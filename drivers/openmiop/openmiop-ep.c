@@ -150,6 +150,13 @@ struct edma_lli {
 #define TX_BATCH 16
 #define TXQ_SIZE 128
 
+/* Without an RX interrupt the poll thread polls the rings. It polls
+ * every 20-50 us while traffic is recent, then every 200-400 us, so an
+ * idle link costs little CPU. Busy loops * ~40 us is about 80 ms.
+ */
+#define OMI_POLL_BUSY_LOOPS	2000
+#define OMI_POLL_IDLE_US	200
+
 struct openmiop_scratch {
 	u32 len[TX_BATCH];
 	u32 head;
@@ -1386,6 +1393,7 @@ static int poll_thread(void *data)
 {
 	struct openmiop_ep *ep = data;
 	struct net_device *ndev = ep->ndev;
+	unsigned int idle = 0;
 
 	set_user_nice(current, -20);
 
@@ -1417,12 +1425,18 @@ static int poll_thread(void *data)
 			 * thread stands in for the RX IRQ. local_bh_enable()
 			 * runs the NAPI poll before returning.
 			 */
+			idle = 0;
 			local_bh_disable();
 			napi_schedule(&ep->napi);
 			local_bh_enable();
 			cond_resched();
+		} else if (idle < OMI_POLL_BUSY_LOOPS) {
+			/* TASK_IDLE: a sleeping poller is not load. */
+			idle++;
+			usleep_range_state(20, 50, TASK_IDLE);
 		} else {
-			usleep_range(20, 50);
+			usleep_range_state(OMI_POLL_IDLE_US, 2 * OMI_POLL_IDLE_US,
+					   TASK_IDLE);
 		}
 	}
 	return 0;
