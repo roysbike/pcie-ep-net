@@ -447,6 +447,26 @@ static bool p2p_full(struct openmiop_ep *ep)
 	return fill >= OPENMIOP_P2P_SLOTS - 1;
 }
 
+static bool rc_ring_full(struct openmiop_ep *ep)
+{
+	return READ_ONCE(ep->bar->ep_tx_head) -
+	       READ_ONCE(ep->bar->ep_tx_tail) >= OPENMIOP_SLOTS;
+}
+
+/* Caller holds tx_lock. The queue is stopped by the xmit that fills a
+ * ring and woken under the same lock, so the stack never has to see
+ * NETDEV_TX_BUSY: a requeued skb can be overtaken by later ones from
+ * another CPU, which reorders TCP.
+ */
+static bool omi_tx_room(struct openmiop_ep *ep)
+{
+	if (ep->txq_prod - ep->txq_cons >= TXQ_SIZE)
+		return false;
+	if (ep->p2p_on && p2p_full(ep))
+		return false;
+	return !rc_ring_full(ep);
+}
+
 static void edma_init(struct openmiop_ep *ep)
 {
 	u32 ctrl;
@@ -742,6 +762,8 @@ static int p2p_tx(struct openmiop_ep *ep, struct sk_buff *skb, bool *held)
 		ep->txq[ep->txq_prod & (TXQ_SIZE - 1)] = skb;
 		ep->txq_prod++;
 		ep->tx_inflight++;
+		if (!omi_tx_room(ep))
+			netif_stop_queue(ep->ndev);
 		spin_unlock_bh(&ep->tx_lock);
 		wake_up(&ep->tx_wait);
 		*held = true;
@@ -982,8 +1004,7 @@ static int tx_thread(void *data)
 
 		spin_lock_bh(&ep->tx_lock);
 		ep->tx_inflight -= n + n1;
-		if (netif_queue_stopped(ep->ndev) && !p2p_full(ep) &&
-		    ep->txq_prod - ep->txq_cons < TXQ_SIZE)
+		if (netif_queue_stopped(ep->ndev) && omi_tx_room(ep))
 			netif_wake_queue(ep->ndev);
 		spin_unlock_bh(&ep->tx_lock);
 	}
@@ -1386,12 +1407,10 @@ static int poll_thread(void *data)
 		if (READ_ONCE(bar->rc_tx_head) != READ_ONCE(bar->rc_tx_tail))
 			pending = true;
 		if (netif_queue_stopped(ndev)) {
-			u32 tx_head = READ_ONCE(bar->ep_tx_head);
-			u32 tx_tail = READ_ONCE(bar->ep_tx_tail);
-
-			if (tx_head - tx_tail < OPENMIOP_SLOTS &&
-			    (!ep->p2p_on || !p2p_full(ep)))
+			spin_lock_bh(&ep->tx_lock);
+			if (netif_queue_stopped(ndev) && omi_tx_room(ep))
 				netif_wake_queue(ndev);
+			spin_unlock_bh(&ep->tx_lock);
 		}
 		if (pending) {
 			/* Nothing raises an interrupt for a peer write, so this
@@ -1473,6 +1492,12 @@ static int rc_tx(struct openmiop_ep *ep, struct sk_buff *skb)
 	WRITE_ONCE(bar->ep_tx_head, head + 1);
 	WRITE_ONCE(bar->ep_kick, head + 1);
 	bar_flush_xmit(ep);
+	if (head + 1 - tail >= OPENMIOP_SLOTS) {
+		spin_lock_bh(&ep->tx_lock);
+		if (!omi_tx_room(ep))
+			netif_stop_queue(ep->ndev);
+		spin_unlock_bh(&ep->tx_lock);
+	}
 	return 0;
 }
 
