@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  root-complex:
+    name: MT7620A helper
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-mipsel-linux-gnu
+      - name: Build openmiop-rc
+        working-directory: userspace
+        run: make
+      - name: Check the binary
+        working-directory: userspace
+        run: file openmiop-rc | grep -E 'MIPS|32-bit'
+
+  endpoint:
+    name: RK3588 endpoint module
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev
+      - name: Upstream 6.1 headers
+        run: |
+          git clone --depth 1 --branch linux-6.1.y \
+            https://github.com/gregkh/linux.git "${RUNNER_TEMP}/linux"
+          make -C "${RUNNER_TEMP}/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          make -C "${RUNNER_TEMP}/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
+      - name: Build openmiop-ep.ko
+        working-directory: drivers/openmiop
+        run: |
+          make KDIR="${RUNNER_TEMP}/linux" \
+            ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          test -f openmiop-ep.ko

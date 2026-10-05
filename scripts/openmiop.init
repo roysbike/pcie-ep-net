@@ -1,0 +1,26 @@
+#!/bin/sh /etc/rc.common
+# Cluster Box side. The blade may still be training the link, so rescan
+# until 1d87:4f4d shows up, then bridge BAR0 to omi0.
+START=99
+STOP=10
+
+start() {
+	local i=0
+
+	while [ "$i" -lt 45 ]; do
+		echo 1 > /sys/bus/pci/rescan 2>/dev/null
+		if grep -q 4f4d /sys/bus/pci/devices/*/device 2>/dev/null; then
+			break
+		fi
+		i=$((i + 1))
+		sleep 2
+	done
+	start-stop-daemon -S -b -m -p /var/run/openmiop-rc.pid -x /usr/bin/openmiop-rc
+	sleep 2
+	ip addr add 10.20.0.1/24 dev omi0 2>/dev/null
+	ip link set omi0 up 2>/dev/null
+}
+
+stop() {
+	start-stop-daemon -K -p /var/run/openmiop-rc.pid 2>/dev/null
+}

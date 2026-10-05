@@ -1,0 +1,5 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+
+This project is intended to become Linux kernel and userspace tooling.
+Kernel-bound fragments follow the GPL-2.0-or-later of the files they
+target. Documentation may be reused under the same terms.

@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Same content as the overlay, for boards that compile a single DTB
+ * instead of applying a dtso at runtime.
+ *
+ * Include from the Blade 3 board DTS *after* the normal
+ * &pcie3x4 { status = "okay"; } block so these labels win, or
+ * delete the RC enablement from the board file.
+ */
+
+&pcie30phy {
+	status = "okay";
+	rockchip,rx-common-refclk-mode = <0 0 0 0>;
+};
+
+&pcie3x4 {
+	status = "disabled";
+};
+
+&pcie3x4_ep {
+	vpcie3v3-supply = <&vcc3v3_pcie30>;
+	/* Intentionally no reset-gpios. Vendor EP mode deletes them
+	 * so Linux does not pulse PERST toward the ASM2824. */
+	status = "okay";
+};
+
+&mmu600_pcie {
+	status = "disabled";
+};

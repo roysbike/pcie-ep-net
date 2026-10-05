@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Blade 3: run the PCIe3 x4 dual-mode controller as an Endpoint so
+ * the board can appear behind the Cluster Box ASM2824.
+ *
+ * Template: arch/arm64/boot/dts/rockchip/rk3588-rock-5b-pcie-ep.dtso
+ * (Linux 6.18). Cluster Box uses a separate refclk (ASM2824 SRIS),
+ * so rx-common-refclk-mode must be disabled on all four lanes.
+ *
+ * Mutually exclusive with &pcie3x4 (Root Complex). Keep pcie2x1l0 /
+ * pcie2x1l1 as RC for the onboard RTL8125 NICs.
+ *
+ * Apply on a kernel that already contains pcie3x4_ep in
+ * rk3588-extra.dtsi (Linux 6.12+).
+ */
+
+/dts-v1/;
+/plugin/;
+
+&pcie30phy {
+	rockchip,rx-common-refclk-mode = <0 0 0 0>;
+};
+
+&pcie3x4 {
+	status = "disabled";
+};
+
+&pcie3x4_ep {
+	vpcie3v3-supply = <&vcc3v3_pcie30>;
+	status = "okay";
+};
+
+&mmu600_pcie {
+	status = "disabled";
+};
