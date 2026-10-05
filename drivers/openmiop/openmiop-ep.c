@@ -1221,8 +1221,17 @@ static void program_config_space(struct openmiop_ep *ep)
 		       PCI_BASE_ADDRESS_MEM_TYPE_64 | PCI_BASE_ADDRESS_MEM_PREFETCH,
 		       ep->dbi + PCI_BASE_ADDRESS_0);
 	}
-	for (i = 2; i < 6; i++)
+	/* Disable BAR2-5 and the expansion ROM, as dw_pcie_ep_reset_bar()
+	 * does: zero the DBI2 shadow (enable/mask) first, then the BAR.
+	 * Left enabled they cost the host 4 x 16 MiB + 64 KiB of MMIO each,
+	 * and BAR4 exposes the iATU registers to the host.
+	 */
+	for (i = 2; i < 6; i++) {
+		writel(0, ep->dbi2 + PCI_BASE_ADDRESS_0 + i * 4);
 		writel(0, ep->dbi + PCI_BASE_ADDRESS_0 + i * 4);
+	}
+	writel(0, ep->dbi2 + PCI_ROM_ADDRESS);
+	writel(0, ep->dbi + PCI_ROM_ADDRESS);
 
 	/* Width is the lanes parameter. x4 only trains if the PHY was
 	 * latched in aggregation; a bifurcated PHY still has two lanes.
