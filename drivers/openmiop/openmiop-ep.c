@@ -21,12 +21,14 @@
 #include <linux/etherdevice.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/jhash.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
+#include <linux/of_net.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/pci.h>
 #include <linux/phy/phy.h>
@@ -1665,6 +1667,37 @@ out_clk:
 	}
 }
 
+/* A random address changes on every load and leaves stale ARP entries
+ * on the peer and the router. Prefer a DT address, then one derived
+ * from the SoC serial number that U-Boot puts in the root node.
+ */
+static void omi_set_mac(struct device *dev, struct net_device *ndev)
+{
+	const char *serial;
+	u8 mac[ETH_ALEN];
+	u32 h0, h1;
+
+	if (!of_get_ethdev_address(dev->of_node, ndev))
+		return;
+
+	if (of_property_read_string(of_root, "serial-number", &serial) ||
+	    !*serial) {
+		dev_warn(dev, "no serial-number, using a random MAC\n");
+		eth_hw_addr_random(ndev);
+		return;
+	}
+
+	h0 = jhash(serial, strlen(serial), 0x6f6d6930);	/* "omi0" */
+	h1 = jhash(serial, strlen(serial), h0);
+	mac[0] = ((h0 >> 24) & 0xfc) | 0x02;	/* unicast, locally administered */
+	mac[1] = h0 >> 16;
+	mac[2] = h0 >> 8;
+	mac[3] = h0;
+	mac[4] = h1 >> 8;
+	mac[5] = h1;
+	eth_hw_addr_set(ndev, mac);
+}
+
 static int openmiop_probe(struct platform_device *pdev)
 {
 	struct openmiop_ep *ep;
@@ -1830,7 +1863,7 @@ static int openmiop_probe(struct platform_device *pdev)
 	ndev->features |= NETIF_F_GRO | NETIF_F_RXCSUM;
 	ndev->hw_features |= NETIF_F_GRO | NETIF_F_RXCSUM;
 	netif_napi_add(ndev, &ep->napi, omi_napi);
-	eth_hw_addr_random(ndev);
+	omi_set_mac(&pdev->dev, ndev);
 	netif_carrier_off(ndev);
 	SET_NETDEV_DEV(ndev, &pdev->dev);
 
