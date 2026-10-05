@@ -35,7 +35,6 @@
 #include <linux/wait.h>
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
-#include <net/gro_cells.h>
 
 #include "openmiop.h"
 
@@ -214,8 +213,6 @@ struct openmiop_ep {
 	dma_addr_t batch_src[TX_BATCH];
 	int batch_n;
 	int batch_max;
-	struct gro_cells gro;
-	bool gro_ok;
 	struct napi_struct napi;
 	u32 peer_gen;
 	u32 p2p_fail_gen;
@@ -993,17 +990,12 @@ static int tx_thread(void *data)
 	return 0;
 }
 
+/* NAPI context only. One NAPI instance drains both rings, so frames
+ * reach the stack in ring order whichever CPU the poll runs on.
+ */
 static void rx_deliver(struct openmiop_ep *ep, struct sk_buff *skb)
 {
-	if (!ep->gro_ok) {
-		netif_receive_skb(skb);
-		return;
-	}
-	/* gro_cells queues the skb and finishes it from softirq. Enabling
-	 * bh here would nest; the poll thread runs softirq after a batch.
-	 */
-	if (gro_cells_receive(&ep->gro, skb) == NET_RX_DROP)
-		ep->ndev->stats.rx_dropped++;
+	napi_gro_receive(&ep->napi, skb);
 }
 
 static int p2p_rx(struct openmiop_ep *ep, int budget)
@@ -1402,19 +1394,14 @@ static int poll_thread(void *data)
 				netif_wake_queue(ndev);
 		}
 		if (pending) {
-			int work;
-
-			/* BH stays off for the whole batch so gro_cells can
-			 * queue every frame, then one softirq pass coalesces.
+			/* Nothing raises an interrupt for a peer write, so this
+			 * thread stands in for the RX IRQ. local_bh_enable()
+			 * runs the NAPI poll before returning.
 			 */
 			local_bh_disable();
-			work = 0;
-			if (ep->p2p_on)
-				work += p2p_rx(ep, 256);
-			work += gateway_rx(ep, 64);
+			napi_schedule(&ep->napi);
 			local_bh_enable();
-			if (!work)
-				cond_resched();
+			cond_resched();
 		} else {
 			usleep_range(20, 50);
 		}
@@ -1804,11 +1791,6 @@ static int openmiop_probe(struct platform_device *pdev)
 	ndev->features |= NETIF_F_GRO | NETIF_F_RXCSUM;
 	ndev->hw_features |= NETIF_F_GRO | NETIF_F_RXCSUM;
 	netif_napi_add(ndev, &ep->napi, omi_napi);
-	ret = gro_cells_init(&ep->gro, ndev);
-	if (ret)
-		dev_warn(&pdev->dev, "GRO off (%d)\n", ret);
-	else
-		ep->gro_ok = true;
 	eth_hw_addr_random(ndev);
 	netif_carrier_off(ndev);
 	SET_NETDEV_DEV(ndev, &pdev->dev);
@@ -1823,8 +1805,6 @@ static int openmiop_probe(struct platform_device *pdev)
 	return 0;
 
 err_hw:
-	if (ep->gro_ok)
-		gro_cells_destroy(&ep->gro);
 	netif_napi_del(&ep->napi);
 	hw_stop(ep);
 err_dma:
@@ -1861,8 +1841,6 @@ static int openmiop_remove(struct platform_device *pdev)
 	}
 	if (ep->ndev) {
 		unregister_netdev(ep->ndev);
-		if (ep->gro_ok)
-			gro_cells_destroy(&ep->gro);
 		netif_napi_del(&ep->napi);
 	}
 	if (ep->ob)
