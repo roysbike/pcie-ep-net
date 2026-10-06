@@ -214,12 +214,23 @@ members, jumbo frames to peer and RC.
 * RX notification needs an interrupt on the *receiving* blade for a
   write from another *endpoint*. MSI/MSI-X of the endpoint function go
   to the RC, and the MT7620A cannot take them.
-* Candidate for later (not implemented): map part of BAR0 onto the
-  RK3588 GIC-600 ITS doorbell with an inbound iATU region and let peers
-  write the MSI data there, the mechanism mainline uses for endpoint
-  doorbells (`CONFIG_PCI_ENDPOINT_MSI_DOORBELL`, pci-epf-vntb). Whether
-  the ITS accepts the requester IDs of peer endpoints is unknown and
-  must be measured.
+* Candidates for a real RX doorbell (not implemented, need hardware
+  experiments):
+  1. **GIC ITS doorbell.** An inbound iATU region maps part of BAR0 onto
+     the RK3588 GIC-600 ITS `GITS_TRANSLATER`; a peer writes the event
+     ID there and the receiver gets an LPI, the mechanism mainline uses
+     for endpoint doorbells (`CONFIG_PCI_ENDPOINT_MSI_DOORBELL`,
+     pci-epf-vntb). The vendor node has `msi-map = <0 &its 0 0x1000>`,
+     so the ITS DeviceID of such a write would be the *sender's*
+     requester ID on the BMC's bus numbering (03:00.0 → 0x0300, ...).
+     The receiver needs ITS device entries for every peer's DeviceID,
+     which Linux's platform-MSI API does not express directly.
+  2. **Vendor-defined message.** The sender emits an ID-routed VDM TLP
+     through an outbound iATU region of type Msg; the switch routes it
+     to the receiver's bus number and the receiving DWC raises its
+     `msg` interrupt (SPI 261, present in both DT nodes). No ITS state,
+     but the Rockchip client handling of received VDMs is undocumented
+     here and must be measured.
 * On Talos the upstream `pcie-ep` node also carries the eDMA interrupt
   lines (`dma0`-`dma3`), which would remove the TX spin.
 
