@@ -1,21 +1,31 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Shared BAR0 layout for openmiop.
+ * Shared BAR0 layout for openmiop, protocol version 4.
  *
- * Both CPUs are little-endian (RK3588, MT7620A). The endpoint keeps
- * this structure in DRAM and publishes it with an inbound iATU BAR
- * match. The Cluster Box maps that BAR. The buffer is cacheable on
- * the endpoint, so each writer owns its own cache lines: a write-back
- * must not cover a dword the router or the peer stores.
+ * Every endpoint (EP) exposes one 16 MiB BAR backed by its own DRAM.
+ * The root complex (RC, the Cluster Box) maps all EP BARs. EPs reach
+ * each other through outbound iATU windows and the eDMA engine; that
+ * traffic crosses the PCIe switch and never enters the RC.
  *
- * Blade-to-blade frames do not enter the router. The router writes
- * each endpoint's PCI BAR address into the other endpoint's header.
- * The endpoint then programs an outbound iATU window at the peer BAR.
- * Blade-to-blade frames are moved by the endpoint eDMA engine.
+ * Rules:
  *
- * The small ep_tx/rc_tx rings are only the gateway path (blade to the
- * router). They stay at a 1500-byte MTU. The P2P ring lives at
- * OPENMIOP_P2P_OFF and is sized for jumbo frames.
+ * - Each 64-byte line has exactly one writer. The BAR is cacheable on
+ *   the EP, so the EP flushes lines it writes and invalidates lines
+ *   written by others before reading them.
+ * - EP to EP communication is write-only. An EP never issues a PCIe
+ *   read to another EP: a read to a peer that just went away completes
+ *   with UR and can raise an SError. Ring heads, connect requests,
+ *   acknowledgements and credits are all posted writes into the other
+ *   EP's BAR.
+ * - The RC reads and writes EP BARs with CPU MMIO. It owns the control
+ *   line and the peer table, and moves the gateway rings.
+ *
+ * Node index: the RC gives every EP an index (0 .. OMI_MAX_NODES - 1)
+ * that only depends on the switch port it sits behind, so it survives
+ * reloads. Ring i in an EP's BAR carries frames from the node with
+ * index i.
+ *
+ * Both CPUs are little-endian (RK3588, MT7620A).
  */
 #ifndef OPENMIOP_H
 #define OPENMIOP_H
@@ -23,7 +33,7 @@
 #include <linux/types.h>
 
 #define OPENMIOP_MAGIC		0x31494d4fu	/* bytes "OMI1" on LE */
-#define OPENMIOP_VERSION	3u
+#define OPENMIOP_VERSION	4u
 
 /* Programmed into the endpoint config space. Not Mixtile 4586:b6f2,
  * so the proprietary miop.ko on the Cluster Box will not bind.
@@ -33,76 +43,138 @@
 #define OPENMIOP_PCI_VENDOR	0x1d87u
 #define OPENMIOP_PCI_DEVICE	0x4f4du
 
-#define OPENMIOP_FLAG_UP	0x1u
-
-#define OPENMIOP_SLOTS		128u
-#define OPENMIOP_SLOT_DATA	1600u
-#define OPENMIOP_MAX_FRAME	1514u
-
-/* 16 MiB fits twice in the Cluster Box 256 MiB MMIO window. */
 #define OPENMIOP_BAR_SIZE	(16u * 1024u * 1024u)
 
-/* P2P receive ring. The peer writes it through its outbound window.
- * Slot data starts 16 bytes in so stores can be 16-byte aligned.
- * 512 * 16 KiB = 8 MiB, placed at 1 MiB so it stays clear of the
- * gateway rings above.
- */
-#define OPENMIOP_P2P_OFF	0x00100000u
-#define OPENMIOP_P2P_SLOTS	512u
-#define OPENMIOP_P2P_SLOT	16384u
-#define OPENMIOP_P2P_HDR	16u
-#define OPENMIOP_P2P_DATA	(OPENMIOP_P2P_SLOT - OPENMIOP_P2P_HDR)
+#define OMI_MAX_NODES		8u
 
-struct openmiop_slot {
-	__u32 len;
-	__u32 flags;
-	__u8 data[OPENMIOP_SLOT_DATA];
-};
+/* omi_hdr.flags */
+#define OMI_F_UP		0x1u	/* header valid, rings initialised */
+#define OMI_F_DOWN		0x2u	/* EP is leaving; RC must detach it */
 
-/*
- * Three 64-byte lines.
- *   xmit:  endpoint transmit context (ndo_start_xmit, once at publish)
- *   poll:  endpoint receive context (the poll thread)
- *   dev:   router and the peer. The endpoint only reads this line.
- * Remotes reach DRAM through PCIe, so they do not share the cache.
- */
-struct openmiop_bar {
+/* omi_ctl.flags */
+#define OMI_RC_UP		0x1u
+
+/* Gateway slot flags (RC <-> EP). */
+#define OMI_GW_RELAYED		0x1u	/* RC copied this from another EP */
+
+/* ---- 0x0000: header, written by the owning EP ---- */
+struct omi_hdr {
 	__u32 magic;
 	__u32 version;
-	__u32 ep_flags;
-	__u32 ep_tx_head;	/* EP produces, RC consumes */
-	__u8 ep_mac[6];
-	__u8 ep_pad[2];
-	__u32 ep_kick;
-	__u8 xmit_pad[36];
-
-	__u32 rc_tx_tail;
-	__u32 p2p_rx_tail;	/* EP consumes the peer ring */
-	__u8 poll_pad[56];
-
-	__u32 rc_flags;
-	__u32 ep_tx_tail;
-	__u32 rc_tx_head;	/* RC produces, EP consumes */
-	__u8 rc_mac[6];
-	__u8 rc_pad[2];
-	__u32 rc_kick;
-
-	/* Filled by the router once both endpoints have BARs.
-	 * peer_gen is written last. The endpoint reprograms its
-	 * outbound iATU when peer_gen changes.
-	 */
-	__u32 peer_bar_lo;
-	__u32 peer_bar_hi;
-	__u32 peer_gen;
-	__u8 peer_mac[6];
-	__u8 peer_pad[2];
-
-	/* Peer produces head by DMA into our BAR. */
-	__u32 p2p_rx_head;
-	__u8 dev_pad[16];
-
-	struct openmiop_slot ep_tx[OPENMIOP_SLOTS];
-	struct openmiop_slot rc_tx[OPENMIOP_SLOTS];
+	__u32 epoch;		/* random, non-zero, new on every probe */
+	__u32 flags;		/* OMI_F_* */
+	__u8 mac[6];
+	__u16 n_rings;		/* P2P receive rings, indexed by sender */
+	__u32 ring_off;		/* offset of ring 0 */
+	__u32 ring_slots;	/* slots per ring, power of two */
+	__u32 slot_size;	/* bytes per slot, including omi_slot_hdr */
+	__u32 gw_off;		/* offset of struct omi_gw */
+	__u32 gw_slots;		/* per direction, power of two */
+	__u32 gw_slot_size;	/* bytes per gateway slot incl. header */
+	__u32 table_seen;	/* last omi_ctl.table_gen applied */
+	__u8 pad[12];
 };
+
+/* ---- 0x0040: control, written by the RC ---- */
+struct omi_ctl {
+	__u32 flags;		/* OMI_RC_UP */
+	__u8 mac[6];		/* the RC's own omi0 MAC */
+	__u8 self_idx;		/* this EP's node index */
+	__u8 pad0;
+	__u32 table_gen;	/* bumped after every peer table change */
+	__u32 down_ack;		/* = hdr.epoch once the RC has detached us */
+	__u32 ep_epoch;		/* hdr.epoch the RC activated; the control
+				 * line and the table are only valid for
+				 * that epoch
+				 */
+	__u8 pad[40];
+};
+
+/* ---- 0x0080: peer table, written by the RC ----
+ * Entry i describes node i. epoch == 0: absent. The RC clears epoch
+ * before it changes an entry and writes it last, then bumps table_gen.
+ */
+struct omi_peer_entry {
+	__u32 epoch;
+	__u32 bar_lo;		/* PCI address of the peer's BAR0 */
+	__u32 bar_hi;
+	__u8 mac[6];
+	__u8 pad[14];
+};
+
+/* ---- 0x0400: one line per remote node, written by that node ----
+ * rx_prod[i]: producer state of the ring that carries frames from
+ * node i to us. head is written by i's eDMA after the payloads;
+ * token is written by i when it (re)connects: a fresh random value
+ * per connect, so a stale acknowledgement can never match.
+ */
+struct omi_prod {
+	__u32 head;
+	__u32 token;		/* sender's connect token */
+	__u8 pad[56];
+};
+
+/* ---- 0x0600: one line per remote node, written by that node ----
+ * tx_cons[i]: credit for the ring we fill in node i's BAR. Node i
+ * writes how far it has consumed, and acknowledges our connect by
+ * echoing our token.
+ */
+struct omi_cons {
+	__u32 tail;
+	__u32 ack;		/* = our token once node i accepted it */
+	__u8 pad[56];
+};
+
+struct omi_bar_head {
+	struct omi_hdr hdr;
+	struct omi_ctl ctl;
+	struct omi_peer_entry peers[OMI_MAX_NODES];
+	__u8 pad[0x400 - 0x80 - OMI_MAX_NODES * sizeof(struct omi_peer_entry)];
+	struct omi_prod rx_prod[OMI_MAX_NODES];
+	struct omi_cons tx_cons[OMI_MAX_NODES];
+};
+
+/* Slot header in front of every frame, P2P and gateway. For P2P the
+ * sender DMAs the header and the frame in one transfer.
+ */
+struct omi_slot_hdr {
+	__u32 len;
+	__u32 flags;
+	__u32 mask;		/* gateway: node indices that already have it */
+	__u32 pad;
+};
+
+/* ---- gateway (EP <-> RC), at hdr.gw_off ----
+ * ep_prod/rc_cons: frames from the EP to the RC.
+ * rc_prod/ep_cons: frames from the RC to the EP.
+ * Each index lives on its own line with its own writer.
+ */
+struct omi_gw {
+	__u32 ep_head;		/* EP */
+	__u8 pad0[60];
+	__u32 ep_tail;		/* RC */
+	__u8 pad1[60];
+	__u32 rc_head;		/* RC */
+	__u8 pad2[60];
+	__u32 rc_tail;		/* EP */
+	__u8 pad3[60];
+	/* followed by gw_slots ep_tx slots, then gw_slots rc_tx slots */
+};
+
+/* Geometry used by this implementation. The receiver publishes its
+ * geometry in omi_hdr; senders use the published values.
+ */
+#define OMI_GW_OFF		0x1000u
+#define OMI_GW_SLOTS		64u
+#define OMI_GW_SLOT		9280u	/* 16 header + 9216 data, 64-aligned */
+#define OMI_RING_OFF		0x200000u
+#define OMI_RING_SLOTS		256u
+#define OMI_SLOT		10240u
+#define OMI_N_RINGS		4u
+/* Local eDMA scratch. Peers and the RC never write here. */
+#define OMI_SCRATCH_OFF		0xf00000u
+
+#define OMI_GW_DATA		(OMI_GW_SLOT - sizeof(struct omi_slot_hdr))
+#define OMI_SLOT_DATA		(OMI_SLOT - sizeof(struct omi_slot_hdr))
 
 #endif

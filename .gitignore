@@ -7,3 +7,5 @@
 modules.order
 Module.symvers
 userspace/openmiop-rc
+_out/
+userspace/omi-peek

@@ -1,26 +1,26 @@
 #!/bin/sh /etc/rc.common
-# Cluster Box side. The blade may still be training the link, so rescan
-# until 1d87:4f4d shows up, then bridge BAR0 to omi0.
+# Cluster Box side of openmiop. The helper finds the endpoints itself
+# (and rescans while a switch port is empty), so start it right away.
 START=99
 STOP=10
 
-start() {
-	local i=0
+ADDR=10.20.0.1/24
 
-	while [ "$i" -lt 45 ]; do
-		echo 1 > /sys/bus/pci/rescan 2>/dev/null
-		if grep -q 4f4d /sys/bus/pci/devices/*/device 2>/dev/null; then
-			break
-		fi
+start() {
+	# The helper logs to stderr; keep it in tmpfs for debugging.
+	start-stop-daemon -S -b -m -p /var/run/openmiop-rc.pid -x /bin/sh -- \
+		-c "exec /usr/bin/openmiop-rc 2>>/tmp/openmiop-rc.log"
+	i=0
+	while [ "$i" -lt 20 ] && ! ip link show omi0 >/dev/null 2>&1; do
 		i=$((i + 1))
-		sleep 2
+		sleep 1
 	done
-	start-stop-daemon -S -b -m -p /var/run/openmiop-rc.pid -x /usr/bin/openmiop-rc
-	sleep 2
-	ip addr add 10.20.0.1/24 dev omi0 2>/dev/null
-	ip link set omi0 up 2>/dev/null
+	ip link set omi0 mtu 9000
+	ip addr replace "$ADDR" dev omi0
+	ip link set omi0 up
 }
 
 stop() {
 	start-stop-daemon -K -p /var/run/openmiop-rc.pid 2>/dev/null
+	rm -f /var/run/openmiop-rc.pid
 }

@@ -1,0 +1,194 @@
+# omi0 benchmark
+date:        2026-10-06T05:12:44Z
+commit:      a7a8177
+blade160: kernel 6.1.99, module 2e3eb7c5b085ad96, mtu 9000, firmware-version: proto 4 node 0
+blade173: kernel 6.1.99, module 2e3eb7c5b085ad96, mtu 9000, firmware-version: proto 4 node 1
+link 0000:03:00.0: LnkSta:	Speed 8GT/s, Width x2, MaxPayload 256 bytes, MaxReadReq 512 bytes
+link 0000:04:00.0: LnkSta:	Speed 8GT/s, Width x2, MaxPayload 256 bytes, MaxReadReq 512 bytes
+runs: 3 x 10s
+
+## idle (link up, no traffic)
+blade173 busy 0.6% of 8 cores
+0.68 1.29 1.70 1/361 7608
+blade160 busy 0.8% of 8 cores
+0.85 1.43 1.89 1/354 5557
+   blade160 idle: ctl_poll_cycles=24817 intr/s=2941 ctxt/s=5528 softirq=0.2%core 
+
+## latency
+   peer, 1 s interval (after idle): rtt min/avg/max/mdev = 0.555/0.860/1.222/0.182 ms
+   peer, 5 ms interval:             rtt min/avg/max/mdev = 0.164/0.302/0.844/0.045 ms
+   peer, flood 64 B:                rtt min/avg/max/mdev = 0.055/0.273/0.737/0.079 ms, ipg/ewma 0.353/0.172 ms
+   gateway, 50 ms interval:         rtt min/avg/max/mdev = 0.433/0.997/1.671/0.390 ms
+
+## TCP blade160->blade173 P1 run 1:  8.03 Gbits/sec 0 sender; 8.03 Gbits/sec receiver;
+   blade160 cpu: c0:3 c1:13 c2:6 c3:10 c4:2 c5:0 c6:25 c7:99 
+   blade173 cpu: c0:24 c1:24 c2:8 c3:5 c4:30 c5:21 c6:14 c7:8 
+   blade160: tx_gw_packets=2 tx_queue_stops=6575 tx_p2p_frames=1121521 tx_dma_runs=35697 tx_dma_elements=3705104 tx_queue_wakes=5576 tx_dma_wait_ns=8056145194 tx_dma_bytes=10108638164 rx_p2p_packets=117082 rx_gw_packets=2 rx_napi_polls=82692 ctl_poll_cycles=221681 ctl_napi_kicks=82692 ctl_queue_wakes=999 intr/s=16468 ctxt/s=30999 softirq=36.7%core 
+   blade173: tx_p2p_frames=117082 tx_dma_runs=102720 tx_dma_elements=336892 tx_dma_wait_ns=678026086 tx_dma_bytes=7727475 rx_p2p_packets=1121521 rx_napi_polls=35009 ctl_poll_cycles=112324 ctl_napi_kicks=34571 intr/s=26093 ctxt/s=47929 softirq=62.3%core 
+## TCP blade160->blade173 P1 run 2:  8.03 Gbits/sec 0 sender; 8.03 Gbits/sec receiver;
+   blade160 cpu: c0:13 c1:1 c2:2 c3:15 c4:10 c5:23 c6:76 c7:18 
+   blade173 cpu: c0:16 c1:24 c2:4 c3:4 c4:40 c5:21 c6:9 c7:8 
+   blade160: tx_queue_stops=6363 tx_p2p_frames=1122141 tx_dma_runs=36119 tx_dma_elements=3707547 tx_queue_wakes=5353 tx_dma_wait_ns=8070748768 tx_dma_bytes=10113836946 rx_p2p_packets=111513 rx_napi_polls=79116 ctl_poll_cycles=220919 ctl_napi_kicks=79116 ctl_queue_wakes=1010 intr/s=16647 ctxt/s=31399 softirq=32.8%core 
+   blade173: tx_p2p_frames=111513 tx_dma_runs=97978 tx_dma_elements=321012 tx_dma_wait_ns=644520544 tx_dma_bytes=7359932 rx_p2p_packets=1122141 rx_napi_polls=35520 ctl_poll_cycles=116538 ctl_napi_kicks=35297 intr/s=25945 ctxt/s=48151 softirq=62.1%core 
+## TCP blade160->blade173 P1 run 3:  8.05 Gbits/sec 0 sender; 8.05 Gbits/sec receiver;
+   blade160 cpu: c0:4 c1:10 c2:24 c3:0 c4:2 c5:6 c6:55 c7:62 
+   blade173 cpu: c0:7 c1:24 c2:28 c3:31 c4:5 c5:5 c6:19 c7:21 
+   blade160: tx_queue_stops=6371 tx_p2p_frames=1124623 tx_dma_runs=35904 tx_dma_elements=3715451 tx_queue_wakes=5508 tx_dma_wait_ns=8078508177 tx_dma_bytes=10136624917 rx_p2p_packets=120035 rx_napi_polls=80558 ctl_poll_cycles=219212 ctl_napi_kicks=80558 ctl_queue_wakes=863 intr/s=16468 ctxt/s=30999 softirq=36.0%core 
+   blade173: tx_p2p_frames=120035 tx_dma_runs=100751 tx_dma_elements=340829 tx_dma_wait_ns=637515648 tx_dma_bytes=7922456 rx_p2p_packets=1124623 rx_napi_polls=35407 ctl_poll_cycles=102888 ctl_napi_kicks=35287 intr/s=24859 ctxt/s=45839 softirq=67.8%core 
+## TCP blade173->blade160 P1 (-R) run 1:  8.14 Gbits/sec 0 sender; 8.13 Gbits/sec receiver;
+   blade160 cpu: c0:23 c1:14 c2:10 c3:12 c4:15 c5:17 c6:18 c7:21 
+   blade173 cpu: c0:8 c1:4 c2:20 c3:10 c4:2 c5:14 c6:28 c7:80 
+   blade160: tx_p2p_frames=114111 tx_dma_runs=99303 tx_dma_elements=327533 tx_dma_wait_ns=612408280 tx_dma_bytes=7531892 rx_p2p_packets=1136764 rx_napi_polls=36284 ctl_poll_cycles=125030 ctl_napi_kicks=35832 intr/s=26251 ctxt/s=49179 softirq=61.8%core 
+   blade173: tx_queue_stops=6636 tx_p2p_frames=1136764 tx_dma_runs=37242 tx_dma_elements=3756472 tx_queue_wakes=5833 tx_dma_wait_ns=8175405405 tx_dma_bytes=10244903218 rx_p2p_packets=114111 rx_napi_polls=79833 ctl_poll_cycles=222232 ctl_napi_kicks=79833 ctl_queue_wakes=803 intr/s=16868 ctxt/s=31625 softirq=35.5%core 
+## TCP blade173->blade160 P1 (-R) run 2:  8.26 Gbits/sec 0 sender; 8.26 Gbits/sec receiver;
+   blade160 cpu: c0:2 c1:11 c2:5 c3:2 c4:33 c5:28 c6:13 c7:23 
+   blade173 cpu: c0:17 c1:2 c2:22 c3:14 c4:4 c5:3 c6:14 c7:95 
+   blade160: tx_p2p_frames=112201 tx_dma_runs=98668 tx_dma_elements=323078 tx_dma_wait_ns=648564911 tx_dma_bytes=7405827 rx_p2p_packets=1153767 rx_napi_polls=35794 ctl_poll_cycles=109453 ctl_napi_kicks=35502 intr/s=24882 ctxt/s=46801 softirq=63.5%core 
+   blade173: tx_queue_stops=6831 tx_p2p_frames=1153767 tx_dma_runs=36105 tx_dma_elements=3811009 tx_queue_wakes=6020 tx_dma_wait_ns=8266101283 tx_dma_bytes=10399903946 rx_p2p_packets=112201 rx_napi_polls=78437 ctl_poll_cycles=221864 ctl_napi_kicks=78437 ctl_queue_wakes=811 intr/s=16748 ctxt/s=31571 softirq=36.2%core 
+## TCP blade173->blade160 P1 (-R) run 3:  8.08 Gbits/sec 0 sender; 8.08 Gbits/sec receiver;
+   blade160 cpu: c0:15 c1:19 c2:35 c3:6 c4:34 c5:22 c6:7 c7:5 
+   blade173 cpu: c0:1 c1:14 c2:16 c3:1 c4:3 c5:1 c6:24 c7:98 
+   blade160: tx_p2p_frames=119676 tx_dma_runs=103831 tx_dma_elements=343191 tx_dma_wait_ns=689551075 tx_dma_bytes=7899179 rx_p2p_packets=1129489 rx_napi_polls=35257 ctl_poll_cycles=117754 ctl_napi_kicks=35017 intr/s=26065 ctxt/s=48218 softirq=61.1%core 
+   blade173: tx_queue_stops=6455 tx_p2p_frames=1129488 tx_dma_runs=35563 tx_dma_elements=3731056 tx_queue_wakes=5637 tx_dma_wait_ns=8112059356 tx_dma_bytes=10180722012 rx_p2p_packets=119676 rx_napi_polls=83943 ctl_poll_cycles=225157 ctl_napi_kicks=83943 ctl_queue_wakes=818 intr/s=16386 ctxt/s=31018 softirq=37.6%core 
+## TCP bidir P1 run 1: [TX-C] 7.84 Gbits/sec 0 sender;[TX-C] 7.84 Gbits/sec receiver;[RX-C] 7.83 Gbits/sec 0 sender;[RX-C] 7.83 Gbits/sec receiver;
+   blade160 cpu: c0:4 c1:1 c2:1 c3:0 c4:39 c5:41 c6:94 c7:21 
+   blade173 cpu: c0:6 c1:3 c2:2 c3:1 c4:27 c5:48 c6:92 c7:22 
+   blade160: tx_queue_stops=7290 tx_p2p_frames=1201157 tx_dma_runs=40221 tx_dma_elements=3835653 tx_queue_wakes=6856 tx_dma_wait_ns=8076319284 tx_dma_bytes=9879268368 rx_p2p_packets=1205816 rx_napi_polls=39187 ctl_poll_cycles=142979 ctl_napi_kicks=38996 ctl_queue_wakes=434 intr/s=20321 ctxt/s=37990 softirq=69.1%core 
+   blade173: tx_queue_stops=7286 tx_p2p_frames=1205816 tx_dma_runs=40561 tx_dma_elements=3843292 tx_queue_wakes=6817 tx_dma_wait_ns=8067787766 tx_dma_bytes=9865910649 rx_p2p_packets=1201157 rx_napi_polls=39089 ctl_poll_cycles=139205 ctl_napi_kicks=38938 ctl_queue_wakes=469 intr/s=20639 ctxt/s=38781 softirq=72.0%core 
+## TCP bidir P1 run 2: [TX-C] 7.88 Gbits/sec 0 sender;[TX-C] 7.88 Gbits/sec receiver;[RX-C] 7.86 Gbits/sec 0 sender;[RX-C] 7.85 Gbits/sec receiver;
+   blade160 cpu: c0:6 c1:1 c2:0 c3:0 c4:36 c5:34 c6:65 c7:52 
+   blade173 cpu: c0:6 c1:3 c2:0 c3:0 c4:50 c5:54 c6:32 c7:56 
+   blade160: tx_queue_stops=7282 tx_p2p_frames=1205947 tx_dma_runs=40395 tx_dma_elements=3853135 tx_queue_wakes=6879 tx_dma_wait_ns=8113102650 tx_dma_bytes=9933717243 rx_p2p_packets=1206567 rx_napi_polls=38717 ctl_poll_cycles=145986 ctl_napi_kicks=38569 ctl_queue_wakes=403 intr/s=20485 ctxt/s=38165 softirq=62.4%core 
+   blade173: tx_queue_stops=7299 tx_p2p_frames=1206567 tx_dma_runs=39905 tx_dma_elements=3849340 tx_queue_wakes=6801 tx_dma_wait_ns=8100922396 tx_dma_bytes=9901710061 rx_p2p_packets=1205947 rx_napi_polls=39195 ctl_poll_cycles=143505 ctl_napi_kicks=39049 ctl_queue_wakes=498 intr/s=20521 ctxt/s=38021 softirq=74.6%core 
+## TCP bidir P1 run 3: [TX-C] 7.90 Gbits/sec 0 sender;[TX-C] 7.90 Gbits/sec receiver;[RX-C] 7.91 Gbits/sec 0 sender;[RX-C] 7.91 Gbits/sec receiver;
+   blade160 cpu: c0:5 c1:1 c2:1 c3:1 c4:38 c5:34 c6:61 c7:49 
+   blade173 cpu: c0:5 c1:0 c2:0 c3:0 c4:39 c5:38 c6:39 c7:74 
+   blade160: tx_queue_stops=7232 tx_p2p_frames=1212071 tx_dma_runs=40910 tx_dma_elements=3868888 tx_queue_wakes=6936 tx_dma_wait_ns=8106389936 tx_dma_bytes=9955224018 rx_p2p_packets=1215227 rx_napi_polls=40003 ctl_poll_cycles=147078 ctl_napi_kicks=39824 ctl_queue_wakes=296 intr/s=20930 ctxt/s=39158 softirq=60.3%core 
+   blade173: tx_queue_stops=7304 tx_p2p_frames=1215227 tx_dma_runs=41406 tx_dma_elements=3877455 tx_queue_wakes=6932 tx_dma_wait_ns=8120156086 tx_dma_bytes=9966896392 rx_p2p_packets=1212071 rx_napi_polls=39812 ctl_poll_cycles=143778 ctl_napi_kicks=39759 ctl_queue_wakes=372 intr/s=20463 ctxt/s=38320 softirq=68.8%core 
+## TCP blade160->blade173 P4 run 1:  7.45 Gbits/sec 0 sender; 7.44 Gbits/sec receiver;
+   blade160 cpu: c0:11 c1:4 c2:2 c3:15 c4:3 c5:5 c6:19 c7:96 
+   blade173 cpu: c0:19 c1:18 c2:15 c3:27 c4:13 c5:6 c6:23 c7:19 
+   blade160: tx_queue_stops=21438 tx_p2p_frames=1039745 tx_dma_runs=32709 tx_dma_elements=3443538 tx_queue_wakes=20437 tx_dma_wait_ns=7452107807 tx_dma_bytes=9371903219 rx_p2p_packets=130816 rx_napi_polls=83373 ctl_poll_cycles=226403 ctl_napi_kicks=83373 ctl_queue_wakes=1001 intr/s=16494 ctxt/s=31248 softirq=42.2%core 
+   blade173: tx_p2p_frames=130816 tx_dma_runs=106860 tx_dma_elements=368500 tx_dma_wait_ns=712730386 tx_dma_bytes=8634052 rx_p2p_packets=1039745 rx_napi_polls=32334 ctl_poll_cycles=107066 ctl_napi_kicks=32103 intr/s=25500 ctxt/s=46891 softirq=61.1%core 
+## TCP blade160->blade173 P4 run 2:  7.48 Gbits/sec 0 sender; 7.47 Gbits/sec receiver;
+   blade160 cpu: c0:6 c1:12 c2:0 c3:22 c4:10 c5:97 c6:7 c7:6 
+   blade173 cpu: c0:39 c1:56 c2:21 c3:14 c4:5 c5:10 c6:5 c7:2 
+   blade160: tx_queue_stops=21555 tx_p2p_frames=1043734 tx_dma_runs=32740 tx_dma_elements=3457215 tx_queue_wakes=20484 tx_dma_wait_ns=7469151093 tx_dma_bytes=9407933266 rx_p2p_packets=132643 rx_napi_polls=82255 ctl_poll_cycles=225295 ctl_napi_kicks=82255 ctl_queue_wakes=1071 intr/s=16606 ctxt/s=31273 softirq=47.4%core 
+   blade173: tx_p2p_frames=132643 tx_dma_runs=107230 tx_dma_elements=372524 tx_dma_wait_ns=689929642 tx_dma_bytes=8754656 rx_p2p_packets=1043734 rx_napi_polls=32651 ctl_poll_cycles=81858 ctl_napi_kicks=32603 intr/s=23275 ctxt/s=43430 softirq=79.3%core 
+## TCP blade160->blade173 P4 run 3:  7.39 Gbits/sec 0 sender; 7.37 Gbits/sec receiver;
+   blade160 cpu: c0:4 c1:1 c2:3 c3:24 c4:3 c5:5 c6:95 c7:18 
+   blade173 cpu: c0:26 c1:36 c2:34 c3:11 c4:6 c5:10 c6:11 c7:10 
+   blade160: tx_gw_packets=1 tx_queue_stops=26595 tx_p2p_frames=1030768 tx_dma_runs=32254 tx_dma_elements=3414693 tx_queue_wakes=25711 tx_dma_wait_ns=7398200272 tx_dma_bytes=9291040349 rx_p2p_packets=127880 rx_napi_polls=84062 ctl_poll_cycles=231708 ctl_napi_kicks=84062 ctl_queue_wakes=884 intr/s=17278 ctxt/s=32636 softirq=44.6%core 
+   blade173: tx_p2p_frames=127880 tx_dma_runs=106878 tx_dma_elements=362646 tx_dma_wait_ns=696308600 tx_dma_bytes=8440338 rx_p2p_packets=1030768 rx_napi_polls=31913 ctl_poll_cycles=102540 ctl_napi_kicks=31578 intr/s=24758 ctxt/s=45833 softirq=65.1%core 
+## TCP blade160->blade173 P8 run 1:  7.49 Gbits/sec 625 sender; 7.47 Gbits/sec receiver;
+   blade160 cpu: c0:3 c1:10 c2:16 c3:8 c4:2 c5:9 c6:87 c7:16 
+   blade173 cpu: c0:33 c1:62 c2:36 c3:17 c4:4 c5:2 c6:7 c7:4 
+   blade160: tx_queue_stops=31428 tx_p2p_frames=1044733 tx_dma_runs=32786 tx_dma_elements=3456970 tx_dropped_late=191 tx_peer_gone_drops=191 tx_queue_wakes=30986 tx_dma_wait_ns=7473510243 tx_dma_bytes=9416795717 rx_p2p_packets=141713 rx_napi_polls=87653 ctl_poll_cycles=240621 ctl_napi_kicks=87653 ctl_peer_stalls=1 ctl_queue_wakes=442 intr/s=17651 ctxt/s=33585 softirq=45.3%core TcpRetransSegs=625 
+   blade173: tx_p2p_frames=141713 tx_dma_runs=114964 tx_dma_elements=398398 tx_dma_wait_ns=754308525 tx_dma_bytes=9356112 rx_p2p_packets=1044733 rx_napi_polls=32433 ctl_poll_cycles=75952 ctl_napi_kicks=32164 intr/s=22952 ctxt/s=43199 softirq=77.8%core TcpExtTCPOFOQueue=8 
+## TCP blade160->blade173 P8 run 2:  7.35 Gbits/sec 0 sender; 7.33 Gbits/sec receiver;
+   blade160 cpu: c0:18 c1:4 c2:9 c3:9 c4:5 c5:11 c6:8 c7:97 
+   blade173 cpu: c0:39 c1:14 c2:15 c3:40 c4:11 c5:8 c6:7 c7:6 
+   blade160: tx_queue_stops=30198 tx_p2p_frames=1024908 tx_dma_runs=32093 tx_dma_elements=3392065 tx_queue_wakes=29676 tx_dma_wait_ns=7364357656 tx_dma_bytes=9238054898 rx_p2p_packets=132662 rx_napi_polls=85887 ctl_poll_cycles=230436 ctl_napi_kicks=85887 ctl_queue_wakes=522 intr/s=16930 ctxt/s=32063 softirq=53.8%core 
+   blade173: tx_p2p_frames=132662 tx_dma_runs=111804 tx_dma_elements=377136 tx_dma_wait_ns=716823208 tx_dma_bytes=8756249 rx_p2p_packets=1024908 rx_napi_polls=31757 ctl_poll_cycles=91214 ctl_napi_kicks=31434 intr/s=23892 ctxt/s=44562 softirq=61.0%core 
+## TCP blade160->blade173 P8 run 3:  7.45 Gbits/sec 0 sender; 7.43 Gbits/sec receiver;
+   blade160 cpu: c0:2 c1:16 c2:15 c3:4 c4:16 c5:10 c6:95 c7:1 
+   blade173 cpu: c0:41 c1:43 c2:15 c3:20 c4:2 c5:0 c6:11 c7:13 
+   blade160: tx_queue_stops=31731 tx_p2p_frames=1039279 tx_dma_runs=32549 tx_dma_elements=3441017 tx_queue_wakes=31172 tx_dma_wait_ns=7441910585 tx_dma_bytes=9367612489 rx_p2p_packets=140202 rx_napi_polls=88571 ctl_poll_cycles=232173 ctl_napi_kicks=88571 ctl_queue_wakes=559 intr/s=16854 ctxt/s=31921 softirq=56.9%core 
+   blade173: tx_p2p_frames=140202 tx_dma_runs=116108 tx_dma_elements=396520 tx_dma_wait_ns=710919057 tx_dma_bytes=9253996 rx_p2p_packets=1039279 rx_napi_polls=32510 ctl_poll_cycles=104840 ctl_napi_kicks=32509 intr/s=25125 ctxt/s=46964 softirq=47.7%core 
+## TCP blade173->blade160 P4 (-R) run 1:  7.44 Gbits/sec 0 sender; 7.43 Gbits/sec receiver;
+   blade160 cpu: c0:39 c1:18 c2:5 c3:5 c4:18 c5:8 c6:20 c7:25 
+   blade173 cpu: c0:16 c1:3 c2:6 c3:0 c4:21 c5:94 c6:3 c7:7 
+   blade160: tx_p2p_frames=125177 tx_dma_runs=101169 tx_dma_elements=351534 tx_dma_wait_ns=684105887 tx_dma_bytes=8262778 rx_p2p_packets=1038333 rx_napi_polls=32599 ctl_poll_cycles=123801 ctl_napi_kicks=32555 intr/s=26000 ctxt/s=47766 softirq=58.3%core 
+   blade173: tx_queue_stops=21026 tx_p2p_frames=1038333 tx_dma_runs=32681 tx_dma_elements=3437413 tx_queue_wakes=20045 tx_dma_wait_ns=7442285958 tx_dma_bytes=9359114123 rx_p2p_packets=125177 rx_napi_polls=79975 ctl_poll_cycles=226021 ctl_napi_kicks=79975 ctl_queue_wakes=981 intr/s=16719 ctxt/s=31813 softirq=41.4%core 
+## TCP blade173->blade160 P4 (-R) run 2:  7.44 Gbits/sec 0 sender; 7.43 Gbits/sec receiver;
+   blade160 cpu: c0:37 c1:24 c2:2 c3:25 c4:17 c5:9 c6:13 c7:12 
+   blade173 cpu: c0:5 c1:8 c2:11 c3:3 c4:95 c5:8 c6:16 c7:6 
+   blade160: tx_p2p_frames=129690 tx_dma_runs=101735 tx_dma_elements=361126 tx_dma_wait_ns=691478959 tx_dma_bytes=8560639 rx_p2p_packets=1039038 rx_napi_polls=32424 ctl_poll_cycles=101966 ctl_napi_kicks=32329 intr/s=24223 ctxt/s=45024 softirq=69.1%core 
+   blade173: tx_queue_stops=21078 tx_p2p_frames=1039038 tx_dma_runs=32574 tx_dma_elements=3443397 tx_queue_wakes=19986 tx_dma_wait_ns=7449900659 tx_dma_bytes=9365647951 rx_p2p_packets=129690 rx_napi_polls=77717 ctl_poll_cycles=220600 ctl_napi_kicks=77717 ctl_queue_wakes=1092 intr/s=16477 ctxt/s=31104 softirq=41.0%core 
+## TCP blade173->blade160 P4 (-R) run 3:  7.52 Gbits/sec 0 sender; 7.50 Gbits/sec receiver;
+   blade160 cpu: c0:28 c1:18 c2:8 c3:8 c4:13 c5:12 c6:23 c7:24 
+   blade173 cpu: c0:11 c1:8 c2:1 c3:11 c4:8 c5:4 c6:96 c7:14 
+   blade160: tx_p2p_frames=127801 tx_dma_runs=103731 tx_dma_elements=359344 tx_dma_wait_ns=689233884 tx_dma_bytes=8435962 rx_p2p_packets=1049245 rx_napi_polls=32445 ctl_poll_cycles=111243 ctl_napi_kicks=32074 intr/s=25429 ctxt/s=46767 softirq=64.6%core 
+   blade173: tx_queue_stops=24125 tx_p2p_frames=1049245 tx_dma_runs=32825 tx_dma_elements=3476317 tx_queue_wakes=23145 tx_dma_wait_ns=7518986787 tx_dma_bytes=9457651203 rx_p2p_packets=127801 rx_napi_polls=80196 ctl_poll_cycles=223442 ctl_napi_kicks=80196 ctl_queue_wakes=980 intr/s=16418 ctxt/s=31127 softirq=43.2%core 
+## TCP bidir P4 run 1: [TX-C] 7.41 Gbits/sec 0 sender;[TX-C] 7.40 Gbits/sec receiver;[RX-C] 7.34 Gbits/sec 0 sender;[RX-C] 7.33 Gbits/sec receiver;
+   blade160 cpu: c0:21 c1:16 c2:7 c3:0 c4:22 c5:15 c6:95 c7:31 
+   blade173 cpu: c0:13 c1:3 c2:4 c3:1 c4:18 c5:93 c6:36 c7:32 
+   blade160: tx_queue_stops=28759 tx_p2p_frames=1147263 tx_dma_runs=36403 tx_dma_elements=3661177 tx_queue_wakes=27667 tx_dma_wait_ns=7637331238 tx_dma_bytes=9336796612 rx_p2p_packets=1143804 rx_napi_polls=35448 ctl_poll_cycles=147060 ctl_napi_kicks=35052 ctl_queue_wakes=1092 intr/s=17953 ctxt/s=33372 softirq=63.9%core 
+   blade173: tx_queue_stops=30147 tx_p2p_frames=1143804 tx_dma_runs=36131 tx_dma_elements=3642624 tx_queue_wakes=29069 tx_dma_wait_ns=7566202399 tx_dma_bytes=9253965125 rx_p2p_packets=1147263 rx_napi_polls=35529 ctl_poll_cycles=146964 ctl_napi_kicks=35063 ctl_queue_wakes=1078 intr/s=18165 ctxt/s=33470 softirq=66.3%core 
+## TCP bidir P4 run 2: [TX-C] 7.38 Gbits/sec 0 sender;[TX-C] 7.37 Gbits/sec receiver;[RX-C] 7.42 Gbits/sec 0 sender;[RX-C] 7.41 Gbits/sec receiver;
+   blade160 cpu: c0:4 c1:4 c2:1 c3:1 c4:47 c5:31 c6:96 c7:11 
+   blade173 cpu: c0:20 c1:6 c2:0 c3:0 c4:24 c5:25 c6:29 c7:97 
+   blade160: tx_queue_stops=20311 tx_p2p_frames=1149514 tx_dma_runs=36435 tx_dma_elements=3657786 tx_queue_wakes=19687 tx_dma_wait_ns=7605229945 tx_dma_bytes=9295728115 rx_p2p_packets=1158685 rx_napi_polls=36206 ctl_poll_cycles=142093 ctl_napi_kicks=35913 ctl_queue_wakes=624 intr/s=18401 ctxt/s=34570 softirq=70.2%core 
+   blade173: tx_queue_stops=32088 tx_p2p_frames=1158685 tx_dma_runs=37017 tx_dma_elements=3685718 tx_queue_wakes=30887 tx_dma_wait_ns=7649465803 tx_dma_bytes=9349645908 rx_p2p_packets=1149514 rx_napi_polls=35607 ctl_poll_cycles=146621 ctl_napi_kicks=35174 ctl_queue_wakes=1201 intr/s=18403 ctxt/s=34556 softirq=65.8%core 
+## TCP bidir P4 run 3: [TX-C] 7.39 Gbits/sec 0 sender;[TX-C] 7.38 Gbits/sec receiver;[RX-C] 7.65 Gbits/sec 0 sender;[RX-C] 7.64 Gbits/sec receiver;
+   blade160 cpu: c0:28 c1:2 c2:2 c3:0 c4:50 c5:18 c6:31 c7:79 
+   blade173 cpu: c0:34 c1:26 c2:2 c3:0 c4:10 c5:11 c6:32 c7:97 
+   blade160: tx_queue_stops=21343 tx_p2p_frames=1154383 tx_dma_runs=36445 tx_dma_elements=3670237 tx_queue_wakes=20500 tx_dma_wait_ns=7629887792 tx_dma_bytes=9309364095 rx_p2p_packets=1185894 rx_napi_polls=36869 ctl_poll_cycles=139238 ctl_napi_kicks=36602 ctl_queue_wakes=843 intr/s=18257 ctxt/s=34197 softirq=78.4%core 
+   blade173: tx_queue_stops=30137 tx_p2p_frames=1185894 tx_dma_runs=37266 tx_dma_elements=3782949 tx_queue_wakes=28976 tx_dma_wait_ns=7801217338 tx_dma_bytes=9637266956 rx_p2p_packets=1154383 rx_napi_polls=35773 ctl_poll_cycles=148808 ctl_napi_kicks=35321 ctl_queue_wakes=1161 intr/s=17396 ctxt/s=32358 softirq=62.6%core 
+## TCP blade160->blade173 P1 MSS 1400 run 1:  2.72 Gbits/sec 0 sender; 2.72 Gbits/sec receiver;
+   blade160 cpu: c0:8 c1:2 c2:1 c3:20 c4:8 c5:94 c6:3 c7:5 
+   blade173 cpu: c0:4 c1:34 c2:1 c3:12 c4:20 c5:15 c6:8 c7:19 
+   blade160: tx_queue_stops=74017 tx_p2p_frames=2449600 tx_dma_runs=76577 tx_dma_elements=7528768 tx_queue_wakes=73149 tx_dma_wait_ns=7198903017 tx_dma_bytes=3561690689 rx_p2p_packets=99509 rx_napi_polls=74188 ctl_poll_cycles=228968 ctl_napi_kicks=74188 ctl_queue_wakes=868 intr/s=17407 ctxt/s=33040 softirq=42.8%core 
+   blade173: tx_p2p_frames=99509 tx_dma_runs=84570 tx_dma_elements=283596 tx_dma_wait_ns=537009531 tx_dma_bytes=6567752 rx_p2p_packets=2449600 rx_napi_polls=76452 ctl_poll_cycles=169143 ctl_napi_kicks=76335 intr/s=27106 ctxt/s=51688 softirq=52.1%core 
+## TCP blade160->blade173 P1 MSS 1400 run 2:  2.72 Gbits/sec 0 sender; 2.72 Gbits/sec receiver;
+   blade160 cpu: c0:3 c1:2 c2:6 c3:9 c4:0 c5:2 c6:11 c7:96 
+   blade173 cpu: c0:14 c1:23 c2:2 c3:2 c4:25 c5:21 c6:6 c7:13 
+   blade160: tx_queue_stops=73246 tx_p2p_frames=2451097 tx_dma_runs=76629 tx_dma_elements=7533376 tx_queue_wakes=72406 tx_dma_wait_ns=7217363990 tx_dma_bytes=3563870578 rx_p2p_packets=100285 rx_napi_polls=75680 ctl_poll_cycles=230214 ctl_napi_kicks=75680 ctl_queue_wakes=840 intr/s=17230 ctxt/s=32965 softirq=34.4%core 
+   blade173: tx_p2p_frames=100285 tx_dma_runs=86527 tx_dma_elements=287105 tx_dma_wait_ns=541215049 tx_dma_bytes=6618884 rx_p2p_packets=2451097 rx_napi_polls=76493 ctl_poll_cycles=167474 ctl_napi_kicks=76363 intr/s=27535 ctxt/s=52433 softirq=50.6%core 
+## TCP blade160->blade173 P1 MSS 1400 run 3:  2.75 Gbits/sec 0 sender; 2.75 Gbits/sec receiver;
+   blade160 cpu: c0:10 c1:7 c2:10 c3:0 c4:11 c5:98 c6:1 c7:4 
+   blade173 cpu: c0:28 c1:5 c2:18 c3:1 c4:29 c5:7 c6:13 c7:15 
+   blade160: tx_queue_stops=75283 tx_p2p_frames=2479701 tx_dma_runs=77504 tx_dma_elements=7621269 tx_queue_wakes=74481 tx_dma_wait_ns=7284777308 tx_dma_bytes=3605457642 rx_p2p_packets=101672 rx_napi_polls=75932 ctl_poll_cycles=232539 ctl_napi_kicks=75932 ctl_queue_wakes=802 intr/s=17549 ctxt/s=33359 softirq=44.3%core 
+   blade173: tx_p2p_frames=101672 tx_dma_runs=86874 tx_dma_elements=290226 tx_dma_wait_ns=559860073 tx_dma_bytes=6710472 rx_p2p_packets=2479701 rx_napi_polls=77378 ctl_poll_cycles=169915 ctl_napi_kicks=77251 intr/s=27471 ctxt/s=52411 softirq=48.0%core 
+## UDP blade160->blade173 3G 8900B run 1:  3.00 Gbits/sec 0.000 ms 0/421331 (0%) sender; 2.74 Gbits/sec 0.008 ms 36306/421331 (8.6%) receiver;
+   blade160 cpu: c0:25 c1:3 c2:2 c3:1 c4:3 c5:5 c6:8 c7:8 
+   blade173 cpu: c0:1 c1:4 c2:9 c3:4 c4:6 c5:7 c6:3 c7:0 
+   blade160: tx_queue_stops=1 tx_p2p_frames=421348 tx_dma_runs=207648 tx_dma_elements=1050351 tx_queue_wakes=1 tx_dma_wait_ns=3735865127 tx_dma_bytes=3767543387 rx_p2p_packets=14 rx_napi_polls=10 ctl_poll_cycles=30380 ctl_napi_kicks=10 intr/s=19983 ctxt/s=38061 softirq=0.6%core 
+   blade173: tx_p2p_frames=14 tx_dma_runs=12 tx_dma_elements=48 tx_dma_wait_ns=89836 tx_dma_bytes=1250 rx_p2p_packets=421348 rx_napi_polls=121932 ctl_poll_cycles=235306 ctl_napi_kicks=121932 intr/s=17574 ctxt/s=33632 softirq=11.3%core UdpRcvbufErrors=36306 
+## UDP blade160->blade173 3G 8900B run 2:  3.00 Gbits/sec 0.000 ms 0/421348 (0%) sender; 2.73 Gbits/sec 0.013 ms 37658/421348 (8.9%) receiver;
+   blade160 cpu: c0:10 c1:2 c2:3 c3:2 c4:4 c5:1 c6:4 c7:10 
+   blade173 cpu: c0:0 c1:13 c2:11 c3:7 c4:2 c5:1 c6:1 c7:1 
+   blade160: tx_p2p_frames=421363 tx_dma_runs=227563 tx_dma_elements=1070296 tx_dma_wait_ns=3809798844 tx_dma_bytes=3767695270 rx_p2p_packets=14 rx_napi_polls=11 ctl_poll_cycles=30587 ctl_napi_kicks=11 intr/s=21494 ctxt/s=40802 softirq=0.5%core 
+   blade173: tx_p2p_frames=14 tx_dma_runs=12 tx_dma_elements=48 tx_dma_wait_ns=87211 tx_dma_bytes=1252 rx_p2p_packets=421363 rx_napi_polls=124088 ctl_poll_cycles=226439 ctl_napi_kicks=124088 intr/s=15125 ctxt/s=28700 softirq=14.6%core UdpRcvbufErrors=37658 
+## UDP blade160->blade173 3G 8900B run 3:  3.00 Gbits/sec 0.000 ms 0/421342 (0%) sender; 2.79 Gbits/sec 0.019 ms 29104/421342 (6.9%) receiver;
+   blade160 cpu: c0:7 c1:5 c2:6 c3:0 c4:3 c5:6 c6:4 c7:4 
+   blade173 cpu: c0:25 c1:22 c2:16 c3:3 c4:0 c5:0 c6:0 c7:1 
+   blade160: tx_queue_stops=2 tx_p2p_frames=421357 tx_dma_runs=242917 tx_dma_elements=1085638 tx_queue_wakes=2 tx_dma_wait_ns=3865707150 tx_dma_bytes=3767641620 rx_p2p_packets=14 rx_napi_polls=9 ctl_poll_cycles=30369 ctl_napi_kicks=9 intr/s=21153 ctxt/s=40056 softirq=0.4%core 
+   blade173: tx_p2p_frames=14 tx_dma_runs=11 tx_dma_elements=47 tx_dma_wait_ns=91586 tx_dma_bytes=1250 rx_p2p_packets=421357 rx_napi_polls=127024 ctl_poll_cycles=230755 ctl_napi_kicks=127024 intr/s=14624 ctxt/s=27925 softirq=27.8%core UdpRcvbufErrors=29104 
+## UDP blade160->blade173 1G 1400B run 1:  1000 Mbits/sec 0.000 ms 0/892806 (0%) sender; 1000 Mbits/sec 0.006 ms 48/892806 (0.0054%) receiver;
+   blade160 cpu: c0:20 c1:14 c2:1 c3:4 c4:8 c5:5 c6:9 c7:6 
+   blade173 cpu: c0:8 c1:2 c2:0 c3:0 c4:1 c5:0 c6:14 c7:16 
+   blade160: tx_queue_stops=2507 tx_p2p_frames=892823 tx_dma_runs=341250 tx_dma_elements=2126903 tx_queue_wakes=2507 tx_dma_wait_ns=3483007678 tx_dma_bytes=1287427838 rx_p2p_packets=14 rx_napi_polls=12 ctl_poll_cycles=30578 ctl_napi_kicks=12 intr/s=10866 ctxt/s=19388 softirq=1.0%core 
+   blade173: tx_p2p_frames=14 tx_dma_runs=12 tx_dma_elements=48 tx_dma_wait_ns=104422 tx_dma_bytes=1246 rx_p2p_packets=892823 rx_napi_polls=133128 ctl_poll_cycles=261669 ctl_napi_kicks=133126 intr/s=18041 ctxt/s=34758 softirq=10.0%core UdpRcvbufErrors=48 
+## UDP blade160->blade173 1G 1400B run 2:  1000 Mbits/sec 0.000 ms 0/892806 (0%) sender; 1000 Mbits/sec 0.002 ms 189/892806 (0.021%) receiver;
+   blade160 cpu: c0:1 c1:0 c2:0 c3:1 c4:0 c5:0 c6:0 c7:0 
+   blade173 cpu: c0:26 c1:0 c2:0 c3:14 c4:1 c5:1 c6:1 c7:0 
+   blade160: tx_queue_stops=2501 tx_p2p_frames=892823 tx_dma_runs=115028 tx_dma_elements=1900681 tx_queue_wakes=2501 tx_dma_wait_ns=2479695787 tx_dma_bytes=1287427840 rx_p2p_packets=14 rx_napi_polls=12 ctl_poll_cycles=30437 ctl_napi_kicks=12 intr/s=6422 ctxt/s=11689 softirq=0.4%core 
+   blade173: tx_p2p_frames=14 tx_dma_runs=14 tx_dma_elements=50 tx_dma_wait_ns=105295 tx_dma_bytes=1247 rx_p2p_packets=892823 rx_napi_polls=55570 ctl_poll_cycles=163503 ctl_napi_kicks=55566 intr/s=15994 ctxt/s=30604 softirq=1.8%core UdpRcvbufErrors=189 
+## UDP blade160->blade173 1G 1400B run 3:  1000 Mbits/sec 0.000 ms 0/892805 (0%) sender; 1000 Mbits/sec 0.002 ms 102/892805 (0.011%) receiver;
+   blade160 cpu: c0:1 c1:56 c2:0 c3:0 c4:34 c5:42 c6:14 c7:0 
+   blade173 cpu: c0:37 c1:1 c2:44 c3:0 c4:0 c5:0 c6:22 c7:31 
+   blade160: tx_queue_stops=2500 tx_p2p_frames=892820 tx_dma_runs=174665 tx_dma_elements=1960312 tx_queue_wakes=2500 tx_dma_wait_ns=2747418853 tx_dma_bytes=1287426266 rx_p2p_packets=14 rx_napi_polls=12 ctl_poll_cycles=30544 ctl_napi_kicks=12 intr/s=6688 ctxt/s=11173 softirq=1.0%core 
+   blade173: tx_p2p_frames=14 tx_dma_runs=13 tx_dma_elements=49 tx_dma_wait_ns=103837 tx_dma_bytes=1250 rx_p2p_packets=892820 rx_napi_polls=91503 ctl_poll_cycles=219187 ctl_napi_kicks=91503 intr/s=17486 ctxt/s=33532 softirq=71.1%core UdpRcvbufErrors=102 
+## UDP blade160->blade173 200M 64B run 1:  200 Mbits/sec 0.000 ms 0/3899115 (0%) sender; 189 Mbits/sec 0.000 ms 215741/3898980 (5.5%) receiver;
+   blade160 cpu: c0:3 c1:1 c2:1 c3:0 c4:23 c5:16 c6:70 c7:69 
+   blade173 cpu: c0:6 c1:0 c2:1 c3:1 c4:40 c5:42 c6:31 c7:33 
+   blade160: tx_queue_stops=17202 tx_p2p_frames=3899132 tx_dma_runs=405992 tx_dma_elements=8204263 tx_queue_wakes=17045 tx_dma_wait_ns=7018296219 tx_dma_bytes=413307774 rx_p2p_packets=14 rx_napi_polls=12 ctl_poll_cycles=30465 ctl_napi_kicks=12 ctl_queue_wakes=157 intr/s=8185 ctxt/s=12982 softirq=4.6%core 
+   blade173: tx_p2p_frames=14 tx_dma_runs=13 tx_dma_elements=49 tx_dma_wait_ns=98002 tx_dma_bytes=1253 rx_p2p_packets=3899132 rx_napi_polls=245678 ctl_poll_cycles=304905 ctl_napi_kicks=244061 intr/s=20919 ctxt/s=37212 softirq=74.0%core UdpRcvbufErrors=215755 
+## UDP blade160->blade173 200M 64B run 2:  200 Mbits/sec 0.000 ms 0/3905963 (0%) sender; 192 Mbits/sec 0.001 ms 164757/3905963 (4.2%) receiver;
+   blade160 cpu: c0:1 c1:1 c2:0 c3:0 c4:18 c5:11 c6:64 c7:75 
+   blade173 cpu: c0:5 c1:1 c2:1 c3:1 c4:31 c5:29 c6:38 c7:35 
+   blade160: tx_queue_stops=17114 tx_p2p_frames=3905978 tx_dma_runs=400773 tx_dma_elements=8212736 tx_queue_wakes=16941 tx_dma_wait_ns=7014122929 tx_dma_bytes=414033527 rx_p2p_packets=14 rx_napi_polls=9 ctl_poll_cycles=30526 ctl_napi_kicks=9 ctl_queue_wakes=173 intr/s=8307 ctxt/s=13436 softirq=2.0%core 
+   blade173: tx_p2p_frames=14 tx_dma_runs=11 tx_dma_elements=47 tx_dma_wait_ns=80501 tx_dma_bytes=1250 rx_p2p_packets=3905978 rx_napi_polls=242402 ctl_poll_cycles=300758 ctl_napi_kicks=241081 intr/s=21022 ctxt/s=37519 softirq=63.0%core UdpRcvbufErrors=164757 
+## UDP blade160->blade173 200M 64B run 3:  199 Mbits/sec 0.000 ms 0/3892817 (0%) sender; 190 Mbits/sec 0.001 ms 173313/3892718 (4.5%) receiver;
+   blade160 cpu: c0:2 c1:1 c2:0 c3:0 c4:25 c5:22 c6:59 c7:58 
+   blade173 cpu: c0:4 c1:0 c2:0 c3:0 c4:31 c5:36 c6:33 c7:36 
+   blade160: tx_queue_stops=16892 tx_p2p_frames=3892834 tx_dma_runs=383050 tx_dma_elements=8168725 tx_queue_wakes=16777 tx_dma_wait_ns=6910796634 tx_dma_bytes=412640182 rx_p2p_packets=14 rx_napi_polls=12 ctl_poll_cycles=30521 ctl_napi_kicks=12 ctl_queue_wakes=115 intr/s=7826 ctxt/s=12363 softirq=1.4%core 
+   blade173: tx_p2p_frames=14 tx_dma_runs=13 tx_dma_elements=49 tx_dma_wait_ns=85751 tx_dma_bytes=1251 rx_p2p_packets=3892834 rx_napi_polls=237736 ctl_poll_cycles=297285 ctl_napi_kicks=236618 intr/s=20843 ctxt/s=36866 softirq=65.0%core UdpRcvbufErrors=173313 
+
+## kernel log (openmiop, warnings)
+blade160: [ 2374.409077] openmiop-ep fe150000.pcie: peer 1 not consuming, dropping its frames
+blade160: 
+blade173: 
+blade173: 
+BENCH_DONE
