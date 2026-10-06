@@ -12,8 +12,8 @@ set -u
 
 A=${A:-blade160}
 B=${B:-blade173}
-A_IP=${A_IP:-10.20.0.13}
-B_IP=${B_IP:-10.20.0.14}
+A_IP=${A_IP:-10.20.0.160}
+B_IP=${B_IP:-10.20.0.173}
 GW_IP=${GW_IP:-10.20.0.1}
 RC=${RC:-clusterbox}
 RUNS=${1:-3}
