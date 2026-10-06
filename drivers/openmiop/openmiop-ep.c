@@ -994,11 +994,8 @@ static void tx_build(struct omi_ep *ep, struct omi_batch *b,
 				peer_refresh_tail(ep, p);
 				used = b->base[p] + b->cnt[p] - pr->tail;
 			}
-			if (used >= OMI_RING_SLOTS) {
+			if (used >= OMI_RING_SLOTS)
 				room = false;
-				if (!pr->full_since)
-					pr->full_since = jiffies | 1;
-			}
 		}
 		if (!room)
 			break;
@@ -1022,7 +1019,6 @@ static void tx_build(struct omi_ep *ep, struct omi_batch *b,
 				dar += d->len[seg];
 				b->bytes += d->len[seg];
 			}
-			pr->full_since = 0;
 			b->cnt[p]++;
 			touched |= BIT(p);
 		}
@@ -1333,10 +1329,14 @@ static netdev_tx_t omi_xmit(struct sk_buff *skb, struct net_device *ndev)
 		int p = route_unicast(ep, skb->data);
 
 		if (p >= 0 && p < OMI_MAX_NODES) {
-			/* A known peer without P2P is relayed by the RC. */
+			/* A known peer that is still connecting is relayed by
+			 * the RC. A stalled peer is not reading anything: its
+			 * frames would only fill the slow gateway ring and
+			 * starve real gateway traffic, so drop them.
+			 */
 			if (ep->up_mask & BIT(p))
 				p2p = BIT(p);
-			else
+			else if (!ep->peer[p].stalled)
 				gw = ep->rc_up;
 		} else if (p == OMI_FDB_GW || ether_addr_equal(skb->data, ep->rc_mac)) {
 			gw = ep->rc_up;
@@ -1761,25 +1761,36 @@ static void peers_poll(struct omi_ep *ep)
 	spin_lock_bh(&ep->tx_lock);
 	for (p = 0; p < OMI_N_RINGS; p++) {
 		struct omi_peer *pr = &ep->peer[p];
+		u32 old = pr->tail;
 
 		if (pr->state != OMI_PEER_UP)
 			continue;
+		peer_refresh_tail(ep, p);
 		if (pr->stalled) {
-			u32 old = pr->tail;
-
-			peer_refresh_tail(ep, p);
 			if (pr->tail != old) {
 				pr->stalled = false;
 				pr->full_since = 0;
 				ep->up_mask |= BIT(p);
 			}
-		} else if (pr->full_since &&
-			   time_after(jiffies, pr->full_since + OMI_STALL_TIMEOUT)) {
-			pr->stalled = true;
-			ep->up_mask &= ~BIT(p);
-			omi_inc(&ep->cs, stalls);
-			dev_warn_ratelimited(ep->dev,
-					     "peer %u not consuming, dropping its frames\n", p);
+			continue;
+		}
+		/* Same test as xmit uses to stop the queue: once a peer has
+		 * no room, nothing reaches the TX thread any more, so the
+		 * stall has to be seen here.
+		 */
+		if (!peers_have_room(ep, BIT(p))) {
+			if (!pr->full_since) {
+				pr->full_since = jiffies | 1;
+			} else if (time_after(jiffies, pr->full_since + OMI_STALL_TIMEOUT)) {
+				pr->stalled = true;
+				ep->up_mask &= ~BIT(p);
+				omi_inc(&ep->cs, stalls);
+				dev_warn_ratelimited(ep->dev,
+						     "peer %u not consuming, dropping its frames\n",
+						     p);
+			}
+		} else {
+			pr->full_since = 0;
 		}
 	}
 	if (omi_maybe_wake(ep))
