@@ -191,10 +191,25 @@ struct edma_lli {
  * peers, and the linked list. Peers and the RC never write here.
  */
 struct omi_scratch {
-	u32 head[OMI_MAX_NODES];
-	u8 pad[64 - 4 * OMI_MAX_NODES];
-	struct edma_lli ll[OMI_LL_MAX + 1];
+	u32 head[2][OMI_MAX_NODES];		/* per list */
+	struct edma_lli ll[2][OMI_LL_MAX + 1];	/* double-buffered */
 	struct omi_slot_hdr txh[OMI_TXQ_SIZE];	/* one per txq entry */
+};
+
+/* One eDMA run: a contiguous range of txq entries and the slots it
+ * takes in each peer's ring. Two of them alternate, so the next run is
+ * built while the previous one is on the wire.
+ */
+struct omi_batch {
+	u32 first;			/* txq index of the first entry */
+	u32 n;				/* entries */
+	u32 base[OMI_MAX_NODES];	/* first slot per peer */
+	u32 cnt[OMI_MAX_NODES];		/* slots per peer */
+	u32 gen;			/* ep->build_gen when built */
+	u32 bytes;
+	int nel;			/* list elements, 0: nothing to send */
+	int list;			/* which scratch list */
+	bool built;
 };
 
 /* Without an RX interrupt the ctl thread polls. It polls every
@@ -258,7 +273,7 @@ struct omi_xmit_stats {
 
 struct omi_tx_stats {
 	u64_stats_t p2p_frames, dma_runs, dma_elems, dma_errors, dropped,
-		    peer_full_drops, queue_wakes;
+		    peer_full_drops, queue_wakes, dma_wait_ns, dma_bytes;
 	struct u64_stats_sync syncp;
 };
 
@@ -313,13 +328,14 @@ struct omi_ep {
 	/* TX */
 	spinlock_t tx_lock;
 	u8 up_mask;			/* peers in OMI_PEER_UP, not stalled */
-	bool tx_in_dma;
+	u32 build_gen;			/* tx_lock: batches built */
+	u32 done_gen;			/* tx_lock: build_gen of the last batch retired */
 	struct omi_txd *txq;
 	u32 txq_prod, txq_cons;
 	wait_queue_head_t tx_wait;
 	struct task_struct *tx_task;
 	u32 gw_head;			/* xmit only */
-	bool ll_ready, ll_cb;
+	struct omi_batch batch[2];	/* tx thread */
 
 	/* RX */
 	struct napi_struct napi;
@@ -733,48 +749,15 @@ static void edma_init(struct omi_ep *ep)
 	/* Status bits still latch. This only holds the IRQ pin down. */
 	writel(0xffffffff, ep->edma + EDMA_WR_INT_MASK);
 	writel(readl(ep->edma + EDMA_WR_LL_ERR) | BIT(0), ep->edma + EDMA_WR_LL_ERR);
-	ep->ll_cb = true;
-	ep->ll_ready = false;
 }
 
-/* After an abort or timeout: stop the engine, start it again, and
- * reprogram the list (CCS resets the consumer cycle state to 1).
- */
+/* After an abort or timeout: stop the engine and start it again. */
 static void edma_reset(struct omi_ep *ep)
 {
 	writel(0, ep->edma + EDMA_WR_ENB);
 	udelay(10);
 	writel(EDMA_INT_DONE | EDMA_INT_ABORT, ep->edma + EDMA_WR_INT_CLEAR);
 	writel(BIT(0), ep->edma + EDMA_WR_ENB);
-	ep->ll_cb = true;
-	ep->ll_ready = false;
-}
-
-static int edma_wait(struct omi_ep *ep)
-{
-	void __iomem *dma = ep->edma;
-	int i;
-
-	/* A tight readl of the DMA block starves the engine of the same
-	 * bus it uses to fetch descriptors. Poll, then stay off it.
-	 */
-	for (i = 0; i < 20050; i++) {
-		u32 st = readl(dma + EDMA_WR_INT_STATUS);
-
-		if (st & EDMA_INT_ABORT) {
-			writel(EDMA_INT_DONE | EDMA_INT_ABORT, dma + EDMA_WR_INT_CLEAR);
-			return -EIO;
-		}
-		if (st & EDMA_INT_DONE) {
-			writel(EDMA_INT_DONE, dma + EDMA_WR_INT_CLEAR);
-			return 0;
-		}
-		if (i < 50)
-			cpu_relax();
-		else
-			udelay(1);
-	}
-	return -ETIMEDOUT;
 }
 
 static void ll_data(struct edma_lli *e, bool cb, u32 len, dma_addr_t sar, u64 dar)
@@ -801,38 +784,40 @@ static void ll_link(struct edma_lli *e, bool cb, dma_addr_t next)
 	e->dar_hi = 0;
 }
 
-/* Run the first nel elements of the list and wait for the last. */
-static int edma_run(struct omi_ep *ep, int nel)
+/*
+ * Start list b->list. CCS and LLP are programmed for every run: data
+ * elements carry CB=1 and the list ends in a link element with CB=0,
+ * where the engine stops. The two lists therefore never share cycle
+ * state. LIE on the last element latches the done bit.
+ */
+static void edma_kick(struct omi_ep *ep, struct omi_batch *b)
 {
-	struct omi_scratch *sc = ep->scratch;
-	dma_addr_t ll_dma = ep->scratch_dma + offsetof(struct omi_scratch, ll);
+	struct edma_lli *ll = ep->scratch->ll[b->list];
+	dma_addr_t ll_dma = ep->scratch_dma +
+			    offsetof(struct omi_scratch, ll[b->list]);
 	void __iomem *dma = ep->edma;
-	int ret;
 
-	sc->ll[nel - 1].control |= EDMA_CTRL_LIE;
-	ll_link(&sc->ll[nel], !ep->ll_cb, ll_dma);
-	dma_sync_single_for_device(ep->dev, ep->scratch_dma, sizeof(*sc), DMA_TO_DEVICE);
+	ll[b->nel - 1].control |= EDMA_CTRL_LIE;
+	ll_link(&ll[b->nel], false, ll_dma);
+	dma_sync_single_for_device(ep->dev, ll_dma, (b->nel + 1) * sizeof(*ll),
+				   DMA_TO_DEVICE);
+	dma_sync_single_for_device(ep->dev,
+				   ep->scratch_dma + offsetof(struct omi_scratch, head[b->list]),
+				   sizeof(ep->scratch->head[0]), DMA_TO_DEVICE);
+	dma_sync_single_for_device(ep->dev,
+				   ep->scratch_dma + offsetof(struct omi_scratch, txh),
+				   sizeof(ep->scratch->txh), DMA_TO_DEVICE);
 
 	writel(EDMA_INT_DONE | EDMA_INT_ABORT, dma + EDMA_WR_INT_CLEAR);
 	writel(BIT(0), dma + EDMA_WR_ENB);
-	if (!ep->ll_ready) {
-		writel(EDMA_CTRL_CCS | EDMA_CTRL_LLE, dma + EDMA_WR_CTRL_LO);
-		writel(0, dma + EDMA_WR_CTRL_HI);
-		writel(lower_32_bits(ll_dma), dma + EDMA_WR_LLP_LO);
-		writel(upper_32_bits(ll_dma), dma + EDMA_WR_LLP_HI);
-	}
+	writel(EDMA_CTRL_CCS | EDMA_CTRL_LLE, dma + EDMA_WR_CTRL_LO);
+	writel(0, dma + EDMA_WR_CTRL_HI);
+	writel(lower_32_bits(ll_dma), dma + EDMA_WR_LLP_LO);
+	writel(upper_32_bits(ll_dma), dma + EDMA_WR_LLP_HI);
 	/* writel() orders the list stores (cleaned above) before the
 	 * doorbell. Channel 0, stop bit clear: start.
 	 */
 	writel(0, dma + EDMA_WR_DOORBELL);
-	ret = edma_wait(ep);
-	if (ret) {
-		edma_reset(ep);
-		return ret;
-	}
-	ep->ll_cb = !ep->ll_cb;
-	ep->ll_ready = true;
-	return 0;
 }
 
 /* ---------------------------------------------------------------- */
@@ -940,29 +925,37 @@ static void txd_release(struct omi_ep *ep, struct omi_txd *d, u8 mask)
 }
 
 /*
- * One eDMA run. Takes queued frames in order while every target peer
- * has a free slot, writes them (slot header + frame) into the peers'
- * rings, then writes each touched peer's new head. Returns the number
- * of frames consumed from txq, or 0 if the first frame is blocked.
+ * Build a run from the queued frames that follow `after` (the run on
+ * the wire, or NULL). Takes frames in order while every target peer
+ * has a free slot; slots are counted on top of `after`. Per target:
+ * the 16-byte slot header from scratch, then the skb segments. At the
+ * end, one head write per touched peer.
  */
-static int tx_batch(struct omi_ep *ep)
+static void tx_build(struct omi_ep *ep, struct omi_batch *b,
+		     const struct omi_batch *after, int list)
 {
 	struct omi_scratch *sc = ep->scratch;
-	u32 base[OMI_MAX_NODES], cnt[OMI_MAX_NODES] = { 0 };
-	u8 touched = 0;
-	u32 avail, i, n = 0;
+	struct edma_lli *ll = sc->ll[list];
+	u32 avail, i, first;
 	dma_addr_t hsrc = 0;
-	int nel = 0, ret;
+	u8 touched = 0;
+	int nel = 0;
+
+	memset(b, 0, sizeof(*b));
+	b->list = list;
+	b->built = true;
 
 	spin_lock_bh(&ep->tx_lock);
-	avail = min_t(u32, ep->txq_prod - ep->txq_cons, OMI_TX_BATCH);
+	first = ep->txq_cons + (after ? after->n : 0);
+	avail = min_t(u32, ep->txq_prod - first, OMI_TX_BATCH);
 	spin_unlock_bh(&ep->tx_lock);
+	b->first = first;
 	if (!avail)
-		return 0;
+		return;
 
 	/* Map outside the lock. Only this thread consumes txq entries. */
 	for (i = 0; i < avail; i++) {
-		struct omi_txd *d = &ep->txq[(ep->txq_cons + i) & (OMI_TXQ_SIZE - 1)];
+		struct omi_txd *d = &ep->txq[(first + i) & (OMI_TXQ_SIZE - 1)];
 
 		if (!d->mapped && d->mask && txd_map(ep, d)) {
 			spin_lock_bh(&ep->tx_lock);
@@ -975,9 +968,10 @@ static int tx_batch(struct omi_ep *ep)
 
 	spin_lock_bh(&ep->tx_lock);
 	for (i = 0; i < OMI_MAX_NODES; i++)
-		base[i] = ep->peer[i].head;
-	for (n = 0; n < avail; n++) {
-		struct omi_txd *d = &ep->txq[(ep->txq_cons + n) & (OMI_TXQ_SIZE - 1)];
+		b->base[i] = ep->peer[i].head + (after ? after->cnt[i] : 0);
+	for (b->n = 0; b->n < avail; b->n++) {
+		u32 q = (first + b->n) & (OMI_TXQ_SIZE - 1);
+		struct omi_txd *d = &ep->txq[q];
 		u8 gone = d->mask & ~ep->up_mask;
 		unsigned long m;
 		unsigned int p;
@@ -994,21 +988,21 @@ static int tx_batch(struct omi_ep *ep)
 		m = d->mask;
 		for_each_set_bit(p, &m, OMI_MAX_NODES) {
 			struct omi_peer *pr = &ep->peer[p];
+			u32 used = b->base[p] + b->cnt[p] - pr->tail;
 
-			if (base[p] + cnt[p] - pr->tail >= OMI_RING_SLOTS) {
+			if (used >= OMI_RING_SLOTS) {
 				peer_refresh_tail(ep, p);
-				if (base[p] + cnt[p] - pr->tail >= OMI_RING_SLOTS) {
-					room = false;
-					if (!pr->full_since)
-						pr->full_since = jiffies | 1;
-				}
+				used = b->base[p] + b->cnt[p] - pr->tail;
+			}
+			if (used >= OMI_RING_SLOTS) {
+				room = false;
+				if (!pr->full_since)
+					pr->full_since = jiffies | 1;
 			}
 		}
 		if (!room)
 			break;
 		if (d->mask) {
-			u32 q = (ep->txq_cons + n) & (OMI_TXQ_SIZE - 1);
-
 			sc->txh[q].len = d->skb->len;
 			sc->txh[q].flags = 0;
 			sc->txh[q].mask = 0;
@@ -1017,54 +1011,48 @@ static int tx_batch(struct omi_ep *ep)
 		}
 		for_each_set_bit(p, &m, OMI_MAX_NODES) {
 			struct omi_peer *pr = &ep->peer[p];
-			u32 slot = (base[p] + cnt[p]) & (OMI_RING_SLOTS - 1);
+			u32 slot = (b->base[p] + b->cnt[p]) & (OMI_RING_SLOTS - 1);
 			u64 dar = pr->pci + ring_off(ep->self) + (u64)slot * OMI_SLOT;
-			int s;
+			int seg;
 
-			ll_data(&sc->ll[nel++], ep->ll_cb, sizeof(struct omi_slot_hdr),
-				hsrc, dar);
+			ll_data(&ll[nel++], true, sizeof(struct omi_slot_hdr), hsrc, dar);
 			dar += sizeof(struct omi_slot_hdr);
-			for (s = 0; s < d->nseg; s++) {
-				ll_data(&sc->ll[nel++], ep->ll_cb, d->len[s], d->addr[s], dar);
-				dar += d->len[s];
+			for (seg = 0; seg < d->nseg; seg++) {
+				ll_data(&ll[nel++], true, d->len[seg], d->addr[seg], dar);
+				dar += d->len[seg];
+				b->bytes += d->len[seg];
 			}
 			pr->full_since = 0;
-			cnt[p]++;
+			b->cnt[p]++;
 			touched |= BIT(p);
 		}
 	}
-	ep->tx_in_dma = n > 0;
+	if (b->n)
+		b->gen = ++ep->build_gen;
 	spin_unlock_bh(&ep->tx_lock);
-
-	if (!n)
-		return 0;
 
 	if (touched) {
 		unsigned long m = touched;
 		unsigned int p;
 
 		for_each_set_bit(p, &m, OMI_MAX_NODES) {
-			sc->head[p] = base[p] + cnt[p];
-			ll_data(&sc->ll[nel++], ep->ll_cb, sizeof(u32),
-				ep->scratch_dma + offsetof(struct omi_scratch, head[p]),
+			sc->head[list][p] = b->base[p] + b->cnt[p];
+			ll_data(&ll[nel++], true, sizeof(u32),
+				ep->scratch_dma + offsetof(struct omi_scratch, head[list][p]),
 				ep->peer[p].pci + BAR_OFF(rx_prod[ep->self].head));
 		}
-		ret = edma_run(ep, nel);
-		if (ret) {
-			dev_err_ratelimited(ep->dev, "eDMA run of %d elements failed (%d)\n",
-					    nel, ret);
-			omi_inc(&ep->ts, dma_errors);
-		} else {
-			omi_inc(&ep->ts, dma_runs);
-			omi_add(&ep->ts, dma_elems, nel);
-		}
-	} else {
-		ret = 0;
 	}
+	b->nel = nel;
+}
+
+/* Retire a run: free its frames and, if it went out, advance the heads. */
+static void tx_complete(struct omi_ep *ep, struct omi_batch *b, int ret)
+{
+	u32 i;
 
 	spin_lock_bh(&ep->tx_lock);
-	for (i = 0; i < n; i++) {
-		struct omi_txd *d = &ep->txq[(ep->txq_cons + i) & (OMI_TXQ_SIZE - 1)];
+	for (i = 0; i < b->n; i++) {
+		struct omi_txd *d = &ep->txq[(b->first + i) & (OMI_TXQ_SIZE - 1)];
 
 		txd_release(ep, d, d->mask);
 		txd_unmap(ep, d);
@@ -1077,38 +1065,140 @@ static int tx_batch(struct omi_ep *ep)
 		}
 		d->skb = NULL;
 	}
-	ep->txq_cons += n;
+	ep->txq_cons += b->n;
 	/* On failure the peers never saw the new heads; the slots are
-	 * free again. On success the heads advanced.
+	 * free again.
 	 */
-	if (!ret) {
+	if (!ret)
 		for (i = 0; i < OMI_MAX_NODES; i++)
-			ep->peer[i].head = base[i] + cnt[i];
-	}
-	ep->tx_in_dma = false;
+			ep->peer[i].head = b->base[i] + b->cnt[i];
+	if (b->n)
+		ep->done_gen = b->gen;
 	if (omi_maybe_wake(ep))
 		omi_inc(&ep->ts, queue_wakes);
 	spin_unlock_bh(&ep->tx_lock);
-	return n;
+	b->built = false;
 }
 
+/* Map one queued frame that is not in run b yet. Returns false if
+ * there is none: everything queued behind b is mapped.
+ */
+static bool tx_premap(struct omi_ep *ep, const struct omi_batch *b)
+{
+	/* Pairs with smp_store_release() in txq_add(): an entry below
+	 * txq_prod is completely written.
+	 */
+	u32 first = b->first + b->n, i, prod = smp_load_acquire(&ep->txq_prod);
+
+	for (i = first; i != prod && i - first < OMI_TX_BATCH; i++) {
+		struct omi_txd *d = &ep->txq[i & (OMI_TXQ_SIZE - 1)];
+
+		if (d->mapped || !d->mask)
+			continue;
+		if (txd_map(ep, d)) {
+			spin_lock_bh(&ep->tx_lock);
+			txd_release(ep, d, d->mask);
+			spin_unlock_bh(&ep->tx_lock);
+			d->mask = 0;
+			omi_inc(&ep->ts, dropped);
+		}
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Wait for run b. Meanwhile map the frames that queue up behind it, so
+ * the next run is built from everything that arrived and costs only
+ * the list build when b is done. Polling the eDMA block in a tight loop
+ * starves the engine of the bus it fetches descriptors on, so stay off
+ * it between checks.
+ */
+static int tx_wait_premap(struct omi_ep *ep, struct omi_batch *b)
+{
+	void __iomem *dma = ep->edma;
+	int i;
+
+	for (i = 0; i < 20050; i++) {
+		u32 st = readl(dma + EDMA_WR_INT_STATUS);
+
+		if (st & EDMA_INT_ABORT) {
+			writel(EDMA_INT_DONE | EDMA_INT_ABORT, dma + EDMA_WR_INT_CLEAR);
+			return -EIO;
+		}
+		if (st & EDMA_INT_DONE) {
+			writel(EDMA_INT_DONE, dma + EDMA_WR_INT_CLEAR);
+			return 0;
+		}
+		if (tx_premap(ep, b))
+			continue;
+		if (i < 50)
+			cpu_relax();
+		else
+			udelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
+static int tx_wait_run(struct omi_ep *ep, struct omi_batch *b, u64 t0)
+{
+	int ret = tx_wait_premap(ep, b);
+
+	omi_add(&ep->ts, dma_wait_ns, ktime_get_ns() - t0);
+	if (ret) {
+		edma_reset(ep);
+		dev_err_ratelimited(ep->dev, "eDMA run of %d elements failed (%d)\n",
+				    b->nel, ret);
+		omi_inc(&ep->ts, dma_errors);
+	} else {
+		omi_inc(&ep->ts, dma_runs);
+		omi_add(&ep->ts, dma_elems, b->nel);
+		omi_add(&ep->ts, dma_bytes, b->bytes);
+	}
+	return ret;
+}
+
+/*
+ * While a run is on the wire, the frames queuing behind it are mapped
+ * (tx_wait_premap). When it is done, the next run is built from all of
+ * them and started at once: the engine idles only for the list build,
+ * and runs grow with the load, which amortises the fixed cost of a run
+ * (~13 us measured).
+ */
 static int tx_thread(void *data)
 {
 	struct omi_ep *ep = data;
+	int list = 0;
 
 	set_user_nice(current, -20);
 	while (!kthread_should_stop()) {
-		if (tx_batch(ep))
-			continue;
-		if (READ_ONCE(ep->txq_prod) != READ_ONCE(ep->txq_cons)) {
-			/* The first frame waits for credit. */
-			usleep_range(20, 50);
+		struct omi_batch *b = &ep->batch[list];
+		u64 t0;
+		int ret;
+
+		tx_build(ep, b, NULL, list);
+		if (!b->n) {
+			if (READ_ONCE(ep->txq_prod) != READ_ONCE(ep->txq_cons)) {
+				/* The first frame waits for credit. */
+				usleep_range(20, 50);
+				continue;
+			}
+			wait_event_interruptible_timeout(ep->tx_wait,
+				kthread_should_stop() ||
+				READ_ONCE(ep->txq_prod) != READ_ONCE(ep->txq_cons),
+				HZ);
 			continue;
 		}
-		wait_event_interruptible_timeout(ep->tx_wait,
-			kthread_should_stop() ||
-			READ_ONCE(ep->txq_prod) != READ_ONCE(ep->txq_cons),
-			HZ);
+		if (!b->nel) {
+			/* Only frames whose peers went away. */
+			tx_complete(ep, b, 0);
+			continue;
+		}
+		t0 = ktime_get_ns();
+		edma_kick(ep, b);
+		ret = tx_wait_run(ep, b, t0);
+		tx_complete(ep, b, ret);
+		list ^= 1;
 	}
 	return 0;
 }
@@ -1212,7 +1302,8 @@ static bool txq_add(struct omi_ep *ep, struct sk_buff *skb, u8 mask)
 	d->nseg = 0;
 	for_each_set_bit(p, &m, OMI_MAX_NODES)
 		ep->peer[p].queued++;
-	ep->txq_prod++;
+	/* Release: tx_premap() reads entries without tx_lock. */
+	smp_store_release(&ep->txq_prod, ep->txq_prod + 1);
 	return true;
 }
 
@@ -1508,6 +1599,7 @@ static void hdr_publish(struct omi_ep *ep)
 static void peer_down(struct omi_ep *ep, unsigned int p)
 {
 	struct omi_peer *pr = &ep->peer[p];
+	u32 target;
 
 	spin_lock_bh(&ep->tx_lock);
 	if (pr->state == OMI_PEER_UP)
@@ -1516,8 +1608,10 @@ static void peer_down(struct omi_ep *ep, unsigned int p)
 	pr->stalled = false;
 	pr->epoch = 0;
 	ep->up_mask &= ~BIT(p);
+	/* Runs built from now on leave p out; wait for the ones before. */
+	target = ep->build_gen;
 	spin_unlock_bh(&ep->tx_lock);
-	while (READ_ONCE(ep->tx_in_dma))
+	while ((s32)(READ_ONCE(ep->done_gen) - target) < 0 && ep->tx_task)
 		usleep_range(20, 50);
 	dev_info(ep->dev, "peer %u down\n", p);
 }
@@ -1905,6 +1999,8 @@ static const struct {
 	OMI_STAT("tx_dropped_late", ts, dropped),
 	OMI_STAT("tx_peer_gone_drops", ts, peer_full_drops),
 	OMI_STAT("tx_queue_wakes", ts, queue_wakes),
+	OMI_STAT("tx_dma_wait_ns", ts, dma_wait_ns),
+	OMI_STAT("tx_dma_bytes", ts, dma_bytes),
 	OMI_STAT("rx_p2p_packets", rs, p2p_packets),
 	OMI_STAT("rx_gw_packets", rs, gw_packets),
 	OMI_STAT("rx_bad_len", rs, errors),
