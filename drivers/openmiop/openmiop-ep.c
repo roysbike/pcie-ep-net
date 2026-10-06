@@ -1176,6 +1176,12 @@ static int tx_thread(void *data)
 		u64 t0;
 		int ret;
 
+		/* Under sustained load there is always work. Talos runs
+		 * PREEMPT_NONE and the vendor kernel PREEMPT_VOLUNTARY:
+		 * without this the thread never leaves the CPU, which stalled
+		 * RCU for 21 s in a 10 minute bidirectional run.
+		 */
+		cond_resched();
 		tx_build(ep, b, NULL, list);
 		if (!b->n) {
 			if (READ_ONCE(ep->txq_prod) != READ_ONCE(ep->txq_cons)) {

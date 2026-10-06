@@ -159,13 +159,21 @@ peer: ctl thread notices head ≠ tail ──► napi_schedule ──► NAPI �
 ```
 
 **TX.** `ndo_start_xmit` routes the frame (peer table MAC, then learned
-source MACs, then flood) and queues it. The TX thread maps up to 32
-frames (scatter-gather, no linearize), builds one eDMA linked list
-(per target: 16-byte slot header from scratch, then the skb segments;
-at the end one 4-byte head write per touched peer), rings the doorbell
-and waits for the done bit. The queue is stopped in the same `tx_lock`
-section as the enqueue that fills a ring, so the stack never sees
-`NETDEV_TX_BUSY` (a requeued skb could be overtaken and reorder TCP).
+source MACs, then flood) and queues it. The TX thread builds one eDMA
+linked list per run from up to 32 queued frames (scatter-gather, no
+linearize): per target, the 16-byte slot header from scratch, then the
+skb segments; at the end one 4-byte head write per touched peer. It
+rings the doorbell and, while polling for the done bit, maps the frames
+that queue up behind the run, so the next run is built from all of them
+and started as soon as the current one completes. Two lists alternate;
+CCS and LLP are programmed for every run, so they never share cycle
+state. The queue is stopped in the same `tx_lock` section as the enqueue
+that fills a ring, so the stack never sees `NETDEV_TX_BUSY` (a requeued
+skb could be overtaken and reorder TCP). `txq_prod` is published with
+release semantics because the mapping loop walks entries without the
+lock. The loop calls `cond_resched()`: under sustained load it always
+has work, and on the PREEMPT_NONE/VOLUNTARY kernels it would otherwise
+never leave the CPU (a 21 s RCU stall was observed before the fix).
 A peer that does not consume for 100 ms is marked stalled and its
 frames are dropped, so one dead peer cannot stop the shared queue.
 
@@ -253,10 +261,12 @@ The RC path (gateway) is a control/management path: blade→BMC
 
 ## 9. Known limitations
 
-* The TX thread spins on the eDMA done bit (one core at ~100 % while
-  sending). Throughput is limited by that serial wait and by core
-  placement: on runs where the busy thread landed on an A55 core,
-  throughput fell to 3-5 Gbit/s (big.LITTLE).
+* The TX thread polls the eDMA done bit (one core busy while sending).
+  Runs stay small (≈3-4 frames, ≈30 KB) and each carries a fixed cost,
+  so the engine moves ≈1.1-1.2 GB/s while busy and is busy ≈85 % of the
+  time under an unlimited stream: ≈7.3 Gbit/s one way, ≈15 Gbit/s
+  bidirectional. Core placement matters on big.LITTLE: runs where the
+  busy thread sat on an A55 core were 30-50 % slower.
 * Single TX queue, single NAPI: multiqueue was not added because the
   measured limit is the serial eDMA wait, not one RX/NAPI core.
 * Bridge windows on the BMC are sized when first assigned. A blade
