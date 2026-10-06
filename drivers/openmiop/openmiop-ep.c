@@ -219,6 +219,11 @@ struct omi_batch {
 #define OMI_POLL_BUSY_LOOPS	2000
 #define OMI_POLL_IDLE_US	200
 #define OMI_CONNECT_RETRY	(HZ / 2)
+/* Still no ack after this long: connect again with a new token. The
+ * receiver acks a token once; if that ack was lost (it went out through
+ * a window that was being re-pointed), only a new token gets a new one.
+ */
+#define OMI_CONNECT_RENEW	(2 * HZ)
 #define OMI_STALL_TIMEOUT	(HZ / 10)
 #define OMI_DOWN_ACK_TIMEOUT_MS	2000
 
@@ -239,8 +244,10 @@ struct omi_peer {
 	u8 mac[ETH_ALEN];
 	void __iomem *win;		/* window into the peer's BAR */
 	bool win_ok;			/* release/acquire with NAPI */
+	bool ack_ok;			/* window points at the current peer */
 	u32 token;			/* our connect token for this peer */
 	unsigned long conn_sent;
+	unsigned long conn_start;	/* when the current token was made */
 
 	/* tx_lock */
 	enum omi_peer_state state;
@@ -285,7 +292,7 @@ struct omi_rx_stats {
 
 struct omi_ctl_stats {
 	u64_stats_t poll_cycles, napi_kicks, table_updates, peer_up,
-		    peer_down, stalls, queue_wakes, link_resets;
+		    peer_down, stalls, queue_wakes, link_resets, connect_renew;
 	struct u64_stats_sync syncp;
 };
 
@@ -1428,10 +1435,11 @@ static void rx_credit(struct omi_ep *ep, unsigned int r)
 	struct omi_peer *pr = &ep->peer[r];
 	void __iomem *c;
 
-	/* Pairs with smp_store_release() in peer_set(): the iATU region
-	 * is programmed before we store through the window.
+	/* Pairs with smp_store_release() in peer_set(): acks and credits
+	 * go out only through a window that points at this peer's current
+	 * BAR. After the peer left (or moved) they wait for peer_set().
 	 */
-	if (!smp_load_acquire(&pr->win_ok))
+	if (!smp_load_acquire(&pr->ack_ok))
 		return;
 	c = pr->win + BAR_OFF(tx_cons[ep->self]);
 	if (pr->rx_ack) {
@@ -1586,7 +1594,7 @@ static bool rx_pending(struct omi_ep *ep)
 			    READ_ONCE(prod->head) != READ_ONCE(pr->rx_tail))
 				return true;
 			/* An ack can only go out once we have a window. */
-			if (READ_ONCE(pr->rx_ack) && smp_load_acquire(&pr->win_ok))
+			if (READ_ONCE(pr->rx_ack) && smp_load_acquire(&pr->ack_ok))
 				return true;
 		}
 	}
@@ -1613,6 +1621,10 @@ static void peer_down(struct omi_ep *ep, unsigned int p)
 	pr->state = OMI_PEER_DOWN;
 	pr->stalled = false;
 	pr->epoch = 0;
+	/* Its BAR may move before it comes back: no acks or credits
+	 * through the old window until peer_set() has re-pointed it.
+	 */
+	WRITE_ONCE(pr->ack_ok, false);
 	ep->up_mask &= ~BIT(p);
 	/* Runs built from now on leave p out; wait for the ones before. */
 	target = ep->build_gen;
@@ -1637,6 +1649,26 @@ static void peer_connect(struct omi_ep *ep, unsigned int p)
 	pr->conn_sent = jiffies;
 }
 
+/* ctl thread. A connect that got no ack: use a new token, which the
+ * receiver treats as a new connection and acks again.
+ */
+static void peer_renew_token(struct omi_ep *ep, unsigned int p)
+{
+	struct omi_peer *pr = &ep->peer[p];
+	u32 token;
+
+	do {
+		token = get_random_u32();
+	} while (!token || token == pr->token);
+
+	spin_lock_bh(&ep->tx_lock);
+	pr->token = token;
+	pr->conn_start = jiffies;
+	spin_unlock_bh(&ep->tx_lock);
+	omi_inc(&ep->cs, connect_renew);
+	dev_info_ratelimited(ep->dev, "peer %u: no ack, connecting again\n", p);
+}
+
 static void peer_set(struct omi_ep *ep, unsigned int p, u32 epoch, u64 pci,
 		     const u8 *mac)
 {
@@ -1649,9 +1681,13 @@ static void peer_set(struct omi_ep *ep, unsigned int p, u32 epoch, u64 pci,
 		if (program_outbound(ep, p, pci))
 			return;
 		pr->pci = pci;
-		/* Pairs with smp_load_acquire() in rx_credit(). */
 		smp_store_release(&pr->win_ok, true);
 	}
+	/* Pairs with smp_load_acquire() in rx_credit(): the window points
+	 * at this peer before an ack or credit goes through it. An ack
+	 * held back while the peer was away goes out now.
+	 */
+	smp_store_release(&pr->ack_ok, true);
 	/* A new token per connect: an ack left over from an earlier
 	 * connection to this peer can never match it.
 	 */
@@ -1663,6 +1699,7 @@ static void peer_set(struct omi_ep *ep, unsigned int p, u32 epoch, u64 pci,
 	memcpy(pr->mac, mac, ETH_ALEN);
 	pr->epoch = epoch;
 	pr->token = token;
+	pr->conn_start = jiffies;
 	pr->state = OMI_PEER_CONNECTING;
 	pr->head = 0;
 	pr->tail = 0;
@@ -1749,6 +1786,8 @@ static void peers_poll(struct omi_ep *ep)
 			omi_inc(&ep->cs, peer_up);
 			dev_info(ep->dev, "peer %u up\n", p);
 		} else if (time_after(jiffies, pr->conn_sent + OMI_CONNECT_RETRY)) {
+			if (time_after(jiffies, pr->conn_start + OMI_CONNECT_RENEW))
+				peer_renew_token(ep, p);
 			peer_connect(ep, p);
 		}
 	}
@@ -2033,6 +2072,7 @@ static const struct {
 	OMI_STAT("ctl_peer_stalls", cs, stalls),
 	OMI_STAT("ctl_queue_wakes", cs, queue_wakes),
 	OMI_STAT("ctl_link_resets", cs, link_resets),
+	OMI_STAT("ctl_connect_renew", cs, connect_renew),
 };
 
 static void omi_get_drvinfo(struct net_device *ndev, struct ethtool_drvinfo *info)
