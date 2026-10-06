@@ -67,6 +67,7 @@
 #include <linux/random.h>
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
+#include <linux/rtnetlink.h>
 #include <linux/sched.h>
 #include <linux/u64_stats_sync.h>
 #include <linux/version.h>
@@ -2412,6 +2413,25 @@ static void openmiop_teardown(struct platform_device *pdev)
 	free_netdev(ep->ndev);
 }
 
+/*
+ * Reboot and poweroff. Talos never unloads modules and a Debian
+ * shutdown need not either, so without this the link would just drop:
+ * peers keep writing into a BAR that is gone and the RC may have a read
+ * in flight. Leave the fabric as remove() does, then stop the link.
+ */
+static void openmiop_shutdown(struct platform_device *pdev)
+{
+	struct omi_ep *ep = platform_get_drvdata(pdev);
+
+	kthread_stop(ep->ctl);
+	rtnl_lock();
+	dev_close(ep->ndev);
+	rtnl_unlock();
+	bar_leave(ep);
+	disable_outbound(ep);
+	hw_stop(ep);
+}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 static void openmiop_remove(struct platform_device *pdev)
 {
@@ -2435,6 +2455,7 @@ MODULE_DEVICE_TABLE(of, openmiop_of_match);
 static struct platform_driver openmiop_driver = {
 	.probe = openmiop_probe,
 	.remove = openmiop_remove,
+	.shutdown = openmiop_shutdown,
 	.driver = {
 		.name = DRV_NAME,
 		.of_match_table = openmiop_of_match,
