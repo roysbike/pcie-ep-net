@@ -61,3 +61,39 @@ jobs:
           make KDIR="${RUNNER_TEMP}/linux" \
             ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
           test -f openmiop-ep.ko
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [root-complex, endpoint]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag, CHANGELOG and release notes agree
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          grep -q "^## \[${tag#v}\] - " CHANGELOG.md
+          test -s "docs/release-notes/${tag}.md"
+      - uses: actions/download-artifact@v4
+        with:
+          name: openmiop-clusterbox-${{ github.sha }}
+          path: dist
+      - name: Check the artifacts
+        working-directory: dist
+        run: |
+          sha256sum -c SHA256SUMS
+          grep -qx "commit: ${GITHUB_SHA}" BUILD-INFO.txt
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          pre=
+          case "$tag" in *-*) pre=--prerelease ;; esac
+          gh release create "$tag" --verify-tag $pre \
+            --title "openmiop ${tag}" \
+            --notes-file "docs/release-notes/${tag}.md" \
+            dist/openmiop-rc dist/omi-peek dist/openmiop.init \
+            dist/BUILD-INFO.txt dist/SHA256SUMS
