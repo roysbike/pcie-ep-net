@@ -1,0 +1,44 @@
+#!/bin/sh
+set -e
+NAME=openmiop
+VERSION=@VERSION@
+
+if [ "$1" = configure ]; then
+	# The Mixtile Debian image ships its kernel headers in
+	# /usr/src/linux-headers-6.1-rockchip without the usual build link.
+	KVER=$(uname -r)
+	VENDOR=/usr/src/linux-headers-6.1-rockchip
+	if [ ! -e "/lib/modules/$KVER/build" ] && [ -d "$VENDOR" ] &&
+	   [ "$(cat "$VENDOR/include/config/kernel.release" 2>/dev/null)" = "$KVER" ]; then
+		ln -s "$VENDOR" "/lib/modules/$KVER/build"
+		echo "openmiop: using the Mixtile kernel headers in $VENDOR"
+	fi
+
+	dkms add -m "$NAME" -v "$VERSION" >/dev/null 2>&1 || true
+	built=0
+	for build in /lib/modules/*/build; do
+		[ -e "$build" ] || continue
+		k=$(basename "$(dirname "$build")")
+		if dkms build -m "$NAME" -v "$VERSION" -k "$k" && dkms install -m "$NAME" -v "$VERSION" -k "$k" --force; then
+			built=1
+		else
+			echo "openmiop: build for kernel $k failed (see /var/lib/dkms/$NAME/$VERSION/build/make.log)" >&2
+		fi
+	done
+	[ "$built" = 1 ] || echo "openmiop: no kernel headers found; install the headers of your kernel and run: dkms autoinstall" >&2
+
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload || true
+		systemctl enable openmiop.service >/dev/null 2>&1 || true
+		# Mixtile's own MIOP stack drives the same PCIe controller. Do
+		# not unload it on a running system (that has hung the board):
+		# disable it and reboot.
+		if systemctl is-enabled load-miop.service >/dev/null 2>&1; then
+			systemctl disable load-miop.service >/dev/null 2>&1 || true
+			echo "openmiop: disabled the vendor load-miop.service; reboot to switch to openmiop"
+		fi
+	fi
+	[ -s /etc/openmiop.addr ] ||
+		echo "openmiop: put this blade's fabric address in /etc/openmiop.addr (e.g. 10.20.0.13/24), then reboot or: systemctl start openmiop"
+fi
+exit 0

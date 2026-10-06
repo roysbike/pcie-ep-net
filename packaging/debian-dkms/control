@@ -1,0 +1,14 @@
+Package: openmiop-dkms
+Version: @DEBVERSION@
+Architecture: all
+Maintainer: roysbike <roysbike@users.noreply.github.com>
+Depends: dkms, iproute2, kmod
+Section: kernel
+Priority: optional
+Homepage: https://github.com/roysbike/pcie-ep-net
+Description: openmiop: Ethernet over the Mixtile Cluster Box PCIe fabric (DKMS)
+ Kernel module for the Mixtile Blade 3 (RK3588): the PCIe3 controller
+ fe150000 becomes a PCIe endpoint on the Cluster Box fabric and the
+ blade gets the network interface omi0 (OpenMIOP protocol v4).
+ Built by DKMS for the running kernel (6.1 or newer with its headers).
+ openmiop.service brings up omi0 with the address in /etc/openmiop.addr.

@@ -77,7 +77,7 @@ Details: [docs/architecture.md](docs/architecture.md).
 | --- | --- |
 | Chassis | Mixtile Cluster Box (ASM2824 switch, MT7620A BMC), 4 slots |
 | Blade | Mixtile Blade 3 (RK3588), PCIe link Gen3 x2 to the switch |
-| Blade OS | Debian 12 with the Mixtile vendor kernel 6.1.99; Talos v1.14.2 (6.18.54-talos) via [mixtile-talos](https://github.com/roysbike/mixtile-talos) |
+| Blade OS | Hardware-tested: Talos v1.14.2 (6.18.54-talos) via [mixtile-talos](https://github.com/roysbike/mixtile-talos), Debian 12 with the Mixtile vendor kernel 6.1.99. DKMS package builds in CI for Debian 12/13 and Ubuntu 22.04 (HWE)/24.04 arm64 kernels (not hardware-tested on those) |
 | BMC | OpenWrt 23.05 (kernel 5.15.150) on the Cluster Box; packaged in [mixtile-clusterbox-mt7620a-openwrt](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt) |
 
 The blade's PCIe3 PHY is split in two x2 halves: lanes 0-1 go to the
@@ -92,11 +92,14 @@ Recommended: install the ClusterBox firmware
 [mixtile-clusterbox-mt7620a-openwrt v0.1.0-rc.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0-rc.1),
 which contains the helper as the `openmiop` package and starts it at boot.
 
-On other Cluster Box firmware, use the release assets of this repository
-(`openmiop-rc`, `openmiop.init`, `SHA256SUMS`):
+On other Cluster Box firmware, use the release asset
+`openmiop-<version>-clusterbox-bmc-mipsel.tar.gz` (`openmiop-rc`,
+`omi-peek`, `openmiop.init`):
 
 ```sh
 sha256sum -c SHA256SUMS
+tar xzf openmiop-0.1.0-rc.2-clusterbox-bmc-mipsel.tar.gz
+cd openmiop-0.1.0-rc.2-clusterbox-bmc-mipsel
 ssh <bmc> 'cat > /tmp/openmiop-rc' < openmiop-rc
 ssh <bmc> 'cat > /tmp/openmiop.init' < openmiop.init
 # as root on the BMC (prefix each command with sudo when logged in as a user):
@@ -117,27 +120,34 @@ installer image. The module is built into it as a system extension;
 nothing has to be compiled. The release notes there have the machine
 configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
 
-### Blade 3 with Debian (Mixtile vendor kernel)
+### Blade 3 with Debian or Ubuntu
 
-The vendor kernel headers ship only in the Mixtile Debian image
-(`/usr/src/linux-headers-6.1-rockchip`), so the module is built on the
-blade itself:
+Install the DKMS package from the
+[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.2).
+DKMS builds the module for the running kernel (6.1 or newer; the
+kernel's headers must be installed). CI installs it on Debian 12,
+Debian 13, Ubuntu 22.04 (HWE kernel) and Ubuntu 24.04 (arm64) and checks
+that the module builds for each distribution kernel. On the Mixtile Debian
+12 image the package finds the vendor headers in
+`/usr/src/linux-headers-6.1-rockchip` by itself.
 
 ```sh
-sudo apt-get install -y build-essential git
-git clone --branch v0.1.0-rc.2 https://github.com/roysbike/pcie-ep-net.git
-cd pcie-ep-net
-make -C drivers/openmiop KDIR=/usr/src/linux-headers-6.1-rockchip
-sudo install -m 0644 drivers/openmiop/openmiop-ep.ko /usr/local/lib/openmiop-ep.ko
-sudo install -m 0755 scripts/openmiop-ep-start.sh /usr/local/sbin/openmiop-ep-start
-sudo install -m 0644 scripts/openmiop.service /etc/systemd/system/openmiop.service
+sha256sum -c --ignore-missing SHA256SUMS
+sudo apt install ./openmiop-dkms_0.1.0-rc.2_all.deb
 echo 10.20.0.<last octet of the management address>/24 | sudo tee /etc/openmiop.addr
-sudo systemctl daemon-reload && sudo systemctl enable --now openmiop
+sudo reboot            # or: sudo systemctl start openmiop
 ```
 
-Choose a distinct 10.20.0.x address per blade (10.20.0.1 is the BMC).
-If NetworkManager manages new interfaces, install
-`scripts/unmanaged-omi0.conf` to `/etc/NetworkManager/conf.d/`.
+The package enables `openmiop.service` (it brings up `omi0` once
+`/etc/openmiop.addr` exists) and disables Mixtile's `load-miop.service` if
+present: the vendor MIOP stack drives the same controller and must not be
+unloaded on a running system, hence the reboot. The kernel must boot with
+the Blade 3 PCIe endpoint device tree node (`pcie@fe150000` as
+`mixtile,miop-ep-rk3588` from the Mixtile U-Boot, or
+`openmiop,rk3588-pcie-ep` as in mixtile-talos). Choose a distinct
+10.20.0.x per blade (10.20.0.1 is the BMC).
+
+Build from source instead: `make -C drivers/openmiop KDIR=<kernel build tree>`.
 
 ## Verify
 
@@ -167,10 +177,10 @@ IPv6 multicast; `scripts/bench.sh` runs iperf3 and SHA-256 transfers.
 * BMC: upgrade the ClusterBox firmware, or replace `/usr/bin/openmiop-rc`
   and restart `/etc/init.d/openmiop`. Blades reconnect by themselves.
 * Talos: `talosctl upgrade` to the matching mixtile-talos installer.
-* Debian: rebuild and install the module, then
-  `sudo rmmod openmiop_ep && sudo systemctl restart openmiop`. The module
-  performs the leave handshake on unload; peers pause for a few seconds
-  and reconnect.
+* Debian/Ubuntu: `sudo apt install ./openmiop-dkms_<new>_all.deb`, then
+  reboot (or `sudo rmmod openmiop_ep && sudo systemctl restart openmiop`).
+  The module performs the leave handshake on unload; peers pause for a
+  few seconds and reconnect.
 
 All members must speak the same protocol version (v4 here). The header
 carries the version; a v3 endpoint is not activated by a v4 helper.
