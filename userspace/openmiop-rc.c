@@ -470,13 +470,17 @@ static void log_ep(struct ep *e, const char *msg)
  * ports of the same switch. It depends only on the slot, so it is the
  * same after reloads and reboots, and empty slots keep their number.
  */
-static char switch_up[16];		/* switch upstream port, for re-enumeration */
+/* Root port above the endpoints. Re-enumeration starts there: its
+ * bridge window is sized like the ones below it, and a window sized
+ * for two endpoints cannot hold a third.
+ */
+static char root_port[16];
 
 static int node_index(const char *bdf, char *parent)
 {
 	char path[80], link[160];
 	long n;
-	int i, slash = -1, prev = -1, pprev = -1, idx = 0;
+	int i, slash = -1, prev = -1, idx = 0;
 	unsigned pbus, pdev, d;
 
 	dev_path(path, bdf, "");
@@ -487,7 +491,6 @@ static int node_index(const char *bdf, char *parent)
 	link[n] = 0;
 	for (i = 0; i < n; i++) {
 		if (link[i] == '/') {
-			pprev = prev;
 			prev = slash;
 			slash = i;
 		}
@@ -496,9 +499,25 @@ static int node_index(const char *bdf, char *parent)
 		return -1;
 	memcpy(parent, link + prev + 1, 12);
 	parent[12] = 0;
-	if (pprev >= 0 && prev - pprev - 1 == 12) {
-		memcpy(switch_up, link + pprev + 1, 12);
-		switch_up[12] = 0;
+	/* ".../devices/pci0000:00/0000:00:00.0/...": the first BDF after
+	 * the host bridge component is the root port.
+	 */
+	{
+		const char *h = link;
+		int k;
+
+		for (k = 0; k + 7 < n; k++)
+			if (link[k] == 'p' && link[k + 1] == 'c' && link[k + 2] == 'i' &&
+			    link[k + 7] == ':') {
+				h = link + k;
+				break;
+			}
+		while (*h && *h != '/')
+			h++;
+		if (*h == '/' && h[13] == '/') {
+			memcpy(root_port, h + 1, 12);
+			root_port[12] = 0;
+		}
 	}
 	pbus = (unsigned)(hexval(parent[5]) * 16 + hexval(parent[6]));
 	pdev = (unsigned)(hexval(parent[8]) * 16 + hexval(parent[9]));
@@ -972,10 +991,10 @@ static void reenumerate(void)
 
 	reenum_wanted = 0;
 	reenum_after = now + 60000;
-	if (!switch_up[0])
+	if (!root_port[0])
 		return;
-	wr("re-enumerating the switch at ");
-	wr(switch_up);
+	wr("re-enumerating from the root port ");
+	wr(root_port);
 	wr("\n");
 
 	for (i = 0; i < (int)OMI_MAX_NODES; i++) {
@@ -1001,7 +1020,7 @@ static void reenumerate(void)
 		memset(&eps[i], 0, sizeof(eps[i]));
 	}
 
-	dev_path(path, switch_up, "remove");
+	dev_path(path, root_port, "remove");
 	write_file(path, "1");
 	msleep(500);
 	write_file("/sys/bus/pci/rescan", "1");
