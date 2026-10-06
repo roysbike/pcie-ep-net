@@ -25,9 +25,10 @@ reloads and host link resets, and keeps all endpoint-to-endpoint
 communication write-only. See [docs/architecture.md](docs/architecture.md).
 
 Measured on two RK3588 endpoints behind an ASMedia ASM2824, link
-Gen3 x2, MTU 9000, 2026-10-06 (`docs/bench/`): 6-7.5 Gbit/s TCP one
-way, ~14 Gbit/s bidirectional, 0 retransmits, 0.6 % idle CPU. Gen3 x2
-raw is about 16 Gbit/s.
+Gen3 x2, MTU 9000, 2026-10-06 (`docs/bench/2026-10-06-v4.2-*`): 8.0-8.3
+Gbit/s TCP one way, ~15.8 Gbit/s bidirectional, ~7.4 Gbit/s with 4 or 8
+streams, 0 retransmits, 0.6-0.8 % idle CPU, 0.3 ms RTT. Gen3 x2 raw is
+about 16 Gbit/s per direction.
 
 PCI ID is `1d87:4f4d` (Rockchip vendor id, development device id).
 It is not `4586:b6f2`.
