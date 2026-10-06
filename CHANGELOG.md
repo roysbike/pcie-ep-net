@@ -3,6 +3,30 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.0-rc.2] - 2026-10-06
+
+Driver fix release. Protocol v4 is unchanged; the BMC helper is
+unchanged (byte-identical build). Part of OpenMIOP Stack v0.1.0-rc.2.
+
+### Fixed
+
+- Peers could stay "connecting" after the BMC re-enumerated the fabric
+  and the endpoint BAR addresses moved (seen on hardware when blades were
+  removed and new ones added: four blades → two → three → four). A
+  receiver answered a connect through its outbound window to the peer's
+  *old* BAR address, so the ack was lost (or landed in whichever node
+  now owned that address), and a repeated connect with the same token
+  was never acked again. Traffic in that direction fell back to the slow
+  BMC gateway. Now:
+  - acks and credits wait until the window points at the peer's current
+    BAR (`ack_ok`, cleared when the peer leaves, set when the new peer
+    table entry has been programmed);
+  - a sender that gets no ack for 2 s connects again with a new token,
+    which the receiver acks as a new connection (recovers from any lost
+    ack). Counted in `ethtool -S` as `ctl_connect_renew`.
+  rc.1 workaround (no longer needed): `touch /var/run/openmiop-reenumerate`
+  on the BMC.
+
 ## [0.1.0-rc.1] - 2026-10-06
 
 First release candidate of openmiop: Ethernet (`omi0`) over the PCIe
@@ -119,4 +143,5 @@ all four endpoints; the Debian module built from this source repeated
   this box, MPS other than 128/256, helper restart under load with four
   endpoints.
 
+[0.1.0-rc.2]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.1

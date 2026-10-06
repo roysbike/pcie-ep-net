@@ -11,7 +11,7 @@ It is an independent implementation, not Mixtile's MIOP driver, and
 contains no Mixtile code or firmware. License: GPL-2.0-or-later
 ([LICENSE](LICENSE)).
 
-Current release: **v0.1.0-rc.1** (protocol v4). See
+Current release: **v0.1.0-rc.2** (protocol v4). See
 [CHANGELOG.md](CHANGELOG.md) and [Compatible releases](#compatible-releases).
 
 ## Architecture
@@ -112,7 +112,7 @@ The BMC gets `omi0` = 10.20.0.1/24, MTU 9000. Log: `/tmp/openmiop-rc.log`.
 
 ### Blade 3 with Talos
 
-Use the [mixtile-talos v0.1.0-rc.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.1.0-rc.1)
+Use the [mixtile-talos v0.1.0-rc.2](https://github.com/roysbike/mixtile-talos/releases/tag/v0.1.0-rc.2)
 installer image. The module is built into it as a system extension;
 nothing has to be compiled. The release notes there have the machine
 configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
@@ -125,7 +125,7 @@ blade itself:
 
 ```sh
 sudo apt-get install -y build-essential git
-git clone --branch v0.1.0-rc.1 https://github.com/roysbike/pcie-ep-net.git
+git clone --branch v0.1.0-rc.2 https://github.com/roysbike/pcie-ep-net.git
 cd pcie-ep-net
 make -C drivers/openmiop KDIR=/usr/src/linux-headers-6.1-rockchip
 sudo install -m 0644 drivers/openmiop/openmiop-ep.ko /usr/local/lib/openmiop-ep.ko
@@ -216,7 +216,8 @@ in `docs/bench/`.
 * Talos receives ~20 % slower than Debian (6.4 vs 8.0 Gbit/s); not
   investigated.
 * BMC root-port re-enumeration pauses all fabric traffic ~1-2 s when a
-  blade appears without a BAR address. A blade that disappears without
+  blade appears without a BAR address (in rc.2 peers then reconnect by
+  themselves; in rc.1 a moved peer could stay "connecting"). A blade that disappears without
   the leave handshake (crash, power loss) can race a BMC read and wedge
   the fabric until the BMC reboots.
 * The BMC gateway is slow (management only).
@@ -225,12 +226,12 @@ in `docs/bench/`.
 
 ## Compatible releases
 
-| OpenMIOP Stack v0.1.0-rc.1 | |
+| OpenMIOP Stack v0.1.0-rc.2 | |
 | --- | --- |
-| Protocol | OpenMIOP v4 |
-| Blade driver | [pcie-ep-net v0.1.0-rc.1](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.1) |
-| Blade OS | [mixtile-talos v0.1.0-rc.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.1.0-rc.1) |
-| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.1.0-rc.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0-rc.1) |
+| Protocol | OpenMIOP v4 (wire format unchanged since rc.1) |
+| Blade driver | [pcie-ep-net v0.1.0-rc.2](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.2) |
+| Blade OS | [mixtile-talos v0.1.0-rc.2](https://github.com/roysbike/mixtile-talos/releases/tag/v0.1.0-rc.2) |
+| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.1.0-rc.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0-rc.1) (the BMC helper did not change in rc.2) |
 
 ## Build
 
