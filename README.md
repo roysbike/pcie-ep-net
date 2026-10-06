@@ -70,7 +70,11 @@ flowchart LR
   control plane, data path, memory ordering, L2 semantics, P2P proof,
   limitations
 * [talos-port.md](docs/talos-port.md): what Talos 1.14.2 needed
+* [operations.md](docs/operations.md): install, addresses, health,
+  recovery
 * [baseline.md](docs/baseline.md): protocol v3 as found, before changes
+* [phase1-runbook.md](docs/phase1-runbook.md), [feasibility.md](docs/feasibility.md):
+  the original pci_epf_test exploration (historical)
 * `docs/bench/`: benchmark reports (`scripts/bench.sh`)
 
 ## Build
