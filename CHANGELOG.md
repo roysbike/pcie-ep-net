@@ -43,6 +43,14 @@ helper source is unchanged. Part of OpenMIOP Stack v0.1.0-rc.2.
   rc.1 workaround (no longer needed): `touch /var/run/openmiop-reenumerate`
   on the BMC.
 
+### Tested
+
+- Four Talos blades on this driver: rolling upgrade, then BARs moved on
+  purpose twice (graceful shutdown of one blade + BMC re-enumeration, and
+  its return): all 12 peer directions reconnected without the workaround.
+- DKMS package built and installed in Debian 12/13 and Ubuntu 22.04
+  (HWE)/24.04 arm64 containers (CI); no Debian/Ubuntu hardware run in rc.2.
+
 ## [0.1.0-rc.1] - 2026-10-06
 
 First release candidate of openmiop: Ethernet (`omi0`) over the PCIe
