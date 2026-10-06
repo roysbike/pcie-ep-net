@@ -15,9 +15,30 @@ jobs:
       - name: Build openmiop-rc
         working-directory: userspace
         run: make
-      - name: Check the binary
+      - name: Check the binaries
         working-directory: userspace
-        run: file openmiop-rc | grep -E 'MIPS|32-bit'
+        run: |
+          file openmiop-rc | grep -E 'MIPS|32-bit'
+          file omi-peek | grep -E 'MIPS|32-bit'
+      - name: Collect Cluster Box artifacts
+        run: |
+          mkdir -p dist
+          cp userspace/openmiop-rc userspace/omi-peek dist/
+          cp scripts/openmiop.init dist/openmiop.init
+          {
+            echo "repository: ${GITHUB_REPOSITORY}"
+            echo "commit: ${GITHUB_SHA}"
+            echo "ref: ${GITHUB_REF}"
+            echo "run: ${GITHUB_RUN_ID}"
+            echo "compiler: $(mipsel-linux-gnu-gcc --version | head -1)"
+          } > dist/BUILD-INFO.txt
+          (cd dist && sha256sum openmiop-rc omi-peek openmiop.init BUILD-INFO.txt > SHA256SUMS)
+          cat dist/BUILD-INFO.txt dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openmiop-clusterbox-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
 
   endpoint:
     name: RK3588 endpoint module
