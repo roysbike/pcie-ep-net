@@ -101,6 +101,7 @@
 #define PORT_LOGIC_LINK_WIDTH_4_LANES	(0x4u << 8)
 /* pcie30-phy-grf. Mode is bits 2:0; the high half is the write enable. */
 #define RK3588_PCIE3PHY_GRF_BASE	0xfd5b8000UL
+#define RK3588_PCIE3PHY_GRF_SIZE	0x10000
 #define RK3588_PCIE3PHY_GRF_CMN_CON0	0x0
 #define PHY_MODE_NANBNB			0	/* two PCIe3 x2 */
 #define PHY_MODE_AGGREGATION		4	/* one PCIe3 x4 */
@@ -2052,7 +2053,7 @@ static void program_phy_mode(struct device *dev)
 		pclk = NULL;
 	}
 
-	grf = ioremap(RK3588_PCIE3PHY_GRF_BASE, 0x1000);
+	grf = ioremap(RK3588_PCIE3PHY_GRF_BASE, RK3588_PCIE3PHY_GRF_SIZE);
 	if (!grf) {
 		dev_err(dev, "pcie30 phy grf map failed\n");
 		goto out_clk;
@@ -2061,8 +2062,13 @@ static void program_phy_mode(struct device *dev)
 	if ((before & 0x7) != mode)
 		writel((0x7u << 16) | mode, grf + RK3588_PCIE3PHY_GRF_CMN_CON0);
 	after = readl(grf + RK3588_PCIE3PHY_GRF_CMN_CON0);
+	/* Per-lane RX common-refclk mode (mainline:
+	 * rockchip,rx-common-refclk-mode), for comparison between kernels.
+	 */
+	dev_info(dev, "pcie30 phy mode %u (was %#x, now %#x), lane con1 %#x %#x %#x %#x\n",
+		 mode, before, after, readl(grf + 0x1004), readl(grf + 0x1104),
+		 readl(grf + 0x2004), readl(grf + 0x2104));
 	iounmap(grf);
-	dev_info(dev, "pcie30 phy mode %u (was %#x, now %#x)\n", mode, before, after);
 out_clk:
 	if (pclk) {
 		clk_disable_unprepare(pclk);
