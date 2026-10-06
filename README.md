@@ -13,15 +13,21 @@ License: GPL-2.0-or-later. See [LICENSE](LICENSE).
 
 ## What it is
 
-An RK3588 in endpoint mode exposes one 16 MiB BAR. A small helper on
-the root complex writes each endpoint's BAR address into the other.
-After that, blade-to-blade packets are `MemWr` TLPs from the endpoint
-eDMA engine. The root-complex CPU is not on that path.
+An RK3588 in endpoint mode exposes one 16 MiB BAR. A small helper on the
+root complex numbers the endpoints by slot, publishes a peer table into
+every BAR and bridges a slow gateway ring. Blade-to-blade frames are
+`MemWr` TLPs from the sender's eDMA engine into the receiver's BAR; they
+cross the PCIe switch and never enter the root complex.
+
+Protocol v4 supports any number of endpoints behind the switch (up to 8
+nodes, 4 receive rings per BAR in this layout), recovers from module
+reloads and host link resets, and keeps all endpoint-to-endpoint
+communication write-only. See [docs/architecture.md](docs/architecture.md).
 
 Measured on two RK3588 endpoints behind an ASMedia ASM2824, link
-Gen3 x2, MTU 9000, 2026-10-05: about 7.8 Gbit/s TCP one way. Gen3 x2
-raw is about 16 Gbit/s. A second DMA channel does not add bandwidth;
-both channels share one write pipe.
+Gen3 x2, MTU 9000, 2026-10-06 (`docs/bench/`): 6-7.5 Gbit/s TCP one
+way, ~14 Gbit/s bidirectional, 0 retransmits, 0.6 % idle CPU. Gen3 x2
+raw is about 16 Gbit/s.
 
 PCI ID is `1d87:4f4d` (Rockchip vendor id, development device id).
 It is not `4586:b6f2`.
@@ -29,34 +35,42 @@ It is not `4586:b6f2`.
 ## Topology
 
 The switch fans out to the blades. The uplink to the root complex is
-only wide enough for the gateway, not for blade-to-blade traffic.
+Gen1 x1: enough for control and the gateway, not for blade traffic.
 
 ```mermaid
 flowchart LR
   RC["Root complex<br/>MT7620A"]
   SW["PCIe switch<br/>ASM2824"]
-  A["Endpoint A<br/>RK3588"]
-  B["Endpoint B<br/>RK3588"]
-  RC -->|"Gen1 x1<br/>gateway only"| SW
+  A["Endpoint node 0<br/>RK3588"]
+  B["Endpoint node 1<br/>RK3588"]
+  C["Endpoint node 2/3<br/>RK3588"]
+  RC -->|"Gen1 x1<br/>control, gateway"| SW
   SW -->|"Gen3 x2"| A
   SW -->|"Gen3 x2"| B
+  SW -->|"Gen3 x2"| C
 ```
 
 ## Data path
 
-Gateway frames use a small ring in the BAR and can be copied by the
-root complex. Everything else is one DMA from the sender's DRAM into
-the peer BAR.
-
 ```mermaid
 flowchart LR
-  SKB["omi0 transmit"] --> Q["TX thread"]
-  Q --> DMA["eDMA MemWr"]
-  DMA --> BAR["peer BAR<br/>P2P ring"]
-  BAR --> GRO["peer receive"]
-  GRO --> NET["peer omi0"]
-  HELPER["root-complex helper"] -.->|"BAR address"| Q
+  SKB["omi0 xmit"] --> Q["TX thread"]
+  Q --> DMA["eDMA linked list<br/>MemWr"]
+  DMA --> BAR["peer BAR<br/>ring of this sender"]
+  BAR --> NAPI["peer NAPI + GRO"]
+  NAPI --> NET["peer omi0"]
+  NAPI -.->|"credit (posted write)"| Q
+  HELPER["root-complex helper"] -.->|"peer table"| Q
 ```
+
+## Documents
+
+* [architecture.md](docs/architecture.md): topology, BAR layout,
+  control plane, data path, memory ordering, L2 semantics, P2P proof,
+  limitations
+* [talos-port.md](docs/talos-port.md): what Talos 1.14.2 needed
+* [baseline.md](docs/baseline.md): protocol v3 as found, before changes
+* `docs/bench/`: benchmark reports (`scripts/bench.sh`)
 
 ## Build
 
@@ -66,8 +80,12 @@ The endpoint module is out of tree, against the board's 6.1 headers:
 make -C drivers/openmiop KDIR=/usr/src/linux-headers-6.1-rockchip
 ```
 
-The root-complex helper is a freestanding MIPS32 soft-float binary.
-A glibc build is hard-float and will SIGILL on the MT7620A.
+The module also builds unchanged against 6.18 (Talos; see
+docs/talos-port.md).
+
+The root-complex helper (`openmiop-rc`) and the `omi-peek` diagnostic are
+freestanding MIPS32 soft-float binaries. A glibc build is hard-float and
+will SIGILL on the MT7620A.
 
 ```sh
 make -C userspace
