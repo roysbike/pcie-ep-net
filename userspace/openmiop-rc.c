@@ -439,6 +439,8 @@ struct ep {
 static struct ep eps[OMI_MAX_NODES];
 static u32 now;			/* now_ms() for this loop iteration */
 static int tables_dirty;
+static int reenum_wanted;
+static u32 reenum_after;		/* earliest next re-enumeration */
 static int tap = -1;
 static u8 tap_mac[6];
 static u32 frame[(OMI_GW_SLOT + 3) / 4];
@@ -468,11 +470,13 @@ static void log_ep(struct ep *e, const char *msg)
  * ports of the same switch. It depends only on the slot, so it is the
  * same after reloads and reboots, and empty slots keep their number.
  */
+static char switch_up[16];		/* switch upstream port, for re-enumeration */
+
 static int node_index(const char *bdf, char *parent)
 {
 	char path[80], link[160];
 	long n;
-	int i, slash = -1, prev = -1, idx = 0;
+	int i, slash = -1, prev = -1, pprev = -1, idx = 0;
 	unsigned pbus, pdev, d;
 
 	dev_path(path, bdf, "");
@@ -483,6 +487,7 @@ static int node_index(const char *bdf, char *parent)
 	link[n] = 0;
 	for (i = 0; i < n; i++) {
 		if (link[i] == '/') {
+			pprev = prev;
 			prev = slash;
 			slash = i;
 		}
@@ -491,6 +496,10 @@ static int node_index(const char *bdf, char *parent)
 		return -1;
 	memcpy(parent, link + prev + 1, 12);
 	parent[12] = 0;
+	if (pprev >= 0 && prev - pprev - 1 == 12) {
+		memcpy(switch_up, link + pprev + 1, 12);
+		switch_up[12] = 0;
+	}
 	pbus = (unsigned)(hexval(parent[5]) * 16 + hexval(parent[6]));
 	pdev = (unsigned)(hexval(parent[8]) * 16 + hexval(parent[9]));
 	for (d = 0; d < pdev; d++) {
@@ -606,7 +615,8 @@ static int ep_restore(struct ep *e)
 		return -1;
 	if (!lo && !hi) {
 		if (!e->warned++)
-			log_ep(e, "BAR0 has no address; the bridge window is full");
+			log_ep(e, "BAR0 has no address; the bridge windows need re-sizing");
+		reenum_wanted = 1;
 		return -1;
 	}
 	e->bar_lo = lo;
@@ -940,6 +950,64 @@ static void make_tap_mac(u8 *mac)
 
 /* ---- main loop ---- */
 
+/*
+ * Bridge windows are sized when they are first assigned: a blade that
+ * trains its link after that gets no BAR address. Re-enumerate the
+ * switch, but only after every endpoint stopped peer-to-peer traffic:
+ * while Linux rewrites the bridge windows, a write in flight could be
+ * routed to the wrong blade.
+ *
+ * 1. clear every peer table and wait until each endpoint applied it;
+ * 2. forget all endpoints (no MMIO from here on);
+ * 3. remove the switch upstream port and rescan.
+ *
+ * The endpoints keep their epochs; scan() finds them again, their BARs
+ * may move, and the new tables make the peers reconnect.
+ */
+static void reenumerate(void)
+{
+	char path[80];
+	u32 start;
+	int i, k;
+
+	reenum_wanted = 0;
+	reenum_after = now + 60000;
+	if (!switch_up[0])
+		return;
+	wr("re-enumerating the switch at ");
+	wr(switch_up);
+	wr("\n");
+
+	for (i = 0; i < (int)OMI_MAX_NODES; i++) {
+		struct ep *e = &eps[i];
+		int changed = 0;
+
+		if (e->state != EP_ACTIVE)
+			continue;
+		for (k = 0; k < (int)OMI_MAX_NODES; k++)
+			if (k != i)
+				changed |= table_put(e, k, 0);
+		if (changed) {
+			e->gen++;
+			wr32(&HDR(e)->ctl.table_gen, e->gen);
+		}
+	}
+	start = now_ms();
+	while (!peers_detached() && now_ms() - start < 2000)
+		msleep(10);
+
+	for (i = 0; i < (int)OMI_MAX_NODES; i++) {
+		ep_unmap(&eps[i]);
+		memset(&eps[i], 0, sizeof(eps[i]));
+	}
+
+	dev_path(path, switch_up, "remove");
+	write_file(path, "1");
+	msleep(500);
+	write_file("/sys/bus/pci/rescan", "1");
+	msleep(500);
+}
+
 static int due(struct ep *e, u32 period)
 {
 	if ((s32)(now - e->next) < 0)
@@ -1034,6 +1102,7 @@ static void ep_step(int idx)
 void _start(void)
 {
 	u32 next_scan, next_rescan;
+	char buf[8];
 	int i;
 
 	memset(eps, 0, sizeof(eps));
@@ -1056,6 +1125,16 @@ void _start(void)
 				next_rescan = now + 10000;
 				write_file("/sys/bus/pci/rescan", "1");
 			}
+		}
+		/* Operators can ask for it: touch /var/run/openmiop-reenumerate */
+		if (read_file("/var/run/openmiop-reenumerate", buf, sizeof(buf)) >= 0) {
+			sc(4010 /* unlink */, (long)"/var/run/openmiop-reenumerate", 0, 0, 0, 0, 0);
+			reenum_wanted = 1;
+			reenum_after = now;
+		}
+		if (reenum_wanted && (s32)(now - reenum_after) >= 0) {
+			reenumerate();
+			continue;
 		}
 		for (i = 0; i < (int)OMI_MAX_NODES; i++)
 			ep_step(i);
