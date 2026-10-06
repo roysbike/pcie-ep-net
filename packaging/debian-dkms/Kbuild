@@ -1,0 +1,2 @@
+obj-m += openmiop-ep.o
+ccflags-y += -I$(src)

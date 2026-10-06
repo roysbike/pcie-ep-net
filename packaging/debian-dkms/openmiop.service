@@ -1,0 +1,13 @@
+[Unit]
+Description=openmiop: Ethernet over the Mixtile Cluster Box PCIe fabric (omi0)
+ConditionPathExists=/etc/openmiop.addr
+After=systemd-modules-load.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/openmiop-ep-start
+
+[Install]
+WantedBy=multi-user.target

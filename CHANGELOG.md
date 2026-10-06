@@ -5,8 +5,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.1.0-rc.2] - 2026-10-06
 
-Driver fix release. Protocol v4 is unchanged; the BMC helper is
-unchanged (byte-identical build). Part of OpenMIOP Stack v0.1.0-rc.2.
+Driver fix and packaging release. Protocol v4 is unchanged; the BMC
+helper source is unchanged. Part of OpenMIOP Stack v0.1.0-rc.2.
+
+### Added
+
+- `openmiop-dkms` Debian package for Debian 12/13 and Ubuntu 22.04/24.04
+  (arm64, kernel 6.1 or newer): DKMS builds the module for the running
+  kernel, `openmiop.service` brings up `omi0` from `/etc/openmiop.addr`,
+  the vendor `load-miop.service` is disabled. Finds the Mixtile vendor
+  headers by itself. CI installs the package in each of these
+  distributions and checks that the module builds for its kernel.
+
+### Changed
+
+- Release assets have one naming scheme and no build leftovers:
+  `openmiop-dkms_<version>_all.deb`,
+  `openmiop-<version>-clusterbox-bmc-mipsel.tar.gz` (helper, `omi-peek`,
+  init script), `BUILD-INFO.txt`, `SHA256SUMS`.
 
 ### Fixed
 

@@ -5,14 +5,35 @@ on:
   pull_request:
 
 jobs:
-  root-complex:
-    name: MT7620A helper
+  version:
+    name: Version
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            v=${GITHUB_REF_NAME#v}
+          else
+            v=$(git describe --tags --match 'v[0-9]*' --always | sed 's/^v//')
+          fi
+          echo "version=${v}" | tee -a "${GITHUB_OUTPUT}"
+
+  root-complex:
+    name: Cluster Box helper (MT7620A)
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: Cross toolchain
         run: sudo apt-get update && sudo apt-get install -y gcc-mipsel-linux-gnu
-      - name: Build openmiop-rc
+      - name: Build openmiop-rc and omi-peek
         working-directory: userspace
         run: make
       - name: Check the binaries
@@ -20,28 +41,31 @@ jobs:
         run: |
           file openmiop-rc | grep -E 'MIPS|32-bit'
           file omi-peek | grep -E 'MIPS|32-bit'
-      - name: Collect Cluster Box artifacts
+      - name: Package
         run: |
-          mkdir -p dist
-          cp userspace/openmiop-rc userspace/omi-peek dist/
-          cp scripts/openmiop.init dist/openmiop.init
-          {
-            echo "repository: ${GITHUB_REPOSITORY}"
-            echo "commit: ${GITHUB_SHA}"
-            echo "ref: ${GITHUB_REF}"
-            echo "run: ${GITHUB_RUN_ID}"
-            echo "compiler: $(mipsel-linux-gnu-gcc --version | head -1)"
-          } > dist/BUILD-INFO.txt
-          (cd dist && sha256sum openmiop-rc omi-peek openmiop.init BUILD-INFO.txt > SHA256SUMS)
-          cat dist/BUILD-INFO.txt dist/SHA256SUMS
+          name=openmiop-${VERSION}-clusterbox-bmc-mipsel
+          mkdir -p "pkg/${name}" dist
+          cp userspace/openmiop-rc userspace/omi-peek "pkg/${name}/"
+          cp scripts/openmiop.init "pkg/${name}/openmiop.init"
+          cat > "pkg/${name}/README.txt" <<EOT
+          openmiop ${VERSION}: Cluster Box BMC helper (OpenWrt, MT7620A, mipsel soft-float)
+          Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
+
+          Only needed on BMC firmware without the openmiop package.
+            cp openmiop-rc /usr/bin/ && chmod 755 /usr/bin/openmiop-rc
+            cp openmiop.init /etc/init.d/openmiop && chmod 755 /etc/init.d/openmiop
+            /etc/init.d/openmiop enable && /etc/init.d/openmiop start
+          EOT
+          sed -i 's/^          //' "pkg/${name}/README.txt"
+          tar -C pkg --owner=0 --group=0 -czf "dist/${name}.tar.gz" "${name}"
       - uses: actions/upload-artifact@v4
         with:
-          name: openmiop-clusterbox-${{ github.sha }}
+          name: bmc
           path: dist/
           if-no-files-found: error
 
   endpoint:
-    name: RK3588 endpoint module
+    name: Endpoint module, upstream 6.1 compile check
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -62,38 +86,113 @@ jobs:
             ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
           test -f openmiop-ep.ko
 
+  dkms-deb:
+    name: DKMS package
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/build-dkms-deb.sh "${{ needs.version.outputs.version }}" dist
+      - run: dpkg-deb -I dist/*.deb && dpkg-deb -c dist/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/
+          if-no-files-found: error
+
+  dkms-install:
+    name: DKMS install on ${{ matrix.os }}
+    needs: dkms-deb
+    runs-on: ubuntu-24.04-arm
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Debian 12
+            image: debian:12
+            headers: linux-headers-arm64
+          - os: Debian 13
+            image: debian:13
+            headers: linux-headers-arm64
+          - os: Ubuntu 22.04 (HWE kernel)
+            image: ubuntu:22.04
+            headers: linux-headers-generic-hwe-22.04
+          - os: Ubuntu 24.04
+            image: ubuntu:24.04
+            headers: linux-headers-generic
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb
+          path: dist
+      - name: Kernel headers and dkms
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends dkms build-essential ${{ matrix.headers }} iproute2 kmod
+          ls /lib/modules
+      - name: Install the package (DKMS builds the module)
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y ./dist/openmiop-dkms_*_all.deb
+          dkms status
+      - name: Check the built module
+        run: |
+          set -e
+          n=0
+          for k in $(ls /lib/modules); do
+            [ -e "/lib/modules/$k/build" ] || continue
+            ko=$(find "/lib/modules/$k/updates" -name 'openmiop-ep.ko*' | head -n1)
+            test -n "$ko" || { echo "no module for $k"; exit 1; }
+            modinfo "$ko" | grep -E '^(vermagic|alias|license)'
+            modinfo -F vermagic "$ko" | grep -q "^$k "
+            n=$((n + 1))
+          done
+          test "$n" -ge 1
+      - name: Remove the package
+        run: |
+          apt-get remove -y openmiop-dkms
+          ! find /lib/modules -name 'openmiop-ep.ko*' | grep -q .
+
   release:
     name: GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [root-complex, endpoint]
+    needs: [version, root-complex, endpoint, dkms-deb, dkms-install]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: Tag, CHANGELOG and release notes agree
         run: |
-          tag="${GITHUB_REF_NAME}"
-          grep -q "^## \[${tag#v}\] - " CHANGELOG.md
-          test -s "docs/release-notes/${tag}.md"
+          grep -q "^## \[${VERSION}\] - " CHANGELOG.md
+          test -s "docs/release-notes/${GITHUB_REF_NAME}.md"
       - uses: actions/download-artifact@v4
         with:
-          name: openmiop-clusterbox-${{ github.sha }}
           path: dist
-      - name: Check the artifacts
+          merge-multiple: true
+      - name: Checksums and build record
         working-directory: dist
         run: |
-          sha256sum -c SHA256SUMS
-          grep -qx "commit: ${GITHUB_SHA}" BUILD-INFO.txt
+          {
+            echo "release: ${GITHUB_REF_NAME}"
+            echo "repository: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            echo "commit: ${GITHUB_SHA}"
+            echo "ci-run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "protocol: OpenMIOP v4"
+          } > BUILD-INFO.txt
+          sha256sum -- *.deb *.tar.gz BUILD-INFO.txt > SHA256SUMS
+          cat BUILD-INFO.txt SHA256SUMS
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${GITHUB_REF_NAME}"
           pre=
-          case "$tag" in *-*) pre=--prerelease ;; esac
-          gh release create "$tag" --verify-tag $pre \
-            --title "openmiop ${tag}" \
-            --notes-file "docs/release-notes/${tag}.md" \
-            dist/openmiop-rc dist/omi-peek dist/openmiop.init \
-            dist/BUILD-INFO.txt dist/SHA256SUMS
+          case "${GITHUB_REF_NAME}" in *-*) pre=--prerelease ;; esac
+          gh release create "${GITHUB_REF_NAME}" --verify-tag $pre \
+            --title "openmiop ${GITHUB_REF_NAME}" \
+            --notes-file "docs/release-notes/${GITHUB_REF_NAME}.md" \
+            dist/*.deb dist/*.tar.gz dist/BUILD-INFO.txt dist/SHA256SUMS
