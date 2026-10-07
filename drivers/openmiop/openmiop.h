@@ -111,7 +111,9 @@ struct omi_peer_entry {
 struct omi_prod {
 	__u32 head;
 	__u32 token;		/* sender's connect token */
-	__u8 pad[56];
+	__u32 features;		/* OMI_FEAT_* the sender supports */
+	__u32 feat_token;	/* = token when features belong to it */
+	__u8 pad[48];
 };
 
 /* ---- 0x0600: one line per remote node, written by that node ----
@@ -122,8 +124,26 @@ struct omi_prod {
 struct omi_cons {
 	__u32 tail;
 	__u32 ack;		/* = our token once node i accepted it */
-	__u8 pad[56];
+	__u32 features;		/* OMI_FEAT_* node i offers us */
+	__u32 db_off;		/* doorbell word in node i's BAR */
+	__u32 db_data;		/* value to write there */
+	__u32 db_token;		/* = ack when the four above belong to it */
+	__u8 pad[40];
 };
+
+/*
+ * Optional features, negotiated per connection. A peer that does not
+ * know them never writes these fields; *_token ties them to the
+ * current connect token, so values from an earlier connection never
+ * count.
+ *
+ * OMI_FEAT_DOORBELL, receiver: after a run's head writes, the sender
+ * also writes db_data at db_off in the receiver's BAR. The receiver
+ * maps that address onto an interrupt (on RK3588: an inbound iATU
+ * window onto the GIC ITS translater), so it need not poll its rings.
+ * Sender: it rings when offered.
+ */
+#define OMI_FEAT_DOORBELL	0x1u
 
 struct omi_bar_head {
 	struct omi_hdr hdr;
@@ -173,6 +193,9 @@ struct omi_gw {
 #define OMI_N_RINGS		4u
 /* Local eDMA scratch. Peers and the RC never write here. */
 #define OMI_SCRATCH_OFF		0xf00000u
+/* 64 KiB of BAR0 that this implementation maps onto its doorbell. */
+#define OMI_DB_WIN_OFF		0xff0000u
+#define OMI_DB_WIN_SIZE		0x10000u
 
 #define OMI_GW_DATA		(OMI_GW_SLOT - sizeof(struct omi_slot_hdr))
 #define OMI_SLOT_DATA		(OMI_SLOT - sizeof(struct omi_slot_hdr))

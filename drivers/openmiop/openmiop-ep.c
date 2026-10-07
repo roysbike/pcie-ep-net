@@ -53,13 +53,16 @@
 #include <linux/interrupt.h>
 #include <linux/ethtool.h>
 #include <linux/io.h>
+#include <linux/irqdomain.h>
 #include <linux/jhash.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/msi.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_net.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/pci.h>
@@ -145,6 +148,10 @@ static bool tx_irq = true;
 module_param(tx_irq, bool, 0444);
 MODULE_PARM_DESC(tx_irq, "Wait for eDMA runs on the done interrupt (off: poll the done bit)");
 
+static bool rx_doorbell = true;
+module_param(rx_doorbell, bool, 0444);
+MODULE_PARM_DESC(rx_doorbell, "Offer peers a doorbell that raises an RX interrupt (needs the GIC ITS and Linux 6.10+; off: poll)");
+
 static uint lanes = 2;
 module_param(lanes, uint, 0444);
 MODULE_PARM_DESC(lanes, "Link width. 2 matches Blade 3 (the other two PHY lanes are the M.2 NVMe). 4 aggregates the PHY onto this controller and drops the NVMe");
@@ -200,6 +207,7 @@ struct omi_scratch {
 	u32 head[2][OMI_MAX_NODES];		/* per list */
 	struct edma_lli ll[2][OMI_LL_MAX + 1];	/* double-buffered */
 	struct omi_slot_hdr txh[OMI_TXQ_SIZE];	/* one per txq entry */
+	u32 db[OMI_MAX_NODES];			/* doorbell value per peer */
 };
 
 /* One eDMA run: a contiguous range of txq entries and the slots it
@@ -213,6 +221,7 @@ struct omi_batch {
 	u32 cnt[OMI_MAX_NODES];		/* slots per peer */
 	u32 gen;			/* ep->build_gen when built */
 	u32 bytes;
+	u8 db_mask;			/* peers rung at the end of the run */
 	int nel;			/* list elements, 0: nothing to send */
 	int list;			/* which scratch list */
 	bool built;
@@ -220,7 +229,9 @@ struct omi_batch {
 
 /* Without an RX interrupt the ctl thread polls. It polls every
  * 20-50 us while traffic is recent, then every 200-400 us, so an idle
- * link costs little CPU. Busy loops * ~40 us is about 80 ms.
+ * link costs little CPU. Busy loops * ~40 us is about 80 ms. When every
+ * connected sender rings our doorbell it only polls at the idle rate,
+ * for the gateway ring and for a doorbell that arrives before its data.
  */
 #define OMI_POLL_BUSY_LOOPS	2000
 #define OMI_POLL_IDLE_US	200
@@ -258,6 +269,8 @@ struct omi_peer {
 	/* tx_lock */
 	enum omi_peer_state state;
 	bool stalled;
+	bool db_ok;			/* ring the peer's doorbell */
+	u32 db_off;			/* doorbell word in its BAR */
 	u32 head;			/* next slot we fill */
 	u32 tail;			/* consumed by the peer (credit) */
 	u32 queued;			/* frames queued, not yet sent */
@@ -268,6 +281,7 @@ struct omi_peer {
 	u32 rx_tail;
 	u32 rx_credit;			/* last tail written to the sender */
 	bool rx_ack;			/* ack not yet written */
+	bool rx_db;			/* the sender rings our doorbell */
 };
 
 struct omi_txd {
@@ -287,7 +301,7 @@ struct omi_xmit_stats {
 struct omi_tx_stats {
 	u64_stats_t p2p_frames, dma_runs, dma_elems, dma_errors, dropped,
 		    peer_full_drops, queue_wakes, dma_wait_ns, dma_bytes,
-		    irq_lost;
+		    irq_lost, doorbells;
 	struct u64_stats_sync syncp;
 };
 
@@ -299,7 +313,8 @@ struct omi_rx_stats {
 
 struct omi_ctl_stats {
 	u64_stats_t poll_cycles, napi_kicks, table_updates, peer_up,
-		    peer_down, stalls, queue_wakes, link_resets, connect_renew;
+		    peer_down, stalls, queue_wakes, link_resets, connect_renew,
+		    db_windows;
 	struct u64_stats_sync syncp;
 };
 
@@ -353,6 +368,24 @@ struct omi_ep {
 	wait_queue_head_t tx_done_wq;
 	u32 gw_head;			/* xmit only */
 	struct omi_batch batch[2];	/* tx thread */
+
+	/* RX doorbell: one GIC ITS vector per possible sender bus (the ITS
+	 * DeviceID is the writer's requester ID), and inbound iATU region 0
+	 * mapping BAR0 + OMI_DB_WIN_OFF onto the ITS translater.
+	 */
+	bool db_ok;			/* vectors ready */
+	u64 db_bar_pci;			/* BAR address the window is for, 0: off */
+	phys_addr_t db_xlate;		/* 64 KiB page holding GITS_TRANSLATER */
+	u32 db_word;			/* its offset in that page */
+	u32 db_data;			/* event id the senders write */
+	unsigned long rx_nodb;		/* connected senders that do not ring */
+	struct device_node *db_np;
+	struct of_changeset db_ocs;
+	struct omi_dbv {
+		struct platform_device *pdev;
+		int irq;
+		struct msi_msg msg;
+	} dbv[16];
 
 	/* RX */
 	struct napi_struct napi;
@@ -446,9 +479,16 @@ static int atu_wait_enable(void __iomem *base)
 	return -ETIMEDOUT;
 }
 
+/* Inbound regions. Where regions overlap the lower index wins (seen on
+ * RK3588), so the doorbell window, a small part of BAR0, is region 0
+ * and the BAR match behind it region 1.
+ */
+#define OMI_IB_DB	0
+#define OMI_IB_BAR	1
+
 static int program_inbound_bar0(struct omi_ep *ep)
 {
-	void __iomem *base = atu_region(ep, 0, true);
+	void __iomem *base = atu_region(ep, OMI_IB_BAR, true);
 
 	writel(lower_32_bits(ep->dma), base + PCIE_ATU_LOWER_TARGET);
 	writel(upper_32_bits(ep->dma), base + PCIE_ATU_UPPER_TARGET);
@@ -460,7 +500,51 @@ static int program_inbound_bar0(struct omi_ep *ep)
 		dev_err(ep->dev, "inbound iATU did not enable\n");
 		return -ETIMEDOUT;
 	}
+	/* The BAR match is in place: region 0 (an older driver's BAR match,
+	 * or a doorbell window for an address that may be gone) can go.
+	 * db_window_update() maps the window again for the current BAR.
+	 */
+	writel(0, atu_region(ep, OMI_IB_DB, true) + PCIE_ATU_REGION_CTRL2);
+	ep->db_bar_pci = 0;
 	return 0;
+}
+
+/* ctl thread. Map the doorbell window for the BAR address the RC
+ * assigned, again whenever it moves. A doorbell written while the
+ * window is off lands in unused BAR memory; the idle poll covers it.
+ */
+static void db_window_update(struct omi_ep *ep)
+{
+	void __iomem *base = atu_region(ep, OMI_IB_DB, true);
+	u64 pci, win, end;
+
+	if (!ep->db_ok)
+		return;
+	pci = ((u64)readl(ep->dbi + PCI_BASE_ADDRESS_1) << 32 |
+	       readl(ep->dbi + PCI_BASE_ADDRESS_0)) & ~0xfULL;
+	if (pci == ep->db_bar_pci)
+		return;
+	writel(0, base + PCIE_ATU_REGION_CTRL2);
+	ep->db_bar_pci = 0;
+	if (!pci)
+		return;
+	win = pci + OMI_DB_WIN_OFF;
+	end = win + OMI_DB_WIN_SIZE - 1;
+	writel(lower_32_bits(win), base + PCIE_ATU_LOWER_BASE);
+	writel(upper_32_bits(win), base + PCIE_ATU_UPPER_BASE);
+	writel(lower_32_bits(end), base + PCIE_ATU_LIMIT);
+	writel(upper_32_bits(end), base + PCIE_ATU_UPPER_LIMIT);
+	writel(lower_32_bits(ep->db_xlate), base + PCIE_ATU_LOWER_TARGET);
+	writel(upper_32_bits(ep->db_xlate), base + PCIE_ATU_UPPER_TARGET);
+	writel(PCIE_ATU_TYPE_MEM, base + PCIE_ATU_REGION_CTRL1);
+	writel(PCIE_ATU_ENABLE, base + PCIE_ATU_REGION_CTRL2);
+	if (atu_wait_enable(base)) {
+		dev_err_ratelimited(ep->dev, "doorbell window did not enable\n");
+		return;
+	}
+	ep->db_bar_pci = pci;
+	omi_inc(&ep->cs, db_windows);
+	dev_info(ep->dev, "doorbell window at %#llx\n", win);
 }
 
 /* Outbound region n maps window n (ob_phys + n * BAR size) onto the
@@ -1008,7 +1092,8 @@ static void tx_build(struct omi_ep *ep, struct omi_batch *b,
 			d->mask &= ep->up_mask;
 			omi_inc(&ep->ts, peer_full_drops);
 		}
-		if (nel + hweight8(d->mask) * (d->nseg + 1) + OMI_MAX_NODES > OMI_LL_MAX)
+		/* Room for this frame plus a head write and a doorbell per peer. */
+		if (nel + hweight8(d->mask) * (d->nseg + 1) + 2 * OMI_MAX_NODES > OMI_LL_MAX)
 			break;
 		m = d->mask;
 		for_each_set_bit(p, &m, OMI_MAX_NODES) {
@@ -1050,6 +1135,9 @@ static void tx_build(struct omi_ep *ep, struct omi_batch *b,
 	}
 	if (b->n)
 		b->gen = ++ep->build_gen;
+	for (i = 0; i < OMI_MAX_NODES; i++)
+		if ((touched & BIT(i)) && ep->peer[i].db_ok)
+			b->db_mask |= BIT(i);
 	spin_unlock_bh(&ep->tx_lock);
 
 	if (touched) {
@@ -1062,6 +1150,15 @@ static void tx_build(struct omi_ep *ep, struct omi_batch *b,
 				ep->scratch_dma + offsetof(struct omi_scratch, head[list][p]),
 				ep->peer[p].pci + BAR_OFF(rx_prod[ep->self].head));
 		}
+		/* Doorbells after every head: the element order is the
+		 * order the writes leave in, so a receiver woken by its
+		 * doorbell finds the head (and the frames before it).
+		 */
+		m = b->db_mask;
+		for_each_set_bit(p, &m, OMI_MAX_NODES)
+			ll_data(&ll[nel++], true, sizeof(u32),
+				ep->scratch_dma + offsetof(struct omi_scratch, db[p]),
+				ep->peer[p].pci + ep->peer[p].db_off);
 	}
 	b->nel = nel;
 }
@@ -1214,6 +1311,7 @@ static int tx_wait_run(struct omi_ep *ep, struct omi_batch *b, u64 t0)
 		omi_inc(&ep->ts, dma_runs);
 		omi_add(&ep->ts, dma_elems, b->nel);
 		omi_add(&ep->ts, dma_bytes, b->bytes);
+		omi_add(&ep->ts, doorbells, hweight8(b->db_mask));
 	}
 	return ret;
 }
@@ -1501,6 +1599,17 @@ static void rx_credit(struct omi_ep *ep, unsigned int r)
 		return;
 	c = pr->win + BAR_OFF(tx_cons[ep->self]);
 	if (pr->rx_ack) {
+		/* Features before the ack: the writes go out in order, so a
+		 * sender that sees the ack sees what belongs to it.
+		 */
+		if (READ_ONCE(ep->db_bar_pci)) {
+			writel(OMI_FEAT_DOORBELL, c + offsetof(struct omi_cons, features));
+			writel(OMI_DB_WIN_OFF + ep->db_word, c + offsetof(struct omi_cons, db_off));
+			writel(ep->db_data, c + offsetof(struct omi_cons, db_data));
+			writel(pr->rx_epoch, c + offsetof(struct omi_cons, db_token));
+		} else {
+			writel(0, c + offsetof(struct omi_cons, db_token));
+		}
 		writel(pr->rx_tail, c + offsetof(struct omi_cons, tail));
 		writel(pr->rx_epoch, c + offsetof(struct omi_cons, ack));
 		pr->rx_ack = false;
@@ -1533,10 +1642,20 @@ static int rx_ring(struct omi_ep *ep, unsigned int r, int budget)
 	dma_rmb();
 	head = READ_ONCE(prod->head);
 	if (epoch != pr->rx_epoch) {
-		/* Sender (re)connected; it wrote head before the token. */
+		/* Sender (re)connected; it wrote head and its features
+		 * before the token.
+		 */
 		pr->rx_epoch = epoch;
 		pr->rx_tail = head;
 		pr->rx_ack = true;
+		/* It rings if it can and we offer it (with this ack). */
+		pr->rx_db = READ_ONCE(ep->db_bar_pci) &&
+			    READ_ONCE(prod->feat_token) == epoch &&
+			    (READ_ONCE(prod->features) & OMI_FEAT_DOORBELL);
+		if (pr->rx_db)
+			clear_bit(r, &ep->rx_nodb);
+		else
+			set_bit(r, &ep->rx_nodb);
 		omi_inc(&ep->rs, connects);
 	}
 	avail = head - pr->rx_tail;
@@ -1678,6 +1797,7 @@ static void peer_down(struct omi_ep *ep, unsigned int p)
 		omi_inc(&ep->cs, peer_down);
 	pr->state = OMI_PEER_DOWN;
 	pr->stalled = false;
+	pr->db_ok = false;
 	pr->epoch = 0;
 	/* Its BAR may move before it comes back: no acks or credits
 	 * through the old window until peer_set() has re-pointed it.
@@ -1689,6 +1809,8 @@ static void peer_down(struct omi_ep *ep, unsigned int p)
 	spin_unlock_bh(&ep->tx_lock);
 	while ((s32)(READ_ONCE(ep->done_gen) - target) < 0 && ep->tx_task)
 		usleep_range(20, 50);
+	/* Until it connects again we cannot count on its doorbell. */
+	set_bit(p, &ep->rx_nodb);
 	dev_info(ep->dev, "peer %u down\n", p);
 }
 
@@ -1703,6 +1825,8 @@ static void peer_connect(struct omi_ep *ep, unsigned int p)
 	 * the barrier in writel() keeps them in order.
 	 */
 	writel(0, prod + offsetof(struct omi_prod, head));
+	writel(OMI_FEAT_DOORBELL, prod + offsetof(struct omi_prod, features));
+	writel(pr->token, prod + offsetof(struct omi_prod, feat_token));
 	writel(pr->token, prod + offsetof(struct omi_prod, token));
 	pr->conn_sent = jiffies;
 }
@@ -1759,6 +1883,7 @@ static void peer_set(struct omi_ep *ep, unsigned int p, u32 epoch, u64 pci,
 	pr->token = token;
 	pr->conn_start = jiffies;
 	pr->state = OMI_PEER_CONNECTING;
+	pr->db_ok = false;
 	pr->head = 0;
 	pr->tail = 0;
 	pr->full_since = 0;
@@ -1835,14 +1960,27 @@ static void peers_poll(struct omi_ep *ep)
 		c = (void *)ep->bar + BAR_OFF(tx_cons[p]);
 		bar_inval(ep, BAR_OFF(tx_cons[p]), sizeof(*c));
 		if (READ_ONCE(c->ack) == pr->token) {
+			u32 db_off = READ_ONCE(c->db_off);
+			bool db = READ_ONCE(c->db_token) == pr->token &&
+				  (READ_ONCE(c->features) & OMI_FEAT_DOORBELL) &&
+				  !(db_off & 3) && db_off <= OPENMIOP_BAR_SIZE - 4;
+
+			if (db) {
+				ep->scratch->db[p] = READ_ONCE(c->db_data);
+				dma_sync_single_for_device(ep->dev,
+					ep->scratch_dma + offsetof(struct omi_scratch, db[p]),
+					sizeof(u32), DMA_TO_DEVICE);
+			}
 			spin_lock_bh(&ep->tx_lock);
 			pr->state = OMI_PEER_UP;
 			pr->head = 0;
 			pr->tail = READ_ONCE(c->tail);
+			pr->db_off = db_off;
+			pr->db_ok = db;
 			ep->up_mask |= BIT(p);
 			spin_unlock_bh(&ep->tx_lock);
 			omi_inc(&ep->cs, peer_up);
-			dev_info(ep->dev, "peer %u up\n", p);
+			dev_info(ep->dev, "peer %u up%s\n", p, db ? ", doorbell" : "");
 		} else if (time_after(jiffies, pr->conn_sent + OMI_CONNECT_RETRY)) {
 			if (time_after(jiffies, pr->conn_start + OMI_CONNECT_RENEW))
 				peer_renew_token(ep, p);
@@ -1971,7 +2109,7 @@ static int ctl_thread(void *data)
 	struct net_device *ndev = ep->ndev;
 	unsigned long next_ctl = jiffies;
 	unsigned int idle = 0;
-	bool running;
+	bool running, doorbells;
 
 	set_user_nice(current, -20);
 	while (!kthread_should_stop()) {
@@ -1985,6 +2123,7 @@ static int ctl_thread(void *data)
 				link_reset(ep);
 		}
 		if (time_after_eq(jiffies, next_ctl)) {
+			db_window_update(ep);
 			rc_poll(ep);
 			table_apply(ep);
 			peers_poll(ep);
@@ -1998,7 +2137,14 @@ static int ctl_thread(void *data)
 		}
 
 		running = netif_running(ndev);
-		if (running && test_bit(NAPI_STATE_SCHED, &ep->napi.state)) {
+		/* Every connected sender rings: polling is only the backup. */
+		doorbells = ep->db_bar_pci && !READ_ONCE(ep->rx_nodb);
+		if (running && doorbells &&
+		    test_bit(NAPI_STATE_SCHED, &ep->napi.state)) {
+			idle = OMI_POLL_BUSY_LOOPS;
+			usleep_range_state(OMI_POLL_IDLE_US, 2 * OMI_POLL_IDLE_US,
+					   TASK_IDLE);
+		} else if (running && test_bit(NAPI_STATE_SCHED, &ep->napi.state)) {
 			/* NAPI is still draining (or disabled): it reschedules
 			 * itself while it has work, so there is nothing to kick.
 			 */
@@ -2015,7 +2161,7 @@ static int ctl_thread(void *data)
 			napi_schedule(&ep->napi);
 			local_bh_enable();
 			cond_resched();
-		} else if (idle < OMI_POLL_BUSY_LOOPS) {
+		} else if (idle < OMI_POLL_BUSY_LOOPS && !doorbells) {
 			/* TASK_IDLE: a sleeping poller is not load. */
 			idle++;
 			usleep_range_state(20, 50, TASK_IDLE);
@@ -2118,6 +2264,7 @@ static const struct {
 	OMI_STAT("tx_dma_wait_ns", ts, dma_wait_ns),
 	OMI_STAT("tx_dma_bytes", ts, dma_bytes),
 	OMI_STAT("tx_dma_irq_lost", ts, irq_lost),
+	OMI_STAT("tx_doorbells", ts, doorbells),
 	OMI_STAT("rx_p2p_packets", rs, p2p_packets),
 	OMI_STAT("rx_gw_packets", rs, gw_packets),
 	OMI_STAT("rx_bad_len", rs, errors),
@@ -2134,6 +2281,7 @@ static const struct {
 	OMI_STAT("ctl_queue_wakes", cs, queue_wakes),
 	OMI_STAT("ctl_link_resets", cs, link_resets),
 	OMI_STAT("ctl_connect_renew", cs, connect_renew),
+	OMI_STAT("ctl_doorbell_windows", cs, db_windows),
 };
 
 static void omi_get_drvinfo(struct net_device *ndev, struct ethtool_drvinfo *info)
@@ -2421,6 +2569,201 @@ static int omi_alloc_bar(struct omi_ep *ep)
 	return 0;
 }
 
+/* ---------------------------------------------------------------- */
+/* RX doorbell                                                       */
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0) && IS_ENABLED(CONFIG_OF_DYNAMIC)
+
+static irqreturn_t omi_db_isr(int irq, void *data)
+{
+	struct omi_ep *ep = data;
+
+	napi_schedule(&ep->napi);
+	return IRQ_HANDLED;
+}
+
+static void omi_db_write_msg(struct msi_desc *desc, struct msi_msg *msg)
+{
+	struct platform_device *d = to_platform_device(desc->dev);
+	struct omi_ep *ep = platform_get_drvdata(d);
+
+	ep->dbv[d->id >> 8].msg = *msg;
+}
+
+static void db_teardown(struct omi_ep *ep)
+{
+	unsigned int i;
+
+	ep->db_ok = false;
+	writel(0, atu_region(ep, OMI_IB_DB, true) + PCIE_ATU_REGION_CTRL2);
+	ep->db_bar_pci = 0;
+	for (i = 0; i < ARRAY_SIZE(ep->dbv); i++) {
+		struct omi_dbv *v = &ep->dbv[i];
+
+		if (v->irq > 0)
+			free_irq(v->irq, ep);
+		v->irq = 0;
+		if (v->pdev) {
+			platform_device_msi_free_irqs_all(&v->pdev->dev);
+			platform_device_unregister(v->pdev);
+			v->pdev = NULL;
+		}
+	}
+	if (ep->db_np) {
+		of_changeset_revert(&ep->db_ocs);
+		of_changeset_destroy(&ep->db_ocs);
+		ep->db_np = NULL;
+	}
+}
+
+/* The msi-map of this controller: from our own node, else from the
+ * root-complex node of the same controller (same "apb" registers),
+ * which the SoC DT describes with its msi-map.
+ */
+static struct device_node *db_msi_map_node(struct platform_device *pdev)
+{
+	struct resource *apb = platform_get_resource_byname(pdev, IORESOURCE_MEM, "apb");
+	struct device_node *np;
+	struct resource r;
+	int idx;
+
+	if (of_property_present(pdev->dev.of_node, "msi-map"))
+		return of_node_get(pdev->dev.of_node);
+	if (!apb)
+		return NULL;
+	for_each_compatible_node(np, NULL, "rockchip,rk3588-pcie") {
+		idx = of_property_match_string(np, "reg-names", "apb");
+		if (idx >= 0 && !of_address_to_resource(np, idx, &r) &&
+		    r.start == apb->start && of_property_present(np, "msi-map"))
+			return np;	/* reference held by the iterator */
+	}
+	return NULL;
+}
+
+/*
+ * One ITS vector per possible sender bus. Every vector's device points
+ * at a node of ours that carries the controller's msi-map, so the ITS
+ * DeviceID of the vector is msi-map(bus << 8): exactly the ID the
+ * controller attaches to a write from the endpoint on that bus. The bus
+ * numbers belong to the RC and may change; covering them all means no
+ * coordination with it. Senders all write the same event id (0).
+ */
+static int db_setup(struct omi_ep *ep, struct platform_device *pdev)
+{
+	struct device_node *src, *root, *np, *its = NULL;
+	struct irq_domain *dom;
+	const __be32 *map;
+	u32 *vals, devid;
+	u64 addr = 0;
+	unsigned int i;
+	int len, ret;
+
+	src = db_msi_map_node(pdev);
+	if (!src)
+		return -ENODEV;
+	map = of_get_property(src, "msi-map", &len);
+	if (!map || len < 16 || len % 16) {
+		of_node_put(src);
+		return -EINVAL;
+	}
+	vals = kmalloc(len, GFP_KERNEL);
+	if (!vals) {
+		of_node_put(src);
+		return -ENOMEM;
+	}
+	for (i = 0; i < len / 4; i++)
+		vals[i] = be32_to_cpu(map[i]);
+	of_node_put(src);
+
+	of_changeset_init(&ep->db_ocs);
+	root = of_find_node_by_path("/");
+	np = of_changeset_create_node(&ep->db_ocs, root, "openmiop-doorbell");
+	of_node_put(root);
+	ret = np ? of_changeset_add_prop_u32_array(&ep->db_ocs, np, "msi-map",
+						   vals, len / 4) : -ENOMEM;
+	kfree(vals);
+	if (!ret)
+		ret = of_changeset_apply(&ep->db_ocs);
+	if (ret) {
+		of_changeset_destroy(&ep->db_ocs);
+		return ret;
+	}
+	ep->db_np = np;
+
+	ret = of_map_id(np, 1 << 8, "msi-map", "msi-map-mask", &its, &devid);
+	if (ret || !its) {
+		db_teardown(ep);
+		return ret ?: -ENODEV;
+	}
+	dom = irq_find_matching_fwnode(of_fwnode_handle(its), DOMAIN_BUS_NEXUS);
+	of_node_put(its);
+	if (!dom) {
+		db_teardown(ep);
+		return -EPROBE_DEFER;
+	}
+
+	for (i = 1; i < ARRAY_SIZE(ep->dbv); i++) {
+		struct omi_dbv *v = &ep->dbv[i];
+		struct platform_device *d;
+		u64 a;
+
+		d = platform_device_alloc("openmiop-db", i << 8);
+		if (!d) {
+			ret = -ENOMEM;
+			break;
+		}
+		device_set_node(&d->dev, of_fwnode_handle(np));
+		platform_set_drvdata(d, ep);
+		ret = platform_device_add(d);
+		if (ret) {
+			platform_device_put(d);
+			break;
+		}
+		v->pdev = d;
+		dev_set_msi_domain(&d->dev, dom);
+		ret = platform_device_msi_init_and_alloc_irqs(&d->dev, 1, omi_db_write_msg);
+		if (ret)
+			break;
+		ret = request_irq(msi_get_virq(&d->dev, 0), omi_db_isr, 0,
+				  dev_name(&d->dev), ep);
+		if (ret)
+			break;
+		v->irq = msi_get_virq(&d->dev, 0);
+		a = (u64)v->msg.address_hi << 32 | v->msg.address_lo;
+		if (!addr) {
+			addr = a;
+			ep->db_data = v->msg.data;
+		}
+		if (a != addr || v->msg.data != ep->db_data) {
+			ret = -EINVAL;
+			break;
+		}
+	}
+	if (ret) {
+		db_teardown(ep);
+		return ret;
+	}
+	ep->db_xlate = addr & ~(u64)(OMI_DB_WIN_SIZE - 1);
+	ep->db_word = addr & (OMI_DB_WIN_SIZE - 1);
+	ep->db_ok = true;
+	dev_info(ep->dev, "RX doorbell: %u ITS vectors, translater %#llx data %#x\n",
+		 (unsigned int)ARRAY_SIZE(ep->dbv) - 1, addr, ep->db_data);
+	return 0;
+}
+
+#else
+
+static int db_setup(struct omi_ep *ep, struct platform_device *pdev)
+{
+	return -EOPNOTSUPP;
+}
+
+static void db_teardown(struct omi_ep *ep)
+{
+}
+
+#endif
+
 static int openmiop_probe(struct platform_device *pdev)
 {
 	struct omi_ep *ep;
@@ -2437,7 +2780,9 @@ static int openmiop_probe(struct platform_device *pdev)
 		     2 * OMI_GW_SLOTS * OMI_GW_SLOT > OMI_RING_OFF);
 	BUILD_BUG_ON(OMI_RING_OFF + OMI_N_RINGS * OMI_RING_SLOTS * OMI_SLOT >
 		     OMI_SCRATCH_OFF);
-	BUILD_BUG_ON(OMI_SCRATCH_OFF + sizeof(struct omi_scratch) > OPENMIOP_BAR_SIZE);
+	BUILD_BUG_ON(OMI_SCRATCH_OFF + sizeof(struct omi_scratch) > OMI_DB_WIN_OFF);
+	BUILD_BUG_ON(OMI_DB_WIN_OFF + OMI_DB_WIN_SIZE > OPENMIOP_BAR_SIZE);
+	BUILD_BUG_ON(sizeof(struct omi_prod) != 64 || sizeof(struct omi_cons) != 64);
 	BUILD_BUG_ON(offsetof(struct omi_scratch, ll) % 64);
 	BUILD_BUG_ON(OMI_N_RINGS > OMI_MAX_NODES || OMI_MAX_NODES > 8);
 	BUILD_BUG_ON(!is_power_of_2(OMI_RING_SLOTS) || !is_power_of_2(OMI_GW_SLOTS));
@@ -2579,6 +2924,15 @@ static int openmiop_probe(struct platform_device *pdev)
 	ndev->hw_features |= NETIF_F_SG | NETIF_F_GRO | NETIF_F_RXCSUM;
 	netif_napi_add(ndev, &ep->napi, omi_napi);
 	netif_carrier_off(ndev);
+	/* No sender has connected: none rings yet. */
+	ep->rx_nodb = GENMASK(OMI_MAX_NODES - 1, 0);
+	if (ep->edma && rx_doorbell) {
+		ret = db_setup(ep, pdev);
+		if (ret == -EPROBE_DEFER)
+			goto err_hw;
+		if (ret)
+			dev_info(&pdev->dev, "no RX doorbell (%d), polling\n", ret);
+	}
 	SET_NETDEV_DEV(ndev, &pdev->dev);
 
 	ret = register_netdev(ndev);
@@ -2600,6 +2954,7 @@ static int openmiop_probe(struct platform_device *pdev)
 err_unreg:
 	unregister_netdev(ndev);
 err_hw:
+	db_teardown(ep);
 	netif_napi_del(&ep->napi);
 	if (ep->ob)
 		iounmap(ep->ob);
@@ -2631,6 +2986,7 @@ static void openmiop_teardown(struct platform_device *pdev)
 	 */
 	kthread_stop(ep->ctl);
 	unregister_netdev(ep->ndev);
+	db_teardown(ep);
 	bar_leave(ep);
 	netif_napi_del(&ep->napi);
 	disable_outbound(ep);
