@@ -167,7 +167,7 @@ static void its_free(void)
 	its_irq = -1;
 	if (its_pdev) {
 		platform_device_msi_free_irqs_all(&its_pdev->dev);
-		of_platform_device_destroy(&its_pdev->dev, NULL);
+		platform_device_unregister(its_pdev);
 		its_pdev = NULL;
 	}
 	if (its_np) {
@@ -196,11 +196,17 @@ static int its_vector(u32 devid)
 			break;
 		}
 	}
-	if (!its)
+	if (!its) {
+		pr_err("omi-dbtest: ITS1 node at %#llx not found\n", ITS1_PHYS);
 		return -ENODEV;
+	}
 	dom = irq_find_matching_fwnode(of_fwnode_handle(its), DOMAIN_BUS_NEXUS);
+	if (!dom)
+		dom = irq_find_matching_fwnode(of_fwnode_handle(its), DOMAIN_BUS_ANY);
 	mp[0] = its->phandle;
 	mp[1] = devid;
+	pr_info("omi-dbtest: ITS1 node %pOF phandle %#x domain %s\n", its, mp[0],
+		dom ? dom->name : "(none)");
 	of_node_put(its);
 	if (!dom)
 		return -ENODEV;
@@ -221,10 +227,19 @@ static int its_vector(u32 devid)
 		return ret;
 	}
 	its_np = np;
-	its_pdev = of_platform_device_create(np, "omi-dbtest-its", NULL);
+	its_pdev = platform_device_alloc("omi-dbtest-its", PLATFORM_DEVID_NONE);
 	if (!its_pdev) {
 		its_free();
-		return -ENODEV;
+		return -ENOMEM;
+	}
+	device_set_node(&its_pdev->dev, of_fwnode_handle(np));
+	ret = platform_device_add(its_pdev);
+	if (ret) {
+		pr_err("omi-dbtest: platform_device_add: %d\n", ret);
+		platform_device_put(its_pdev);
+		its_pdev = NULL;
+		its_free();
+		return ret;
 	}
 	dev_set_msi_domain(&its_pdev->dev, dom);
 	ret = platform_device_msi_init_and_alloc_irqs(&its_pdev->dev, 1, write_its_msg);
