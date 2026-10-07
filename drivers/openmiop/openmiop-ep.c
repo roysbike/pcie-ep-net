@@ -50,6 +50,7 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
+#include <linux/interrupt.h>
 #include <linux/ethtool.h>
 #include <linux/io.h>
 #include <linux/jhash.h>
@@ -140,14 +141,19 @@ static bool use_edma = true;
 module_param(use_edma, bool, 0444);
 MODULE_PARM_DESC(use_edma, "Send blade-to-blade frames with the PCIe eDMA engine (off: gateway only)");
 
+static bool tx_irq = true;
+module_param(tx_irq, bool, 0444);
+MODULE_PARM_DESC(tx_irq, "Wait for eDMA runs on the done interrupt (off: poll the done bit)");
+
 static uint lanes = 2;
 module_param(lanes, uint, 0444);
 MODULE_PARM_DESC(lanes, "Link width. 2 matches Blade 3 (the other two PHY lanes are the M.2 NVMe). 4 aggregates the PHY onto this controller and drops the NVMe");
 
 /* Synopsys DWC eDMA (unrolled) write engine, channel 0. A write
  * channel reads local DRAM (SAR) and emits MemWr TLPs to the PCIe
- * address in DAR. LIE makes the done bit latch; the mask register
- * keeps the IRQ pin quiet so we can poll.
+ * address in DAR. LIE makes the done bit latch; with tx_irq the mask
+ * register lets channel 0's done and abort bits raise an interrupt,
+ * otherwise everything stays masked and the TX thread polls.
  */
 #define EDMA_CTRL		0x008
 #define EDMA_WR_ENB		0x00c
@@ -280,7 +286,8 @@ struct omi_xmit_stats {
 
 struct omi_tx_stats {
 	u64_stats_t p2p_frames, dma_runs, dma_elems, dma_errors, dropped,
-		    peer_full_drops, queue_wakes, dma_wait_ns, dma_bytes;
+		    peer_full_drops, queue_wakes, dma_wait_ns, dma_bytes,
+		    irq_lost;
 	struct u64_stats_sync syncp;
 };
 
@@ -341,6 +348,9 @@ struct omi_ep {
 	u32 txq_prod, txq_cons;
 	wait_queue_head_t tx_wait;
 	struct task_struct *tx_task;
+	int tx_irq;			/* an eDMA interrupt we hold, 0: poll */
+	atomic_t tx_irq_st;		/* done/abort bits latched by the ISR */
+	wait_queue_head_t tx_done_wq;
 	u32 gw_head;			/* xmit only */
 	struct omi_batch batch[2];	/* tx thread */
 
@@ -741,6 +751,15 @@ static void hw_stop(struct omi_ep *ep)
 /* ---------------------------------------------------------------- */
 /* eDMA                                                              */
 
+/* Only channel 0's done and abort bits may raise the interrupt, and
+ * only in interrupt mode. Status bits latch either way.
+ */
+static void edma_set_mask(struct omi_ep *ep)
+{
+	writel(ep->tx_irq ? ~(u32)(EDMA_INT_DONE | EDMA_INT_ABORT) : 0xffffffff,
+	       ep->edma + EDMA_WR_INT_MASK);
+}
+
 static void edma_init(struct omi_ep *ep)
 {
 	u32 ctrl;
@@ -753,8 +772,7 @@ static void edma_init(struct omi_ep *ep)
 		ep->edma = NULL;
 		return;
 	}
-	/* Status bits still latch. This only holds the IRQ pin down. */
-	writel(0xffffffff, ep->edma + EDMA_WR_INT_MASK);
+	edma_set_mask(ep);
 	writel(readl(ep->edma + EDMA_WR_LL_ERR) | BIT(0), ep->edma + EDMA_WR_LL_ERR);
 }
 
@@ -1143,9 +1161,48 @@ static int tx_wait_premap(struct omi_ep *ep, struct omi_batch *b)
 	return -ETIMEDOUT;
 }
 
+static irqreturn_t omi_edma_isr(int irq, void *data)
+{
+	struct omi_ep *ep = data;
+	u32 st = readl(ep->edma + EDMA_WR_INT_STATUS) &
+		 (EDMA_INT_DONE | EDMA_INT_ABORT);
+
+	if (!st)
+		return IRQ_NONE;
+	writel(st, ep->edma + EDMA_WR_INT_CLEAR);
+	atomic_or(st, &ep->tx_irq_st);
+	wake_up(&ep->tx_done_wq);
+	return IRQ_HANDLED;
+}
+
+/*
+ * Interrupt mode of tx_wait_premap(): map what is queued behind run b,
+ * then sleep until the done interrupt. If it does not come, look at the
+ * status bits once before calling the run lost.
+ */
+static int tx_wait_irq(struct omi_ep *ep, struct omi_batch *b)
+{
+	u32 st;
+
+	while (tx_premap(ep, b))
+		;
+	if (!wait_event_idle_timeout(ep->tx_done_wq, atomic_read(&ep->tx_irq_st),
+				     msecs_to_jiffies(50))) {
+		st = readl(ep->edma + EDMA_WR_INT_STATUS) &
+		     (EDMA_INT_DONE | EDMA_INT_ABORT);
+		if (!st)
+			return -ETIMEDOUT;
+		writel(st, ep->edma + EDMA_WR_INT_CLEAR);
+		atomic_or(st, &ep->tx_irq_st);
+		omi_inc(&ep->ts, irq_lost);
+	}
+	st = atomic_xchg(&ep->tx_irq_st, 0);
+	return st & EDMA_INT_ABORT ? -EIO : 0;
+}
+
 static int tx_wait_run(struct omi_ep *ep, struct omi_batch *b, u64 t0)
 {
-	int ret = tx_wait_premap(ep, b);
+	int ret = ep->tx_irq ? tx_wait_irq(ep, b) : tx_wait_premap(ep, b);
 
 	omi_add(&ep->ts, dma_wait_ns, ktime_get_ns() - t0);
 	if (ret) {
@@ -1204,6 +1261,7 @@ static int tx_thread(void *data)
 			continue;
 		}
 		t0 = ktime_get_ns();
+		atomic_set(&ep->tx_irq_st, 0);
 		edma_kick(ep, b);
 		ret = tx_wait_run(ep, b, t0);
 		tx_complete(ep, b, ret);
@@ -1893,6 +1951,8 @@ static void link_reset(struct omi_ep *ep)
 	for (p = 0; p < OMI_MAX_NODES; p++)
 		if (ep->peer[p].win_ok)
 			program_outbound(ep, p, ep->peer[p].pci);
+	if (ep->edma)
+		edma_set_mask(ep);
 
 	do {
 		ep->epoch = get_random_u32();
@@ -2057,6 +2117,7 @@ static const struct {
 	OMI_STAT("tx_queue_wakes", ts, queue_wakes),
 	OMI_STAT("tx_dma_wait_ns", ts, dma_wait_ns),
 	OMI_STAT("tx_dma_bytes", ts, dma_bytes),
+	OMI_STAT("tx_dma_irq_lost", ts, irq_lost),
 	OMI_STAT("rx_p2p_packets", rs, p2p_packets),
 	OMI_STAT("rx_gw_packets", rs, gw_packets),
 	OMI_STAT("rx_bad_len", rs, errors),
@@ -2391,6 +2452,7 @@ static int openmiop_probe(struct platform_device *pdev)
 	ep->self = OMI_MAX_NODES;
 	spin_lock_init(&ep->tx_lock);
 	init_waitqueue_head(&ep->tx_wait);
+	init_waitqueue_head(&ep->tx_done_wq);
 	u64_stats_init(&ep->xs.syncp);
 	u64_stats_init(&ep->ts.syncp);
 	u64_stats_init(&ep->rs.syncp);
@@ -2476,6 +2538,25 @@ static int openmiop_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_dma;
 	edma_init(ep);
+	if (ep->edma && tx_irq) {
+		/* Which dmaN line carries write channel 0 is not documented;
+		 * listen on all of them, the handler only takes channel 0 bits.
+		 */
+		static const char * const names[] = { "dma0", "dma1", "dma2", "dma3" };
+		unsigned int i;
+
+		for (i = 0; i < ARRAY_SIZE(names); i++) {
+			int irq = platform_get_irq_byname_optional(pdev, names[i]);
+
+			if (irq > 0 && !devm_request_irq(&pdev->dev, irq, omi_edma_isr,
+							 IRQF_SHARED, "openmiop-edma", ep))
+				ep->tx_irq = irq;
+		}
+		if (ep->tx_irq)
+			edma_set_mask(ep);
+		else
+			dev_warn(ep->dev, "no eDMA interrupt, polling\n");
+	}
 	if (ep->edma) {
 		ep->ob = ioremap(ep->ob_phys, (size_t)OMI_MAX_NODES * OPENMIOP_BAR_SIZE);
 		if (!ep->ob)
@@ -2512,7 +2593,8 @@ static int openmiop_probe(struct platform_device *pdev)
 	}
 
 	dev_info(&pdev->dev, "%s mac %pM epoch %#x eDMA %s\n", ndev->name,
-		 ndev->dev_addr, ep->epoch, ep->edma ? "on" : "off");
+		 ndev->dev_addr, ep->epoch,
+		 !ep->edma ? "off" : ep->tx_irq ? "on (irq)" : "on (polled)");
 	return 0;
 
 err_unreg:
