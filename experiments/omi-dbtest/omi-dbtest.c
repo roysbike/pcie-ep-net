@@ -21,7 +21,14 @@
  *                          match) to SPARE (default 2), disable 0, then
  *                          program 0 as the window. If the lowest region
  *                          wins on overlap, this is the order that works.
+ *                          TARGET (3rd arg): 0 MBI alias (default),
+ *                          1 GICD, 2 ITS1 translater page
  *   db0off                 undo db0
+ *   cpu 0|1                CPU write of the MBI vector data to the MBI
+ *                          alias (0) or GICD_SETSPI_NSR (1)
+ *   its DEVID              allocate an ITS1 vector for DeviceID DEVID
+ *                          (the requester ID of the PCIe writer); its
+ *                          event id is what to write at TRANSLATER
  *   peek OFF               read 16 bytes of BAR0 memory at OFF
  *   dump                   iATU regions, counters, vector
  *
@@ -37,6 +44,7 @@
 #include <linux/msi.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/pci_regs.h>
 #include <linux/platform_device.h>
@@ -60,6 +68,9 @@ module_param(ch, int, 0444);
 #define ATU_PHYS	0xa40300000ULL
 #define EDMA_OFF	0x80000
 #define MBI_ALIAS	0xfe610000ULL
+#define GICD_PHYS	0xfe600000ULL
+#define ITS1_PHYS	0xfe660000ULL
+#define ITS1_XLATE	(ITS1_PHYS + 0x10000)	/* GITS_TRANSLATER at +0x40 */
 
 #define EDMA_CTRL		0x008
 #define EDMA_WR_ENB		0x00c
@@ -97,6 +108,12 @@ static int db0_spare;			/* db0: region holding the BAR match */
 static atomic_t db_count, dma_count[4];
 static struct msi_msg db_msg;
 static phys_addr_t bar_phys;
+static struct of_changeset its_ocs;
+static struct device_node *its_np;	/* our dynamic node */
+static struct platform_device *its_pdev;
+static int its_irq = -1;
+static struct msi_msg its_msg;
+static atomic_t its_count;
 static void *buf;
 static dma_addr_t buf_dma;
 
@@ -126,6 +143,125 @@ static irqreturn_t db_isr(int irq, void *d)
 		pr_info("omi-dbtest: doorbell irq %d on cpu %d (count %d)\n",
 			irq, raw_smp_processor_id(), n);
 	return IRQ_HANDLED;
+}
+
+static void write_its_msg(struct msi_desc *desc, struct msi_msg *msg)
+{
+	its_msg = *msg;
+}
+
+static irqreturn_t its_isr(int irq, void *d)
+{
+	int n = atomic_inc_return(&its_count);
+
+	if (n <= 5 || !(n & 1023))
+		pr_info("omi-dbtest: ITS irq %d on cpu %d (count %d)\n",
+			irq, raw_smp_processor_id(), n);
+	return IRQ_HANDLED;
+}
+
+static void its_free(void)
+{
+	if (its_irq >= 0)
+		free_irq(its_irq, NULL);
+	its_irq = -1;
+	if (its_pdev) {
+		platform_device_msi_free_irqs_all(&its_pdev->dev);
+		of_platform_device_destroy(&its_pdev->dev, NULL);
+		its_pdev = NULL;
+	}
+	if (its_np) {
+		of_changeset_revert(&its_ocs);
+		of_changeset_destroy(&its_ocs);
+		its_np = NULL;
+	}
+}
+
+/* An ITS1 vector whose DeviceID is devid, via a dynamic DT node with
+ * msi-parent = <&its1 devid>. A PCIe write of the event id to the
+ * TRANSLATER raises it if the controller tags the write with devid.
+ */
+static int its_vector(u32 devid)
+{
+	struct device_node *its = NULL, *root, *np;
+	struct irq_domain *dom;
+	struct resource r;
+	u32 mp[2];
+	int ret, irq;
+
+	its_free();
+	for_each_compatible_node(np, NULL, "arm,gic-v3-its") {
+		if (!of_address_to_resource(np, 0, &r) && r.start == ITS1_PHYS) {
+			its = of_node_get(np);
+			break;
+		}
+	}
+	if (!its)
+		return -ENODEV;
+	dom = irq_find_matching_fwnode(of_fwnode_handle(its), DOMAIN_BUS_NEXUS);
+	mp[0] = its->phandle;
+	mp[1] = devid;
+	of_node_put(its);
+	if (!dom)
+		return -ENODEV;
+
+	root = of_find_node_by_path("/");
+	of_changeset_init(&its_ocs);
+	np = of_changeset_create_node(&its_ocs, root, "omi-dbtest-its");
+	of_node_put(root);
+	if (!np) {
+		of_changeset_destroy(&its_ocs);
+		return -ENOMEM;
+	}
+	ret = of_changeset_add_prop_u32_array(&its_ocs, np, "msi-parent", mp, 2);
+	if (!ret)
+		ret = of_changeset_apply(&its_ocs);
+	if (ret) {
+		of_changeset_destroy(&its_ocs);
+		return ret;
+	}
+	its_np = np;
+	its_pdev = of_platform_device_create(np, "omi-dbtest-its", NULL);
+	if (!its_pdev) {
+		its_free();
+		return -ENODEV;
+	}
+	dev_set_msi_domain(&its_pdev->dev, dom);
+	ret = platform_device_msi_init_and_alloc_irqs(&its_pdev->dev, 1, write_its_msg);
+	if (ret) {
+		pr_err("omi-dbtest: ITS MSI alloc failed %d\n", ret);
+		its_free();
+		return ret;
+	}
+	irq = msi_get_virq(&its_pdev->dev, 0);
+	ret = request_irq(irq, its_isr, 0, "omi-its-doorbell", NULL);
+	if (ret) {
+		its_free();
+		return ret;
+	}
+	its_irq = irq;
+	pr_info("omi-dbtest: ITS1 DeviceID %#x: irq %d msg %#x_%08x data %#x\n",
+		devid, irq, its_msg.address_hi, its_msg.address_lo, its_msg.data);
+	return 0;
+}
+
+static int cpu_write(int sel)
+{
+	phys_addr_t base = sel ? GICD_PHYS : MBI_ALIAS;
+	void __iomem *p;
+	int before = atomic_read(&db_count);
+
+	if (db_irq < 0)
+		return -ENODEV;
+	p = ioremap(base, 0x1000);
+	if (!p)
+		return -ENOMEM;
+	writel(db_msg.data, p + 0x40);
+	iounmap(p);
+	mdelay(5);
+	pr_info("omi-dbtest: CPU wrote %#x to %pa+0x40: doorbells %d -> %d\n",
+		db_msg.data, &base, before, atomic_read(&db_count));
+	return 0;
 }
 
 static irqreturn_t dma_isr(int irq, void *d)
@@ -164,6 +300,9 @@ static void dump(void)
 		dump_region(i);
 	pr_info("omi-dbtest: vector irq %d msg %#x_%08x data %#x; doorbell window region %d\n",
 		db_irq, db_msg.address_hi, db_msg.address_lo, db_msg.data, db_region);
+	pr_info("omi-dbtest: ITS vector irq %d msg %#x_%08x data %#x, ITS irqs %d\n",
+		its_irq, its_msg.address_hi, its_msg.address_lo, its_msg.data,
+		atomic_read(&its_count));
 	pr_info("omi-dbtest: doorbells %d, dma irqs %d %d %d %d\n",
 		atomic_read(&db_count), atomic_read(&dma_count[0]),
 		atomic_read(&dma_count[1]), atomic_read(&dma_count[2]),
@@ -271,17 +410,21 @@ static void copy_region(int from, int to)
 }
 
 /* Each step leaves every BAR0 address with a valid translation. */
-static int db0_on(int spare, u32 off)
+static int db0_on(int spare, u32 off, int tsel)
 {
+	static const u64 targets[] = { MBI_ALIAS, GICD_PHYS, ITS1_XLATE };
+	u64 target;
 	void __iomem *b = ib(0);
 	u64 base, end, pci = bar_pci();
 
 	if (db_irq < 0)
 		return -ENODEV;
-	if (spare < 1 || spare > 15 || off & 0xffff || off >= OPENMIOP_BAR_SIZE)
+	if (spare < 1 || spare > 15 || off & 0xffff || off >= OPENMIOP_BAR_SIZE ||
+	    tsel < 0 || tsel >= ARRAY_SIZE(targets))
 		return -EINVAL;
 	if (db0_spare)
 		return -EBUSY;
+	target = targets[tsel];
 	if (!pci)
 		return -EAGAIN;
 	if (!(readl(b + ATU_CTRL2) & ATU_ENABLE) || !(readl(b + ATU_CTRL2) & BIT(30))) {
@@ -301,8 +444,8 @@ static int db0_on(int spare, u32 off)
 	writel(upper_32_bits(base), b + ATU_UBASE);
 	writel(lower_32_bits(end), b + ATU_LIMIT);
 	writel(upper_32_bits(end), b + ATU_ULIMIT);
-	writel(lower_32_bits(MBI_ALIAS), b + ATU_LTARGET);
-	writel(upper_32_bits(MBI_ALIAS), b + ATU_UTARGET);
+	writel(lower_32_bits(target), b + ATU_LTARGET);
+	writel(upper_32_bits(target), b + ATU_UTARGET);
 	writel(upper_32_bits(end) != upper_32_bits(base) ? ATU_INCREASE : 0,
 	       b + ATU_CTRL1);
 	writel(ATU_ENABLE, b + ATU_CTRL2);
@@ -415,11 +558,15 @@ static int cmd_set(const char *val, const struct kernel_param *kp)
 	else if (!strcmp(op, "dboff"))
 		db_off();
 	else if (!strcmp(op, "db0"))
-		ret = db0_on(n > 1 ? a : 2, n > 2 ? b : win_off);
+		ret = db0_on(n > 1 ? a : 2, n > 2 ? b : win_off, n > 3 ? c : 0);
 	else if (!strcmp(op, "db0off"))
 		db0_off();
 	else if (!strcmp(op, "peek"))
 		ret = peek(a);
+	else if (!strcmp(op, "cpu"))
+		ret = cpu_write(a);
+	else if (!strcmp(op, "its"))
+		ret = n > 1 ? its_vector(a) : -EINVAL;
 	else if (!strcmp(op, "dump"))
 		dump();
 	else
@@ -434,7 +581,7 @@ static const struct kernel_param_ops cmd_ops = {
 	.set = cmd_set,
 };
 module_param_cb(cmd, &cmd_ops, NULL, 0200);
-MODULE_PARM_DESC(cmd, "edma PEER [OFF [CH]] | db REGION [WIN_OFF] | dboff | db0 [SPARE [WIN_OFF]] | db0off | peek OFF | dump");
+MODULE_PARM_DESC(cmd, "edma PEER [OFF [CH]] | db REGION [WIN_OFF] | dboff | db0 [SPARE [WIN_OFF [TARGET]]] | db0off | peek OFF | cpu 0|1 | its DEVID | dump");
 
 static void cleanup(void)
 {
@@ -442,6 +589,7 @@ static void cleanup(void)
 
 	db0_off();
 	db_off();
+	its_free();
 	if (db_irq >= 0)
 		free_irq(db_irq, NULL);
 	if (mdev) {
