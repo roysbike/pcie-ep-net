@@ -11,7 +11,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: v
@@ -30,7 +30,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cross toolchain
         run: sudo apt-get update && sudo apt-get install -y gcc-mipsel-linux-gnu
       - name: Build openmiop-rc and omi-peek
@@ -58,7 +58,7 @@ jobs:
           EOT
           sed -i 's/^          //' "pkg/${name}/README.txt"
           tar -C pkg --owner=0 --group=0 -czf "dist/${name}.tar.gz" "${name}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bmc
           path: dist/
@@ -68,7 +68,7 @@ jobs:
     name: Endpoint module, upstream 6.1 compile check
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cross toolchain
         run: |
           sudo apt-get update
@@ -91,10 +91,10 @@ jobs:
     needs: version
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/build-dkms-deb.sh "${{ needs.version.outputs.version }}" dist
       - run: dpkg-deb -I dist/*.deb && dpkg-deb -c dist/*.deb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deb
           path: dist/
@@ -122,7 +122,7 @@ jobs:
             image: ubuntu:24.04
             headers: linux-headers-generic
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: deb
           path: dist
@@ -165,12 +165,12 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Tag, CHANGELOG and release notes agree
         run: |
           grep -q "^## \[${VERSION}\] - " CHANGELOG.md
           test -s "docs/release-notes/${GITHUB_REF_NAME}.md"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
