@@ -2713,6 +2713,8 @@ static int db_setup(struct omi_ep *ep, struct platform_device *pdev)
 			break;
 		}
 		device_set_node(&d->dev, of_fwnode_handle(np));
+		/* The ITS maps dev->id (not pdev->id) through msi-map. */
+		d->dev.id = i << 8;
 		platform_set_drvdata(d, ep);
 		ret = platform_device_add(d);
 		if (ret) {
@@ -2735,6 +2737,8 @@ static int db_setup(struct omi_ep *ep, struct platform_device *pdev)
 			ep->db_data = v->msg.data;
 		}
 		if (a != addr || v->msg.data != ep->db_data) {
+			dev_err(ep->dev, "doorbell vector %u: msg %#llx/%#x, expected %#llx/%#x\n",
+				i, a, v->msg.data, addr, ep->db_data);
 			ret = -EINVAL;
 			break;
 		}
