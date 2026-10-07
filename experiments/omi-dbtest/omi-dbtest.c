@@ -111,6 +111,7 @@ static phys_addr_t bar_phys;
 static struct of_changeset its_ocs;
 static struct device_node *its_np;	/* our dynamic node */
 static struct platform_device *its_pdev;
+static bool its_pdev_ours;		/* created here, not by the OF notifier */
 static int its_irq = -1;
 static struct msi_msg its_msg;
 static atomic_t its_count;
@@ -167,7 +168,10 @@ static void its_free(void)
 	its_irq = -1;
 	if (its_pdev) {
 		platform_device_msi_free_irqs_all(&its_pdev->dev);
-		platform_device_unregister(its_pdev);
+		if (its_pdev_ours)
+			platform_device_unregister(its_pdev);
+		else
+			put_device(&its_pdev->dev);
 		its_pdev = NULL;
 	}
 	if (its_np) {
@@ -227,20 +231,29 @@ static int its_vector(u32 devid)
 		return ret;
 	}
 	its_np = np;
-	its_pdev = platform_device_alloc("omi-dbtest-its", PLATFORM_DEVID_NONE);
+	/* A node added under the root gets a platform device from the OF
+	 * reconfig notifier; use that one, create one only if it did not.
+	 */
+	its_pdev = of_find_device_by_node(np);
+	its_pdev_ours = !its_pdev;
 	if (!its_pdev) {
-		its_free();
-		return -ENOMEM;
+		its_pdev = platform_device_alloc("omi-dbtest-its", PLATFORM_DEVID_NONE);
+		if (!its_pdev) {
+			its_free();
+			return -ENOMEM;
+		}
+		device_set_node(&its_pdev->dev, of_fwnode_handle(np));
+		ret = platform_device_add(its_pdev);
+		if (ret) {
+			pr_err("omi-dbtest: platform_device_add: %d\n", ret);
+			platform_device_put(its_pdev);
+			its_pdev = NULL;
+			its_free();
+			return ret;
+		}
 	}
-	device_set_node(&its_pdev->dev, of_fwnode_handle(np));
-	ret = platform_device_add(its_pdev);
-	if (ret) {
-		pr_err("omi-dbtest: platform_device_add: %d\n", ret);
-		platform_device_put(its_pdev);
-		its_pdev = NULL;
-		its_free();
-		return ret;
-	}
+	pr_info("omi-dbtest: ITS device %s (%s)\n", dev_name(&its_pdev->dev),
+		its_pdev_ours ? "created" : "from OF notifier");
 	dev_set_msi_domain(&its_pdev->dev, dom);
 	ret = platform_device_msi_init_and_alloc_irqs(&its_pdev->dev, 1, write_its_msg);
 	if (ret) {
