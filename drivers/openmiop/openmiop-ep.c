@@ -1446,6 +1446,33 @@ static int tx_wait_run(struct omi_ep *ep, struct omi_chan *ch,
 	return ret;
 }
 
+/*
+ * A queue stopped for credit with nothing left to send: the ring of some
+ * peer is full and only that peer's credit (a write into our BAR, which
+ * raises nothing) can restart it. Look for it here every 20-50 us rather
+ * than leave it to the ctl thread's 1-2 ms poll. True if a queue of ch
+ * is still stopped.
+ */
+static bool ch_credit_wake(struct omi_ep *ep, struct omi_chan *ch)
+{
+	bool stopped = false;
+	unsigned int q;
+
+	for (q = ch->idx; q < ep->nq; q += ep->nch) {
+		struct omi_txq *txq = &ep->txq[q];
+
+		if (!netif_tx_queue_stopped(netdev_get_tx_queue(ep->ndev, q)))
+			continue;
+		spin_lock_bh(&txq->lock);
+		if (omi_maybe_wake(ep, txq))
+			omi_inc(&ch->ts, queue_wakes);
+		else
+			stopped = true;
+		spin_unlock_bh(&txq->lock);
+	}
+	return stopped;
+}
+
 /* The queues a channel serves: q with q % nch == channel. */
 static bool ch_has_frames(struct omi_ep *ep, struct omi_chan *ch)
 {
@@ -1501,8 +1528,10 @@ static int tx_thread(void *data)
 				waiting = true;
 		}
 		if (!b->n) {
-			if (waiting) {
-				/* The first frame waits for credit. */
+			if (waiting || ch_credit_wake(ep, ch)) {
+				/* The first frame, or a stopped queue, waits for
+				 * credit.
+				 */
 				usleep_range(20, 50);
 				continue;
 			}
