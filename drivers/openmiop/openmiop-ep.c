@@ -152,6 +152,10 @@ static bool rx_doorbell = true;
 module_param(rx_doorbell, bool, 0444);
 MODULE_PARM_DESC(rx_doorbell, "Offer peers a doorbell that raises an RX interrupt (needs the GIC ITS and Linux 6.10+; off: poll)");
 
+static uint queues = OMI_MAX_QUEUES;
+module_param(queues, uint, 0444);
+MODULE_PARM_DESC(queues, "TX/RX queue pairs (1-4); peers with the same count use one ring per queue");
+
 static uint lanes = 2;
 module_param(lanes, uint, 0444);
 MODULE_PARM_DESC(lanes, "Link width. 2 matches Blade 3 (the other two PHY lanes are the M.2 NVMe). 4 aggregates the PHY onto this controller and drops the NVMe");
@@ -182,6 +186,13 @@ MODULE_PARM_DESC(lanes, "Link width. 2 matches Blade 3 (the other two PHY lanes 
 #define EDMA_CTRL_TD		BIT(26)
 #define EDMA_INT_DONE		BIT(0)
 #define EDMA_INT_ABORT		BIT(16)
+/* Registers of write channel c (unrolled: one 0x200 block per channel),
+ * and its status bits.
+ */
+#define EDMA_WR_CH(c, reg)	((reg) + (c) * 0x200)
+#define EDMA_CH_DONE(c)		(EDMA_INT_DONE << (c))
+#define EDMA_CH_ABORT(c)	(EDMA_INT_ABORT << (c))
+#define EDMA_CH_BITS(c)		(EDMA_CH_DONE(c) | EDMA_CH_ABORT(c))
 
 /* One eDMA linked-list element. A link element stores the next
  * pointer in sar and leaves dar unused.
@@ -197,34 +208,41 @@ struct edma_lli {
 
 #define OMI_TX_BATCH		32
 #define OMI_TXQ_SIZE		256
-#define OMI_LL_MAX		256	/* data + head elements per run */
+#define OMI_LL_MAX		256	/* data + head + doorbell elements per run */
 #define OMI_MAX_SEGS		(MAX_SKB_FRAGS + 1)
+#define OMI_MAX_CH		2	/* eDMA write channels we drive */
 
-/* Local scratch at OMI_SCRATCH_OFF: head values the eDMA copies into
- * peers, and the linked list. Peers and the RC never write here.
+/* Local scratch at OMI_SCRATCH_OFF: per channel its two linked lists
+ * and the head values they copy into peers, per queue the slot headers,
+ * and the doorbell values. Peers and the RC never write here.
  */
-struct omi_scratch {
+struct omi_chan_scratch {
 	u32 head[2][OMI_MAX_NODES];		/* per list */
 	struct edma_lli ll[2][OMI_LL_MAX + 1];	/* double-buffered */
-	struct omi_slot_hdr txh[OMI_TXQ_SIZE];	/* one per txq entry */
-	u32 db[OMI_MAX_NODES];			/* doorbell value per peer */
+} __aligned(64);
+
+struct omi_scratch {
+	struct omi_chan_scratch ch[OMI_MAX_CH];
+	struct omi_slot_hdr txh[OMI_MAX_QUEUES][OMI_TXQ_SIZE];
+	u32 db[OMI_MAX_NODES][OMI_MAX_QUEUES];	/* doorbell value per peer, queue */
 };
 
-/* One eDMA run: a contiguous range of txq entries and the slots it
- * takes in each peer's ring. Two of them alternate, so the next run is
- * built while the previous one is on the wire.
+/* One eDMA run: a contiguous range of one queue's entries and the slots
+ * it takes in each peer's ring for that queue. Two of them alternate per
+ * channel, so the next run is built while the previous one is on the
+ * wire.
  */
 struct omi_batch {
+	u8 q;				/* queue it was built from */
 	u32 first;			/* txq index of the first entry */
 	u32 n;				/* entries */
 	u32 base[OMI_MAX_NODES];	/* first slot per peer */
 	u32 cnt[OMI_MAX_NODES];		/* slots per peer */
-	u32 gen;			/* ep->build_gen when built */
+	u32 gen;			/* txq->build_gen when built */
 	u32 bytes;
 	u8 db_mask;			/* peers rung at the end of the run */
 	int nel;			/* list elements, 0: nothing to send */
 	int list;			/* which scratch list */
-	bool built;
 };
 
 /* Without an RX interrupt the ctl thread polls. It polls every
@@ -260,6 +278,20 @@ enum omi_peer_state {
 	OMI_PEER_UP,
 };
 
+/* Our state for one queue of a peer. */
+struct omi_peer_txq {			/* omi_txq.lock */
+	u32 head;			/* next slot we fill */
+	u32 tail;			/* consumed by the peer (credit) */
+	u32 queued;			/* frames queued, not yet sent */
+};
+
+struct omi_peer_rxq {			/* the queue's NAPI */
+	u32 epoch;			/* sender token this queue follows */
+	u8 nq;				/* sender's layout: rings it fills */
+	u32 tail;
+	u32 credit;			/* last tail written to the sender */
+};
+
 struct omi_peer {
 	/* ctl thread */
 	u32 epoch;			/* table epoch we act on, 0: none */
@@ -272,22 +304,20 @@ struct omi_peer {
 	unsigned long conn_sent;
 	unsigned long conn_start;	/* when the current token was made */
 
-	/* tx_lock */
+	/* tx_lock; read locklessly by xmit and the TX threads */
 	enum omi_peer_state state;
 	bool stalled;
 	bool db_ok;			/* ring the peer's doorbell */
 	u32 db_off;			/* doorbell word in its BAR */
-	u32 head;			/* next slot we fill */
-	u32 tail;			/* consumed by the peer (credit) */
-	u32 queued;			/* frames queued, not yet sent */
+	u8 nq;				/* rings it set up for us (1: one ring) */
+	u32 slots;			/* slots per ring */
 	unsigned long full_since;
+	struct omi_peer_txq tq[OMI_MAX_QUEUES];
 
-	/* NAPI */
-	u32 rx_epoch;			/* sender token we accepted */
-	u32 rx_tail;
-	u32 rx_credit;			/* last tail written to the sender */
+	/* NAPI of queue 0 */
 	bool rx_ack;			/* ack not yet written */
 	bool rx_db;			/* the sender rings our doorbell */
+	struct omi_peer_rxq rq[OMI_MAX_QUEUES];
 };
 
 struct omi_txd {
@@ -299,19 +329,19 @@ struct omi_txd {
 	u32 len[OMI_MAX_SEGS];
 };
 
-struct omi_xmit_stats {
+struct omi_xmit_stats {			/* per TX queue: xmit */
 	u64_stats_t packets, bytes, dropped, gw_packets, gw_full, queue_stops;
 	struct u64_stats_sync syncp;
 };
 
-struct omi_tx_stats {
+struct omi_tx_stats {			/* per channel: its TX thread */
 	u64_stats_t p2p_frames, dma_runs, dma_elems, dma_errors, dropped,
 		    peer_full_drops, queue_wakes, dma_wait_ns, dma_bytes,
 		    irq_lost, doorbells;
 	struct u64_stats_sync syncp;
 };
 
-struct omi_rx_stats {
+struct omi_rx_stats {			/* per RX queue: its NAPI */
 	u64_stats_t packets, bytes, p2p_packets, gw_packets, errors,
 		    dropped, resyncs, connects, polls;
 	struct u64_stats_sync syncp;
@@ -322,6 +352,44 @@ struct omi_ctl_stats {
 		    peer_down, stalls, queue_wakes, link_resets, connect_renew,
 		    db_windows;
 	struct u64_stats_sync syncp;
+};
+
+struct omi_ep;
+
+/* A TX queue: xmit fills it, the TX thread of channel q % nch drains it. */
+struct omi_txq {
+	spinlock_t lock;
+	u8 idx;
+	struct omi_txd *ring;
+	u32 prod, cons;
+	u32 build_gen;			/* lock: runs built */
+	u32 done_gen;			/* lock: build_gen of the last run retired */
+	struct omi_xmit_stats xs;
+};
+
+/* An eDMA write channel and the thread that drives it. */
+struct omi_chan {
+	struct omi_ep *ep;
+	u8 idx;
+	u8 rr;				/* next of its queues to serve */
+	struct task_struct *task;
+	wait_queue_head_t wait;		/* xmit: frames queued */
+	wait_queue_head_t done_wq;	/* ISR: run done */
+	atomic_t irq_st;		/* done/abort bits latched by the ISR */
+	int irq;			/* 0: poll */
+	struct omi_batch batch[2];
+	struct omi_tx_stats ts;
+};
+
+/* An RX queue: rings (sender, q) for every sender, and for queue 0 the
+ * one-ring senders and the gateway ring.
+ */
+struct omi_rxq {
+	struct napi_struct napi;
+	struct omi_ep *ep;
+	u8 idx;
+	u32 rr;
+	struct omi_rx_stats rs;
 };
 
 struct omi_ep {
@@ -361,50 +429,41 @@ struct omi_ep {
 	struct omi_peer peer[OMI_MAX_NODES];
 
 	/* TX */
-	spinlock_t tx_lock;
+	u8 nq;				/* queues (TX and RX) */
+	u8 nch;				/* eDMA channels in use */
+	spinlock_t tx_lock;		/* peer state; before any txq lock */
 	u8 up_mask;			/* peers in OMI_PEER_UP, not stalled */
-	u32 build_gen;			/* tx_lock: batches built */
-	u32 done_gen;			/* tx_lock: build_gen of the last batch retired */
-	struct omi_txd *txq;
-	u32 txq_prod, txq_cons;
-	wait_queue_head_t tx_wait;
-	struct task_struct *tx_task;
-	int tx_irq;			/* an eDMA interrupt we hold, 0: poll */
-	atomic_t tx_irq_st;		/* done/abort bits latched by the ISR */
-	wait_queue_head_t tx_done_wq;
-	u32 gw_head;			/* xmit only */
-	struct omi_batch batch[2];	/* tx thread */
+	struct omi_txq txq[OMI_MAX_QUEUES];
+	struct omi_chan ch[OMI_MAX_CH];
+	spinlock_t gw_lock;		/* gateway TX ring */
+	u32 gw_head;
 
-	/* RX doorbell: one GIC ITS vector per possible sender bus (the ITS
-	 * DeviceID is the writer's requester ID), and inbound iATU region 0
-	 * mapping BAR0 + OMI_DB_WIN_OFF onto the ITS translater.
+	/* RX doorbell: GIC ITS vectors per possible sender bus (the ITS
+	 * DeviceID is the writer's requester ID) and queue, and inbound
+	 * iATU region 0 mapping BAR0 + OMI_DB_WIN_OFF onto the translater.
 	 */
 	bool db_ok;			/* vectors ready */
 	u64 db_bar_pci;			/* BAR address the window is for, 0: off */
 	phys_addr_t db_xlate;		/* 64 KiB page holding GITS_TRANSLATER */
 	u32 db_word;			/* its offset in that page */
-	u32 db_data;			/* event id the senders write */
+	u32 db_data;			/* event id of queue 0 */
 	unsigned long rx_nodb;		/* connected senders that do not ring */
 	unsigned long nodb_rx;		/* jiffies: last frame from one of them */
 	struct device_node *db_np;
 	struct of_changeset db_ocs;
 	struct omi_dbv {
 		struct platform_device *pdev;
-		int irq;
-		struct msi_msg msg;
+		int irq[OMI_MAX_QUEUES];
+		struct msi_msg msg[OMI_MAX_QUEUES];
+		char name[OMI_MAX_QUEUES][24];
 	} dbv[16];
 
 	/* RX */
-	struct napi_struct napi;
-	u32 rx_rr;
-	u32 gw_rx_tail;
+	struct omi_rxq rxq[OMI_MAX_QUEUES];
+	u32 gw_rx_tail;			/* queue 0 */
 	u64 fdb[OMI_FDB_SIZE];
 
 	struct task_struct *ctl;
-
-	struct omi_xmit_stats xs;
-	struct omi_tx_stats ts;
-	struct omi_rx_stats rs;
 	struct omi_ctl_stats cs;
 };
 
@@ -842,13 +901,18 @@ static void hw_stop(struct omi_ep *ep)
 /* ---------------------------------------------------------------- */
 /* eDMA                                                              */
 
-/* Only channel 0's done and abort bits may raise the interrupt, and
- * only in interrupt mode. Status bits latch either way.
+/* The done and abort bits of the channels we drive with an interrupt
+ * may raise it. Status bits latch either way.
  */
 static void edma_set_mask(struct omi_ep *ep)
 {
-	writel(ep->tx_irq ? ~(u32)(EDMA_INT_DONE | EDMA_INT_ABORT) : 0xffffffff,
-	       ep->edma + EDMA_WR_INT_MASK);
+	u32 m = 0xffffffff;
+	unsigned int c;
+
+	for (c = 0; c < ep->nch; c++)
+		if (ep->ch[c].irq)
+			m &= ~EDMA_CH_BITS(c);
+	writel(m, ep->edma + EDMA_WR_INT_MASK);
 }
 
 static void edma_init(struct omi_ep *ep)
@@ -863,16 +927,21 @@ static void edma_init(struct omi_ep *ep)
 		ep->edma = NULL;
 		return;
 	}
+	/* Channel count: bits 3:0 write channels. */
+	ep->nch = clamp_t(u8, min_t(u32, ctrl & 0xf, OMI_MAX_CH), 1, ep->nq);
 	edma_set_mask(ep);
-	writel(readl(ep->edma + EDMA_WR_LL_ERR) | BIT(0), ep->edma + EDMA_WR_LL_ERR);
+	writel(readl(ep->edma + EDMA_WR_LL_ERR) | GENMASK(ep->nch - 1, 0),
+	       ep->edma + EDMA_WR_LL_ERR);
 }
 
-/* After an abort or timeout: stop the engine and start it again. */
-static void edma_reset(struct omi_ep *ep)
+/* After an abort or timeout: stop the engine and start it again. A run
+ * of the other channel that this aborts fails and is dropped too.
+ */
+static void edma_reset(struct omi_ep *ep, struct omi_chan *ch)
 {
 	writel(0, ep->edma + EDMA_WR_ENB);
 	udelay(10);
-	writel(EDMA_INT_DONE | EDMA_INT_ABORT, ep->edma + EDMA_WR_INT_CLEAR);
+	writel(EDMA_CH_BITS(ch->idx), ep->edma + EDMA_WR_INT_CLEAR);
 	writel(BIT(0), ep->edma + EDMA_WR_ENB);
 }
 
@@ -900,62 +969,89 @@ static void ll_link(struct edma_lli *e, bool cb, dma_addr_t next)
 	e->dar_hi = 0;
 }
 
-/*
- * Start list b->list. CCS and LLP are programmed for every run: data
- * elements carry CB=1 and the list ends in a link element with CB=0,
- * where the engine stops. The two lists therefore never share cycle
- * state. LIE on the last element latches the done bit.
- */
-static void edma_kick(struct omi_ep *ep, struct omi_batch *b)
+static dma_addr_t ch_scratch_dma(struct omi_ep *ep, struct omi_chan *ch)
 {
-	struct edma_lli *ll = ep->scratch->ll[b->list];
-	dma_addr_t ll_dma = ep->scratch_dma +
-			    offsetof(struct omi_scratch, ll[b->list]);
+	return ep->scratch_dma + offsetof(struct omi_scratch, ch) +
+	       ch->idx * sizeof(struct omi_chan_scratch);
+}
+
+/*
+ * Start list b->list on channel ch. CCS and LLP are programmed for every
+ * run: data elements carry CB=1 and the list ends in a link element with
+ * CB=0, where the engine stops. The two lists therefore never share
+ * cycle state. LIE on the last element latches the done bit.
+ */
+static void edma_kick(struct omi_ep *ep, struct omi_chan *ch, struct omi_batch *b)
+{
+	struct omi_chan_scratch *cs = &ep->scratch->ch[ch->idx];
+	struct edma_lli *ll = cs->ll[b->list];
+	dma_addr_t base = ch_scratch_dma(ep, ch);
+	dma_addr_t ll_dma = base + offsetof(struct omi_chan_scratch, ll[b->list]);
 	void __iomem *dma = ep->edma;
+	unsigned int c = ch->idx;
 
 	ll[b->nel - 1].control |= EDMA_CTRL_LIE;
 	ll_link(&ll[b->nel], false, ll_dma);
 	dma_sync_single_for_device(ep->dev, ll_dma, (b->nel + 1) * sizeof(*ll),
 				   DMA_TO_DEVICE);
 	dma_sync_single_for_device(ep->dev,
-				   ep->scratch_dma + offsetof(struct omi_scratch, head[b->list]),
-				   sizeof(ep->scratch->head[0]), DMA_TO_DEVICE);
+				   base + offsetof(struct omi_chan_scratch, head[b->list]),
+				   sizeof(cs->head[0]), DMA_TO_DEVICE);
 	dma_sync_single_for_device(ep->dev,
-				   ep->scratch_dma + offsetof(struct omi_scratch, txh),
-				   sizeof(ep->scratch->txh), DMA_TO_DEVICE);
+				   ep->scratch_dma + offsetof(struct omi_scratch, txh[b->q]),
+				   sizeof(ep->scratch->txh[0]), DMA_TO_DEVICE);
 
-	writel(EDMA_INT_DONE | EDMA_INT_ABORT, dma + EDMA_WR_INT_CLEAR);
+	writel(EDMA_CH_BITS(c), dma + EDMA_WR_INT_CLEAR);
 	writel(BIT(0), dma + EDMA_WR_ENB);
-	writel(EDMA_CTRL_CCS | EDMA_CTRL_LLE, dma + EDMA_WR_CTRL_LO);
-	writel(0, dma + EDMA_WR_CTRL_HI);
-	writel(lower_32_bits(ll_dma), dma + EDMA_WR_LLP_LO);
-	writel(upper_32_bits(ll_dma), dma + EDMA_WR_LLP_HI);
+	writel(EDMA_CTRL_CCS | EDMA_CTRL_LLE, dma + EDMA_WR_CH(c, EDMA_WR_CTRL_LO));
+	writel(0, dma + EDMA_WR_CH(c, EDMA_WR_CTRL_HI));
+	writel(lower_32_bits(ll_dma), dma + EDMA_WR_CH(c, EDMA_WR_LLP_LO));
+	writel(upper_32_bits(ll_dma), dma + EDMA_WR_CH(c, EDMA_WR_LLP_HI));
 	/* writel() orders the list stores (cleaned above) before the
-	 * doorbell. Channel 0, stop bit clear: start.
+	 * doorbell. Channel c, stop bit clear: start.
 	 */
-	writel(0, dma + EDMA_WR_DOORBELL);
+	writel(c, dma + EDMA_WR_DOORBELL);
 }
 
 /* ---------------------------------------------------------------- */
 /* TX                                                                */
 
-/* tx_lock held. Room for one more frame to every peer in mask. */
-static bool peers_have_room(struct omi_ep *ep, u8 mask)
+/* Ring q of peer p in its BAR: where our frames for queue q go. */
+static u64 peer_ring(struct omi_ep *ep, struct omi_peer *pr, unsigned int q)
+{
+	return pr->pci + ring_off(ep->self) + (u64)q * pr->slots * OMI_SLOT;
+}
+
+static unsigned int prod_head_off(u8 self, unsigned int q)
+{
+	return q ? BAR_OFF(rx_prod[self].head_q[q - 1]) : BAR_OFF(rx_prod[self].head);
+}
+
+static unsigned int cons_tail_off(u8 self, unsigned int q)
+{
+	return q ? BAR_OFF(tx_cons[self].tail_q[q - 1]) : BAR_OFF(tx_cons[self].tail);
+}
+
+/* txq lock held. Room for one more frame on queue q to every peer in mask. */
+static bool peers_have_room(struct omi_ep *ep, u8 mask, unsigned int q)
 {
 	unsigned long m = mask;
 	unsigned int p;
 
 	for_each_set_bit(p, &m, OMI_MAX_NODES) {
 		struct omi_peer *pr = &ep->peer[p];
+		struct omi_peer_txq *t = &pr->tq[q];
 
-		if (pr->queued + (pr->head - pr->tail) >= OMI_RING_SLOTS - 1)
+		if (t->queued + (t->head - t->tail) >= READ_ONCE(pr->slots) - 1)
 			return false;
 	}
 	return true;
 }
 
-/* tx_lock held. Pick up credit the peer wrote into our tx_cons line. */
-static void peer_refresh_tail(struct omi_ep *ep, unsigned int p)
+/* txq lock held. Pick up credit for queue q the peer wrote into our
+ * tx_cons line.
+ */
+static void peer_refresh_tail(struct omi_ep *ep, unsigned int p, unsigned int q)
 {
 	struct omi_peer *pr = &ep->peer[p];
 	unsigned int off = BAR_OFF(tx_cons[p]);
@@ -965,26 +1061,27 @@ static void peer_refresh_tail(struct omi_ep *ep, unsigned int p)
 	bar_inval(ep, off, sizeof(*c));
 	if (READ_ONCE(c->ack) != pr->token)
 		return;
-	tail = READ_ONCE(c->tail);
+	tail = READ_ONCE(*(u32 *)((void *)ep->bar + cons_tail_off(p, q)));
 	/* Ignore credit that would claim more than we sent. */
-	if (pr->head - tail <= OMI_RING_SLOTS)
-		pr->tail = tail;
+	if (pr->tq[q].head - tail <= pr->slots)
+		pr->tq[q].tail = tail;
 }
 
-/* tx_lock held. Wake the queue if every live peer has room. */
-static bool omi_maybe_wake(struct omi_ep *ep)
+/* txq lock held. Wake queue q if every live peer has room on it. */
+static bool omi_maybe_wake(struct omi_ep *ep, struct omi_txq *txq)
 {
-	unsigned long m = ep->up_mask;
+	struct netdev_queue *nq = netdev_get_tx_queue(ep->ndev, txq->idx);
+	unsigned long m = READ_ONCE(ep->up_mask);
 	unsigned int p;
 
-	if (!netif_queue_stopped(ep->ndev))
+	if (!netif_tx_queue_stopped(nq))
 		return false;
 	for_each_set_bit(p, &m, OMI_MAX_NODES)
-		peer_refresh_tail(ep, p);
-	if (ep->txq_prod - ep->txq_cons >= OMI_TXQ_SIZE ||
-	    !peers_have_room(ep, ep->up_mask))
+		peer_refresh_tail(ep, p, txq->idx);
+	if (txq->prod - txq->cons >= OMI_TXQ_SIZE ||
+	    !peers_have_room(ep, m, txq->idx))
 		return false;
-	netif_wake_queue(ep->ndev);
+	netif_tx_wake_queue(nq);
 	return true;
 }
 
@@ -1030,74 +1127,92 @@ static int txd_map(struct omi_ep *ep, struct omi_txd *d)
 	return 0;
 }
 
-/* Drop the per-peer accounting of frame d for the peers in mask. */
-static void txd_release(struct omi_ep *ep, struct omi_txd *d, u8 mask)
+/* txq lock held. Drop the queue-q accounting of frame d for the peers
+ * in mask.
+ */
+static void txd_release(struct omi_ep *ep, struct omi_txd *d, u8 mask,
+			unsigned int q)
 {
 	unsigned long m = mask;
 	unsigned int p;
 
 	for_each_set_bit(p, &m, OMI_MAX_NODES)
-		ep->peer[p].queued--;
+		ep->peer[p].tq[q].queued--;
+}
+
+/* A frame queued here before mapping failed: it goes nowhere. */
+static void txd_drop_unmapped(struct omi_ep *ep, struct omi_chan *ch,
+			      struct omi_txq *txq, struct omi_txd *d)
+{
+	spin_lock_bh(&txq->lock);
+	txd_release(ep, d, d->mask, txq->idx);
+	spin_unlock_bh(&txq->lock);
+	d->mask = 0;
+	omi_inc(&ch->ts, dropped);
 }
 
 /*
- * Build a run from the queued frames that follow `after` (the run on
- * the wire, or NULL). Takes frames in order while every target peer
- * has a free slot; slots are counted on top of `after`. Per target:
- * the 16-byte slot header from scratch, then the skb segments. At the
- * end, one head write per touched peer.
+ * Build a run for channel ch from the frames queued on txq. Takes frames
+ * in order while every target peer has a free slot in its ring for this
+ * queue. Per target: the 16-byte slot header from scratch, then the skb
+ * segments. At the end one head write per touched peer, then their
+ * doorbells.
  */
-static void tx_build(struct omi_ep *ep, struct omi_batch *b,
-		     const struct omi_batch *after, int list)
+static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
+		     struct omi_txq *txq, struct omi_batch *b, int list)
 {
+	struct omi_chan_scratch *cs = &ep->scratch->ch[ch->idx];
 	struct omi_scratch *sc = ep->scratch;
-	struct edma_lli *ll = sc->ll[list];
+	struct edma_lli *ll = cs->ll[list];
+	unsigned int q = txq->idx;
 	u32 avail, i, first;
 	dma_addr_t hsrc = 0;
-	u8 touched = 0;
+	u8 touched = 0, up;
 	int nel = 0;
 
 	memset(b, 0, sizeof(*b));
 	b->list = list;
-	b->built = true;
+	b->q = q;
 
-	spin_lock_bh(&ep->tx_lock);
-	first = ep->txq_cons + (after ? after->n : 0);
-	avail = min_t(u32, ep->txq_prod - first, OMI_TX_BATCH);
-	spin_unlock_bh(&ep->tx_lock);
+	spin_lock_bh(&txq->lock);
+	first = txq->cons;
+	avail = min_t(u32, txq->prod - first, OMI_TX_BATCH);
+	spin_unlock_bh(&txq->lock);
 	b->first = first;
 	if (!avail)
 		return;
 
-	/* Map outside the lock. Only this thread consumes txq entries. */
+	/* Map outside the lock. Only this thread consumes the queue. */
 	for (i = 0; i < avail; i++) {
-		struct omi_txd *d = &ep->txq[(first + i) & (OMI_TXQ_SIZE - 1)];
+		struct omi_txd *d = &txq->ring[(first + i) & (OMI_TXQ_SIZE - 1)];
 
-		if (!d->mapped && d->mask && txd_map(ep, d)) {
-			spin_lock_bh(&ep->tx_lock);
-			txd_release(ep, d, d->mask);
-			spin_unlock_bh(&ep->tx_lock);
-			d->mask = 0;
-			omi_inc(&ep->ts, dropped);
-		}
+		if (!d->mapped && d->mask && txd_map(ep, d))
+			txd_drop_unmapped(ep, ch, txq, d);
 	}
 
-	spin_lock_bh(&ep->tx_lock);
+	spin_lock_bh(&txq->lock);
+	up = READ_ONCE(ep->up_mask);
 	for (i = 0; i < OMI_MAX_NODES; i++)
-		b->base[i] = ep->peer[i].head + (after ? after->cnt[i] : 0);
+		b->base[i] = ep->peer[i].tq[q].head;
 	for (b->n = 0; b->n < avail; b->n++) {
-		u32 q = (first + b->n) & (OMI_TXQ_SIZE - 1);
-		struct omi_txd *d = &ep->txq[q];
-		u8 gone = d->mask & ~ep->up_mask;
+		u32 e = (first + b->n) & (OMI_TXQ_SIZE - 1);
+		struct omi_txd *d = &txq->ring[e];
+		u8 gone = d->mask & ~up;
 		unsigned long m;
 		unsigned int p;
 		bool room = true;
 
-		/* Peers that went down or stalled since xmit. */
+		/* Peers that went down or stalled since xmit, or that now
+		 * have fewer rings than this queue needs.
+		 */
+		m = d->mask & up;
+		for_each_set_bit(p, &m, OMI_MAX_NODES)
+			if (q >= READ_ONCE(ep->peer[p].nq))
+				gone |= BIT(p);
 		if (gone) {
-			txd_release(ep, d, gone);
-			d->mask &= ep->up_mask;
-			omi_inc(&ep->ts, peer_full_drops);
+			txd_release(ep, d, gone, q);
+			d->mask &= ~gone;
+			omi_inc(&ch->ts, peer_full_drops);
 		}
 		/* Room for this frame plus a head write and a doorbell per peer. */
 		if (nel + hweight8(d->mask) * (d->nseg + 1) + 2 * OMI_MAX_NODES > OMI_LL_MAX)
@@ -1105,28 +1220,34 @@ static void tx_build(struct omi_ep *ep, struct omi_batch *b,
 		m = d->mask;
 		for_each_set_bit(p, &m, OMI_MAX_NODES) {
 			struct omi_peer *pr = &ep->peer[p];
-			u32 used = b->base[p] + b->cnt[p] - pr->tail;
+			u32 used = b->base[p] + b->cnt[p] - pr->tq[q].tail;
 
-			if (used >= OMI_RING_SLOTS) {
-				peer_refresh_tail(ep, p);
-				used = b->base[p] + b->cnt[p] - pr->tail;
+			if (used >= pr->slots) {
+				peer_refresh_tail(ep, p, q);
+				used = b->base[p] + b->cnt[p] - pr->tq[q].tail;
 			}
-			if (used >= OMI_RING_SLOTS)
+			if (used >= pr->slots)
 				room = false;
 		}
 		if (!room)
 			break;
 		if (d->mask) {
-			sc->txh[q].len = d->skb->len;
-			sc->txh[q].flags = 0;
-			sc->txh[q].mask = 0;
-			sc->txh[q].pad = 0;
-			hsrc = ep->scratch_dma + offsetof(struct omi_scratch, txh[q]);
+			struct omi_slot_hdr *h = &sc->txh[q][e];
+
+			h->len = d->skb->len;
+			h->flags = 0;
+			h->mask = 0;
+			h->hash = 0;
+			if (d->skb->l4_hash) {
+				h->flags = OMI_SLOT_HASH;
+				h->hash = d->skb->hash;
+			}
+			hsrc = ep->scratch_dma + offsetof(struct omi_scratch, txh[q][e]);
 		}
 		for_each_set_bit(p, &m, OMI_MAX_NODES) {
 			struct omi_peer *pr = &ep->peer[p];
-			u32 slot = (b->base[p] + b->cnt[p]) & (OMI_RING_SLOTS - 1);
-			u64 dar = pr->pci + ring_off(ep->self) + (u64)slot * OMI_SLOT;
+			u32 slot = (b->base[p] + b->cnt[p]) & (pr->slots - 1);
+			u64 dar = peer_ring(ep, pr, q) + (u64)slot * OMI_SLOT;
 			int seg;
 
 			ll_data(&ll[nel++], true, sizeof(struct omi_slot_hdr), hsrc, dar);
@@ -1141,21 +1262,22 @@ static void tx_build(struct omi_ep *ep, struct omi_batch *b,
 		}
 	}
 	if (b->n)
-		b->gen = ++ep->build_gen;
+		b->gen = ++txq->build_gen;
 	for (i = 0; i < OMI_MAX_NODES; i++)
-		if ((touched & BIT(i)) && ep->peer[i].db_ok)
+		if ((touched & BIT(i)) && READ_ONCE(ep->peer[i].db_ok))
 			b->db_mask |= BIT(i);
-	spin_unlock_bh(&ep->tx_lock);
+	spin_unlock_bh(&txq->lock);
 
 	if (touched) {
+		dma_addr_t hbase = ch_scratch_dma(ep, ch) +
+				   offsetof(struct omi_chan_scratch, head[list]);
 		unsigned long m = touched;
 		unsigned int p;
 
 		for_each_set_bit(p, &m, OMI_MAX_NODES) {
-			sc->head[list][p] = b->base[p] + b->cnt[p];
-			ll_data(&ll[nel++], true, sizeof(u32),
-				ep->scratch_dma + offsetof(struct omi_scratch, head[list][p]),
-				ep->peer[p].pci + BAR_OFF(rx_prod[ep->self].head));
+			cs->head[list][p] = b->base[p] + b->cnt[p];
+			ll_data(&ll[nel++], true, sizeof(u32), hbase + p * sizeof(u32),
+				ep->peer[p].pci + prod_head_off(ep->self, q));
 		}
 		/* Doorbells after every head: the element order is the
 		 * order the writes leave in, so a receiver woken by its
@@ -1164,69 +1286,66 @@ static void tx_build(struct omi_ep *ep, struct omi_batch *b,
 		m = b->db_mask;
 		for_each_set_bit(p, &m, OMI_MAX_NODES)
 			ll_data(&ll[nel++], true, sizeof(u32),
-				ep->scratch_dma + offsetof(struct omi_scratch, db[p]),
+				ep->scratch_dma + offsetof(struct omi_scratch, db[p][q]),
 				ep->peer[p].pci + ep->peer[p].db_off);
 	}
 	b->nel = nel;
 }
 
 /* Retire a run: free its frames and, if it went out, advance the heads. */
-static void tx_complete(struct omi_ep *ep, struct omi_batch *b, int ret)
+static void tx_complete(struct omi_ep *ep, struct omi_chan *ch,
+			struct omi_txq *txq, struct omi_batch *b, int ret)
 {
+	unsigned int q = txq->idx;
 	u32 i;
 
-	spin_lock_bh(&ep->tx_lock);
+	spin_lock_bh(&txq->lock);
 	for (i = 0; i < b->n; i++) {
-		struct omi_txd *d = &ep->txq[(b->first + i) & (OMI_TXQ_SIZE - 1)];
+		struct omi_txd *d = &txq->ring[(b->first + i) & (OMI_TXQ_SIZE - 1)];
 
-		txd_release(ep, d, d->mask);
+		txd_release(ep, d, d->mask, q);
 		txd_unmap(ep, d);
 		if (d->mask && !ret) {
-			omi_inc(&ep->ts, p2p_frames);
+			omi_inc(&ch->ts, p2p_frames);
 			dev_consume_skb_any(d->skb);
 		} else {
-			omi_inc(&ep->ts, dropped);
+			omi_inc(&ch->ts, dropped);
 			dev_kfree_skb_any(d->skb);
 		}
 		d->skb = NULL;
 	}
-	ep->txq_cons += b->n;
+	txq->cons += b->n;
 	/* On failure the peers never saw the new heads; the slots are
 	 * free again.
 	 */
 	if (!ret)
 		for (i = 0; i < OMI_MAX_NODES; i++)
-			ep->peer[i].head = b->base[i] + b->cnt[i];
+			ep->peer[i].tq[q].head = b->base[i] + b->cnt[i];
 	if (b->n)
-		ep->done_gen = b->gen;
-	if (omi_maybe_wake(ep))
-		omi_inc(&ep->ts, queue_wakes);
-	spin_unlock_bh(&ep->tx_lock);
-	b->built = false;
+		txq->done_gen = b->gen;
+	if (omi_maybe_wake(ep, txq))
+		omi_inc(&ch->ts, queue_wakes);
+	spin_unlock_bh(&txq->lock);
 }
 
 /* Map one queued frame that is not in run b yet. Returns false if
  * there is none: everything queued behind b is mapped.
  */
-static bool tx_premap(struct omi_ep *ep, const struct omi_batch *b)
+static bool tx_premap(struct omi_ep *ep, struct omi_chan *ch,
+		      struct omi_txq *txq, const struct omi_batch *b)
 {
 	/* Pairs with smp_store_release() in txq_add(): an entry below
-	 * txq_prod is completely written.
+	 * prod is completely written.
 	 */
-	u32 first = b->first + b->n, i, prod = smp_load_acquire(&ep->txq_prod);
+	u32 first = b->first + b->n, i, prod = smp_load_acquire(&txq->prod);
 
 	for (i = first; i != prod && i - first < OMI_TX_BATCH; i++) {
-		struct omi_txd *d = &ep->txq[i & (OMI_TXQ_SIZE - 1)];
+		struct omi_txd *d = &txq->ring[i & (OMI_TXQ_SIZE - 1)];
 
 		if (d->mapped || !d->mask)
 			continue;
-		if (txd_map(ep, d)) {
-			spin_lock_bh(&ep->tx_lock);
-			txd_release(ep, d, d->mask);
-			spin_unlock_bh(&ep->tx_lock);
-			d->mask = 0;
-			omi_inc(&ep->ts, dropped);
-		}
+		if (txd_map(ep, d))
+			txd_drop_unmapped(ep, ch, txq, d);
 		return true;
 	}
 	return false;
@@ -1239,23 +1358,25 @@ static bool tx_premap(struct omi_ep *ep, const struct omi_batch *b)
  * starves the engine of the bus it fetches descriptors on, so stay off
  * it between checks.
  */
-static int tx_wait_premap(struct omi_ep *ep, struct omi_batch *b)
+static int tx_wait_premap(struct omi_ep *ep, struct omi_chan *ch,
+			  struct omi_txq *txq, struct omi_batch *b)
 {
 	void __iomem *dma = ep->edma;
+	unsigned int c = ch->idx;
 	int i;
 
 	for (i = 0; i < 20050; i++) {
 		u32 st = readl(dma + EDMA_WR_INT_STATUS);
 
-		if (st & EDMA_INT_ABORT) {
-			writel(EDMA_INT_DONE | EDMA_INT_ABORT, dma + EDMA_WR_INT_CLEAR);
+		if (st & EDMA_CH_ABORT(c)) {
+			writel(EDMA_CH_BITS(c), dma + EDMA_WR_INT_CLEAR);
 			return -EIO;
 		}
-		if (st & EDMA_INT_DONE) {
-			writel(EDMA_INT_DONE, dma + EDMA_WR_INT_CLEAR);
+		if (st & EDMA_CH_DONE(c)) {
+			writel(EDMA_CH_DONE(c), dma + EDMA_WR_INT_CLEAR);
 			return 0;
 		}
-		if (tx_premap(ep, b))
+		if (tx_premap(ep, ch, txq, b))
 			continue;
 		if (i < 50)
 			cpu_relax();
@@ -1267,15 +1388,15 @@ static int tx_wait_premap(struct omi_ep *ep, struct omi_batch *b)
 
 static irqreturn_t omi_edma_isr(int irq, void *data)
 {
-	struct omi_ep *ep = data;
-	u32 st = readl(ep->edma + EDMA_WR_INT_STATUS) &
-		 (EDMA_INT_DONE | EDMA_INT_ABORT);
+	struct omi_chan *ch = data;
+	struct omi_ep *ep = ch->ep;
+	u32 st = readl(ep->edma + EDMA_WR_INT_STATUS) & EDMA_CH_BITS(ch->idx);
 
 	if (!st)
 		return IRQ_NONE;
 	writel(st, ep->edma + EDMA_WR_INT_CLEAR);
-	atomic_or(st, &ep->tx_irq_st);
-	wake_up(&ep->tx_done_wq);
+	atomic_or(st, &ch->irq_st);
+	wake_up(&ch->done_wq);
 	return IRQ_HANDLED;
 }
 
@@ -1284,60 +1405,79 @@ static irqreturn_t omi_edma_isr(int irq, void *data)
  * then sleep until the done interrupt. If it does not come, look at the
  * status bits once before calling the run lost.
  */
-static int tx_wait_irq(struct omi_ep *ep, struct omi_batch *b)
+static int tx_wait_irq(struct omi_ep *ep, struct omi_chan *ch,
+		       struct omi_txq *txq, struct omi_batch *b)
 {
-	u32 st;
+	u32 bits = EDMA_CH_BITS(ch->idx), st;
 
-	while (tx_premap(ep, b))
+	while (tx_premap(ep, ch, txq, b))
 		;
-	if (!wait_event_idle_timeout(ep->tx_done_wq, atomic_read(&ep->tx_irq_st),
+	if (!wait_event_idle_timeout(ch->done_wq, atomic_read(&ch->irq_st),
 				     msecs_to_jiffies(50))) {
-		st = readl(ep->edma + EDMA_WR_INT_STATUS) &
-		     (EDMA_INT_DONE | EDMA_INT_ABORT);
+		st = readl(ep->edma + EDMA_WR_INT_STATUS) & bits;
 		if (!st)
 			return -ETIMEDOUT;
 		writel(st, ep->edma + EDMA_WR_INT_CLEAR);
-		atomic_or(st, &ep->tx_irq_st);
-		omi_inc(&ep->ts, irq_lost);
+		atomic_or(st, &ch->irq_st);
+		omi_inc(&ch->ts, irq_lost);
 	}
-	st = atomic_xchg(&ep->tx_irq_st, 0);
-	return st & EDMA_INT_ABORT ? -EIO : 0;
+	st = atomic_xchg(&ch->irq_st, 0);
+	return st & EDMA_CH_ABORT(ch->idx) ? -EIO : 0;
 }
 
-static int tx_wait_run(struct omi_ep *ep, struct omi_batch *b, u64 t0)
+static int tx_wait_run(struct omi_ep *ep, struct omi_chan *ch,
+		       struct omi_txq *txq, struct omi_batch *b, u64 t0)
 {
-	int ret = ep->tx_irq ? tx_wait_irq(ep, b) : tx_wait_premap(ep, b);
+	int ret = ch->irq ? tx_wait_irq(ep, ch, txq, b) :
+			    tx_wait_premap(ep, ch, txq, b);
 
-	omi_add(&ep->ts, dma_wait_ns, ktime_get_ns() - t0);
+	omi_add(&ch->ts, dma_wait_ns, ktime_get_ns() - t0);
 	if (ret) {
-		edma_reset(ep);
-		dev_err_ratelimited(ep->dev, "eDMA run of %d elements failed (%d)\n",
-				    b->nel, ret);
-		omi_inc(&ep->ts, dma_errors);
+		edma_reset(ep, ch);
+		dev_err_ratelimited(ep->dev, "eDMA channel %u: run of %d elements failed (%d)\n",
+				    ch->idx, b->nel, ret);
+		omi_inc(&ch->ts, dma_errors);
 	} else {
-		omi_inc(&ep->ts, dma_runs);
-		omi_add(&ep->ts, dma_elems, b->nel);
-		omi_add(&ep->ts, dma_bytes, b->bytes);
-		omi_add(&ep->ts, doorbells, hweight8(b->db_mask));
+		omi_inc(&ch->ts, dma_runs);
+		omi_add(&ch->ts, dma_elems, b->nel);
+		omi_add(&ch->ts, dma_bytes, b->bytes);
+		omi_add(&ch->ts, doorbells, hweight8(b->db_mask));
 	}
 	return ret;
 }
 
+/* The queues a channel serves: q with q % nch == channel. */
+static bool ch_has_frames(struct omi_ep *ep, struct omi_chan *ch)
+{
+	unsigned int q;
+
+	for (q = ch->idx; q < ep->nq; q += ep->nch)
+		if (READ_ONCE(ep->txq[q].prod) != READ_ONCE(ep->txq[q].cons))
+			return true;
+	return false;
+}
+
 /*
- * While a run is on the wire, the frames queuing behind it are mapped
- * (tx_wait_premap). When it is done, the next run is built from all of
- * them and started at once: the engine idles only for the list build,
- * and runs grow with the load, which amortises the fixed cost of a run
- * (~13 us measured).
+ * One thread per eDMA channel. While a run is on the wire, the frames
+ * queuing behind it are mapped (tx_wait_*). When it is done, the next
+ * run is built from the next of the channel's queues that has frames
+ * and started at once: the engine idles only for the list build, and
+ * runs grow with the load, which amortises the fixed cost of a run
+ * (~13 us measured). The channels run in parallel.
  */
 static int tx_thread(void *data)
 {
-	struct omi_ep *ep = data;
+	struct omi_chan *ch = data;
+	struct omi_ep *ep = ch->ep;
+	unsigned int served = DIV_ROUND_UP(ep->nq - ch->idx, ep->nch);
 	int list = 0;
 
 	set_user_nice(current, -20);
 	while (!kthread_should_stop()) {
-		struct omi_batch *b = &ep->batch[list];
+		struct omi_batch *b = &ch->batch[list];
+		struct omi_txq *txq = NULL;
+		bool waiting = false;
+		unsigned int k;
 		u64 t0;
 		int ret;
 
@@ -1347,47 +1487,57 @@ static int tx_thread(void *data)
 		 * RCU for 21 s in a 10 minute bidirectional run.
 		 */
 		cond_resched();
-		tx_build(ep, b, NULL, list);
+		b->n = 0;
+		for (k = 0; k < served; k++) {
+			unsigned int q = ch->idx + ((ch->rr + k) % served) * ep->nch;
+
+			txq = &ep->txq[q];
+			tx_build(ep, ch, txq, b, list);
+			if (b->n) {
+				ch->rr = (ch->rr + k + 1) % served;
+				break;
+			}
+			if (READ_ONCE(txq->prod) != READ_ONCE(txq->cons))
+				waiting = true;
+		}
 		if (!b->n) {
-			if (READ_ONCE(ep->txq_prod) != READ_ONCE(ep->txq_cons)) {
+			if (waiting) {
 				/* The first frame waits for credit. */
 				usleep_range(20, 50);
 				continue;
 			}
-			wait_event_interruptible_timeout(ep->tx_wait,
-				kthread_should_stop() ||
-				READ_ONCE(ep->txq_prod) != READ_ONCE(ep->txq_cons),
-				HZ);
+			wait_event_interruptible_timeout(ch->wait,
+				kthread_should_stop() || ch_has_frames(ep, ch), HZ);
 			continue;
 		}
 		if (!b->nel) {
 			/* Only frames whose peers went away. */
-			tx_complete(ep, b, 0);
+			tx_complete(ep, ch, txq, b, 0);
 			continue;
 		}
 		t0 = ktime_get_ns();
-		atomic_set(&ep->tx_irq_st, 0);
-		edma_kick(ep, b);
-		ret = tx_wait_run(ep, b, t0);
-		tx_complete(ep, b, ret);
+		atomic_set(&ch->irq_st, 0);
+		edma_kick(ep, ch, b);
+		ret = tx_wait_run(ep, ch, txq, b, t0);
+		tx_complete(ep, ch, txq, b, ret);
 		list ^= 1;
 	}
 	return 0;
 }
 
-static void txq_purge(struct omi_ep *ep)
+static void txq_purge(struct omi_ep *ep, struct omi_txq *txq)
 {
-	spin_lock_bh(&ep->tx_lock);
-	while (ep->txq_cons != ep->txq_prod) {
-		struct omi_txd *d = &ep->txq[ep->txq_cons & (OMI_TXQ_SIZE - 1)];
+	spin_lock_bh(&txq->lock);
+	while (txq->cons != txq->prod) {
+		struct omi_txd *d = &txq->ring[txq->cons & (OMI_TXQ_SIZE - 1)];
 
-		txd_release(ep, d, d->mask);
+		txd_release(ep, d, d->mask, txq->idx);
 		txd_unmap(ep, d);
 		dev_kfree_skb_any(d->skb);
 		d->skb = NULL;
-		ep->txq_cons++;
+		txq->cons++;
 	}
-	spin_unlock_bh(&ep->tx_lock);
+	spin_unlock_bh(&txq->lock);
 }
 
 /* Gateway: copy the frame into the EP->RC ring. mask tells the RC
@@ -1399,28 +1549,36 @@ static int gw_tx(struct omi_ep *ep, struct sk_buff *skb, u8 mask)
 	unsigned int off;
 	struct omi_slot_hdr *h;
 	u32 tail;
+	int ret = 0;
 
 	if (skb->len > OMI_GW_DATA)
 		return -EMSGSIZE;
+	spin_lock(&ep->gw_lock);
 	bar_inval(ep, gw_off() + offsetof(struct omi_gw, ep_tail), sizeof(u32));
 	tail = READ_ONCE(gw->ep_tail);
-	if (ep->gw_head - tail >= OMI_GW_SLOTS)
-		return -ENOSPC;
+	if (ep->gw_head - tail >= OMI_GW_SLOTS) {
+		ret = -ENOSPC;
+		goto out;
+	}
 
 	off = gw_slot_off(false, ep->gw_head);
 	h = ep->cpu + off;
 	h->len = skb->len;
 	h->flags = 0;
 	h->mask = mask | (ep->self < OMI_MAX_NODES ? BIT(ep->self) : 0);
-	h->pad = 0;
-	if (skb_copy_bits(skb, 0, h + 1, skb->len))
-		return -EFAULT;
+	h->hash = 0;
+	if (skb_copy_bits(skb, 0, h + 1, skb->len)) {
+		ret = -EFAULT;
+		goto out;
+	}
 	/* The clean completes (dsb) before the head store below. */
 	bar_clean(ep, off, sizeof(*h) + skb->len);
 	ep->gw_head++;
 	WRITE_ONCE(gw->ep_head, ep->gw_head);
 	bar_clean(ep, gw_off() + offsetof(struct omi_gw, ep_head), sizeof(u32));
-	return 0;
+out:
+	spin_unlock(&ep->gw_lock);
+	return ret;
 }
 
 static int fdb_lookup(struct omi_ep *ep, const u8 *mac)
@@ -1447,54 +1605,79 @@ static void fdb_learn(struct omi_ep *ep, const u8 *mac, u8 node)
 		WRITE_ONCE(ep->fdb[h], e);
 }
 
-/* Which peer owns dest? Table MACs first, then learned addresses. */
+/* Which peer owns dest? Table MACs first, then learned addresses. A
+ * racing table update can misroute one frame; never worse than that.
+ */
 static int route_unicast(struct omi_ep *ep, const u8 *dest)
 {
 	int p;
 
 	for (p = 0; p < OMI_MAX_NODES; p++)
-		if (ep->peer[p].epoch && ether_addr_equal(dest, ep->peer[p].mac))
+		if (READ_ONCE(ep->peer[p].epoch) && ether_addr_equal(dest, ep->peer[p].mac))
 			return p;
 	return fdb_lookup(ep, dest);
 }
 
-/* tx_lock held. Queue skb for the TX thread; false if txq is full. */
-static bool txq_add(struct omi_ep *ep, struct sk_buff *skb, u8 mask)
+/*
+ * The stack's flow hash picks the queue (XPS or skb_tx_hash), so a flow
+ * stays on one queue: one eDMA channel and one ring at the receiver,
+ * in order. Frames that may reach a peer with a single ring (floods,
+ * multicast, such peers, the gateway) all take queue 0, the only queue
+ * that may write those rings.
+ */
+static u16 omi_select_queue(struct net_device *ndev, struct sk_buff *skb,
+			    struct net_device *sb_dev)
+{
+	struct omi_ep *ep = netdev_priv(ndev);
+	int p;
+
+	if (ndev->real_num_tx_queues == 1 || is_multicast_ether_addr(skb->data))
+		return 0;
+	p = route_unicast(ep, skb->data);
+	if (p < 0 || p >= OMI_MAX_NODES || READ_ONCE(ep->peer[p].nq) < 2)
+		return 0;
+	return netdev_pick_tx(ndev, skb, sb_dev);
+}
+
+/* txq lock held. Queue skb for the TX thread; false if txq is full. */
+static bool txq_add(struct omi_ep *ep, struct omi_txq *txq,
+		    struct sk_buff *skb, u8 mask)
 {
 	struct omi_txd *d;
 	unsigned long m = mask;
 	unsigned int p;
 
-	if (ep->txq_prod - ep->txq_cons >= OMI_TXQ_SIZE)
+	if (txq->prod - txq->cons >= OMI_TXQ_SIZE)
 		return false;
-	d = &ep->txq[ep->txq_prod & (OMI_TXQ_SIZE - 1)];
+	d = &txq->ring[txq->prod & (OMI_TXQ_SIZE - 1)];
 	d->skb = skb;
 	d->mask = mask;
 	d->mapped = false;
 	d->nseg = 0;
 	for_each_set_bit(p, &m, OMI_MAX_NODES)
-		ep->peer[p].queued++;
-	/* Release: tx_premap() reads entries without tx_lock. */
-	smp_store_release(&ep->txq_prod, ep->txq_prod + 1);
+		ep->peer[p].tq[txq->idx].queued++;
+	/* Release: tx_premap() reads entries without the lock. */
+	smp_store_release(&txq->prod, txq->prod + 1);
 	return true;
 }
 
 static netdev_tx_t omi_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct omi_ep *ep = netdev_priv(ndev);
-	unsigned int len = skb->len;
+	unsigned int len = skb->len, q = skb_get_queue_mapping(skb);
+	struct omi_txq *txq = &ep->txq[q];
 	bool gw = false, gw_sent = false, queued = false;
-	u8 p2p = 0;
+	bool rc_up = READ_ONCE(ep->rc_up);
+	u8 p2p = 0, up = READ_ONCE(ep->up_mask);
 
 	if (len < ETH_HLEN || len > OMI_SLOT_DATA)
 		goto drop;
 	if (skb_shinfo(skb)->nr_frags + 1 > OMI_MAX_SEGS && skb_linearize(skb))
 		goto drop;
 
-	spin_lock(&ep->tx_lock);
 	if (is_multicast_ether_addr(skb->data)) {
-		p2p = ep->up_mask;
-		gw = ep->rc_up;
+		p2p = up;
+		gw = rc_up;
 	} else {
 		int p = route_unicast(ep, skb->data);
 
@@ -1504,19 +1687,18 @@ static netdev_tx_t omi_xmit(struct sk_buff *skb, struct net_device *ndev)
 			 * frames would only fill the slow gateway ring and
 			 * starve real gateway traffic, so drop them.
 			 */
-			if (ep->up_mask & BIT(p))
+			if (up & BIT(p))
 				p2p = BIT(p);
-			else if (!ep->peer[p].stalled)
-				gw = ep->rc_up;
+			else if (!READ_ONCE(ep->peer[p].stalled))
+				gw = rc_up;
 		} else if (p == OMI_FDB_GW || ether_addr_equal(skb->data, ep->rc_mac)) {
-			gw = ep->rc_up;
+			gw = rc_up;
 		} else {
 			/* Unknown unicast floods, as on a switch. */
-			p2p = ep->up_mask;
-			gw = ep->rc_up;
+			p2p = up;
+			gw = rc_up;
 		}
 	}
-	spin_unlock(&ep->tx_lock);
 
 	/* The gateway copy is made now; the P2P path keeps the skb. */
 	if (gw) {
@@ -1524,42 +1706,42 @@ static netdev_tx_t omi_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 		if (!ret) {
 			gw_sent = true;
-			omi_inc(&ep->xs, gw_packets);
+			omi_inc(&txq->xs, gw_packets);
 		} else if (ret == -ENOSPC) {
-			omi_inc(&ep->xs, gw_full);
+			omi_inc(&txq->xs, gw_full);
 		}
 	}
 
-	if (p2p) {
-		spin_lock(&ep->tx_lock);
+	if (p2p && ep->nch) {
+		spin_lock(&txq->lock);
 		/* A peer may have gone since routing. */
-		p2p &= ep->up_mask;
+		p2p &= READ_ONCE(ep->up_mask);
 		if (p2p)
-			queued = txq_add(ep, skb, p2p);
+			queued = txq_add(ep, txq, skb, p2p);
 		/* Stop in the same lock section as the enqueue that fills a
 		 * ring, so the stack never needs NETDEV_TX_BUSY: a requeued
 		 * skb can be overtaken by later ones from another CPU.
 		 */
-		if (ep->txq_prod - ep->txq_cons >= OMI_TXQ_SIZE ||
-		    !peers_have_room(ep, ep->up_mask)) {
-			netif_stop_queue(ndev);
-			omi_inc(&ep->xs, queue_stops);
+		if (txq->prod - txq->cons >= OMI_TXQ_SIZE ||
+		    !peers_have_room(ep, READ_ONCE(ep->up_mask), q)) {
+			netif_tx_stop_queue(netdev_get_tx_queue(ndev, q));
+			omi_inc(&txq->xs, queue_stops);
 		}
-		spin_unlock(&ep->tx_lock);
+		spin_unlock(&txq->lock);
 		if (queued)
-			wake_up(&ep->tx_wait);
+			wake_up(&ep->ch[q % ep->nch].wait);
 	}
 
 	if (!queued && !gw_sent)
 		goto drop;
-	omi_inc(&ep->xs, packets);
-	omi_add(&ep->xs, bytes, len);
+	omi_inc(&txq->xs, packets);
+	omi_add(&txq->xs, bytes, len);
 	if (!queued)
 		dev_consume_skb_any(skb);
 	return NETDEV_TX_OK;
 
 drop:
-	omi_inc(&ep->xs, dropped);
+	omi_inc(&txq->xs, dropped);
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 }
@@ -1567,35 +1749,58 @@ drop:
 /* ---------------------------------------------------------------- */
 /* RX                                                                */
 
-static void rx_deliver(struct omi_ep *ep, const void *data, u32 len,
-		       u8 from, bool p2p)
+static void rx_deliver(struct omi_rxq *rxq, const struct omi_slot_hdr *h,
+		       u32 len, u8 from, bool p2p)
 {
+	struct omi_ep *ep = rxq->ep;
 	struct net_device *ndev = ep->ndev;
 	struct sk_buff *skb;
 
-	skb = napi_alloc_skb(&ep->napi, len);
+	skb = napi_alloc_skb(&rxq->napi, len);
 	if (!skb) {
-		omi_inc(&ep->rs, dropped);
+		omi_inc(&rxq->rs, dropped);
 		return;
 	}
-	skb_put_data(skb, data, len);
+	skb_put_data(skb, h + 1, len);
 	/* P2P payloads only crossed PCIe links (LCRC protected) and DRAM. */
-	if (p2p)
+	if (p2p) {
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
+		if (READ_ONCE(h->flags) & OMI_SLOT_HASH)
+			skb_set_hash(skb, READ_ONCE(h->hash), PKT_HASH_TYPE_L4);
+	}
+	skb_record_rx_queue(skb, rxq->idx);
 	skb->protocol = eth_type_trans(skb, ndev);
 	fdb_learn(ep, eth_hdr(skb)->h_source, from);
-	u64_stats_update_begin(&ep->rs.syncp);
-	u64_stats_inc(&ep->rs.packets);
-	u64_stats_add(&ep->rs.bytes, len);
-	u64_stats_inc(p2p ? &ep->rs.p2p_packets : &ep->rs.gw_packets);
-	u64_stats_update_end(&ep->rs.syncp);
-	napi_gro_receive(&ep->napi, skb);
+	u64_stats_update_begin(&rxq->rs.syncp);
+	u64_stats_inc(&rxq->rs.packets);
+	u64_stats_add(&rxq->rs.bytes, len);
+	u64_stats_inc(p2p ? &rxq->rs.p2p_packets : &rxq->rs.gw_packets);
+	u64_stats_update_end(&rxq->rs.syncp);
+	napi_gro_receive(&rxq->napi, skb);
 }
 
-/* Write credit (and, after a connect, the ack) into the sender's BAR. */
-static void rx_credit(struct omi_ep *ep, unsigned int r)
+/* The rings sender r fills for us under token, per its prod line. */
+static u8 rx_layout(struct omi_ep *ep, const struct omi_prod *prod, u32 token)
+{
+	if (ep->nq > 1 && READ_ONCE(prod->feat_token) == token &&
+	    (READ_ONCE(prod->features) & OMI_FEAT_MQ) &&
+	    READ_ONCE(prod->nq) == ep->nq)
+		return ep->nq;
+	return 1;
+}
+
+static u32 rx_head(const struct omi_prod *prod, unsigned int q)
+{
+	return q ? READ_ONCE(prod->head_q[q - 1]) : READ_ONCE(prod->head);
+}
+
+/* Write credit for queue q (and, from queue 0 after a connect, the ack
+ * and our offer) into the sender's BAR.
+ */
+static void rx_credit(struct omi_ep *ep, unsigned int r, unsigned int q)
 {
 	struct omi_peer *pr = &ep->peer[r];
+	struct omi_peer_rxq *rq = &pr->rq[q];
 	void __iomem *c;
 
 	/* Pairs with smp_store_release() in peer_set(): acks and credits
@@ -1605,41 +1810,59 @@ static void rx_credit(struct omi_ep *ep, unsigned int r)
 	if (!smp_load_acquire(&pr->ack_ok))
 		return;
 	c = pr->win + BAR_OFF(tx_cons[ep->self]);
-	if (pr->rx_ack) {
-		/* Features before the ack: the writes go out in order, so a
-		 * sender that sees the ack sees what belongs to it.
+	if (!q && pr->rx_ack) {
+		u32 feat = 0, i;
+
+		/* The offer before the ack: the writes go out in order, so
+		 * a sender that sees the ack sees what belongs to it.
 		 */
 		if (READ_ONCE(ep->db_bar_pci)) {
-			writel(OMI_FEAT_DOORBELL, c + offsetof(struct omi_cons, features));
+			feat |= OMI_FEAT_DOORBELL;
 			writel(OMI_DB_WIN_OFF + ep->db_word, c + offsetof(struct omi_cons, db_off));
 			writel(ep->db_data, c + offsetof(struct omi_cons, db_data));
-			writel(pr->rx_epoch, c + offsetof(struct omi_cons, db_token));
-		} else {
-			writel(0, c + offsetof(struct omi_cons, db_token));
 		}
-		writel(pr->rx_tail, c + offsetof(struct omi_cons, tail));
-		writel(pr->rx_epoch, c + offsetof(struct omi_cons, ack));
+		if (rq->nq > 1) {
+			feat |= OMI_FEAT_MQ;
+			writel(rq->nq, c + offsetof(struct omi_cons, nq));
+			for (i = 1; i < rq->nq; i++)
+				writel(0, c + offsetof(struct omi_cons, tail_q[i - 1]));
+		}
+		writel(feat, c + offsetof(struct omi_cons, features));
+		writel(rq->epoch, c + offsetof(struct omi_cons, db_token));
+		writel(rq->tail, c + offsetof(struct omi_cons, tail));
+		writel(rq->epoch, c + offsetof(struct omi_cons, ack));
 		pr->rx_ack = false;
-		pr->rx_credit = pr->rx_tail;
+		rq->credit = rq->tail;
 		return;
 	}
-	if (pr->rx_credit == pr->rx_tail)
+	if (rq->credit == rq->tail)
 		return;
 	/* The slot reads above must complete before the sender can see
 	 * the credit and reuse the slots. writel() only orders earlier
 	 * stores, so a full barrier is needed for the loads.
 	 */
 	mb();
-	writel(pr->rx_tail, c + offsetof(struct omi_cons, tail));
-	pr->rx_credit = pr->rx_tail;
+	writel(rq->tail, c + (q ? offsetof(struct omi_cons, tail_q[q - 1]) :
+				  offsetof(struct omi_cons, tail)));
+	rq->credit = rq->tail;
 }
 
-static int rx_ring(struct omi_ep *ep, unsigned int r, int budget)
+/*
+ * Ring (r, q): frames sender r sent on its queue q. Every queue follows
+ * the sender's connect token on its own; queue 0 also sends the ack.
+ * A sender restarts every head at 0 when it connects and writes no
+ * frames before our ack, so a queue that notices the new token late
+ * still starts at the right slot.
+ */
+static int rx_ring(struct omi_rxq *rxq, unsigned int r, int budget)
 {
+	struct omi_ep *ep = rxq->ep;
 	struct omi_peer *pr = &ep->peer[r];
+	unsigned int q = rxq->idx;
+	struct omi_peer_rxq *rq = &pr->rq[q];
 	unsigned int poff = BAR_OFF(rx_prod[r]);
 	struct omi_prod *prod = (void *)ep->bar + poff;
-	u32 head, epoch, avail;
+	u32 head, epoch, avail, slots;
 	int done = 0;
 
 	bar_inval(ep, poff, sizeof(*prod));
@@ -1647,56 +1870,64 @@ static int rx_ring(struct omi_ep *ep, unsigned int r, int budget)
 	if (!epoch)
 		return 0;
 	dma_rmb();
-	head = READ_ONCE(prod->head);
-	if (epoch != pr->rx_epoch) {
-		/* Sender (re)connected; it wrote head and its features
+	if (epoch != rq->epoch) {
+		/* Sender (re)connected; it wrote its heads and features
 		 * before the token.
 		 */
-		pr->rx_epoch = epoch;
-		pr->rx_tail = head;
-		pr->rx_ack = true;
-		/* It rings if it can and we offer it (with this ack). */
-		pr->rx_db = READ_ONCE(ep->db_bar_pci) &&
-			    READ_ONCE(prod->feat_token) == epoch &&
-			    (READ_ONCE(prod->features) & OMI_FEAT_DOORBELL);
-		if (pr->rx_db)
-			clear_bit(r, &ep->rx_nodb);
-		else
-			set_bit(r, &ep->rx_nodb);
-		omi_inc(&ep->rs, connects);
+		rq->epoch = epoch;
+		rq->nq = rx_layout(ep, prod, epoch);
+		rq->tail = 0;
+		rq->credit = 0;
+		if (!q) {
+			pr->rx_ack = true;
+			/* It rings if it can and we offer it (with this ack). */
+			pr->rx_db = READ_ONCE(ep->db_bar_pci) &&
+				    READ_ONCE(prod->feat_token) == epoch &&
+				    (READ_ONCE(prod->features) & OMI_FEAT_DOORBELL);
+			if (pr->rx_db)
+				clear_bit(r, &ep->rx_nodb);
+			else
+				set_bit(r, &ep->rx_nodb);
+		}
+		omi_inc(&rxq->rs, connects);
 	}
-	avail = head - pr->rx_tail;
-	if (avail > OMI_RING_SLOTS) {
-		pr->rx_tail = head;
-		omi_inc(&ep->rs, resyncs);
+	if (q >= rq->nq)
+		return 0;
+	slots = OMI_RING_SLOTS / rq->nq;
+	head = rx_head(prod, q);
+	avail = head - rq->tail;
+	if (avail > slots) {
+		rq->tail = head;
+		omi_inc(&rxq->rs, resyncs);
 		avail = 0;
 	}
 	while (avail && done < budget) {
-		unsigned int off = ring_off(r) +
-			(pr->rx_tail & (OMI_RING_SLOTS - 1)) * OMI_SLOT;
+		unsigned int off = ring_off(r) + q * slots * OMI_SLOT +
+			(rq->tail & (slots - 1)) * OMI_SLOT;
 		struct omi_slot_hdr *h = ep->cpu + off;
 		u32 len;
 
 		bar_inval(ep, off, sizeof(*h));
 		len = READ_ONCE(h->len);
 		if (len < ETH_HLEN || len > OMI_SLOT_DATA) {
-			omi_inc(&ep->rs, errors);
+			omi_inc(&rxq->rs, errors);
 		} else {
 			bar_inval(ep, off + sizeof(*h), len);
-			rx_deliver(ep, h + 1, len, r, true);
+			rx_deliver(rxq, h, len, r, true);
 		}
-		pr->rx_tail++;
+		rq->tail++;
 		avail--;
 		done++;
 	}
-	if (done && !pr->rx_db)
+	if (done && !READ_ONCE(pr->rx_db))
 		WRITE_ONCE(ep->nodb_rx, jiffies);
-	rx_credit(ep, r);
+	rx_credit(ep, r, q);
 	return done;
 }
 
-static int gw_rx(struct omi_ep *ep, int budget)
+static int gw_rx(struct omi_rxq *rxq, int budget)
 {
+	struct omi_ep *ep = rxq->ep;
 	struct omi_gw *gw = ep->gw;
 	u32 head;
 	int done = 0;
@@ -1705,7 +1936,7 @@ static int gw_rx(struct omi_ep *ep, int budget)
 	head = READ_ONCE(gw->rc_head);
 	if (head - ep->gw_rx_tail > OMI_GW_SLOTS) {
 		ep->gw_rx_tail = head;
-		omi_inc(&ep->rs, resyncs);
+		omi_inc(&rxq->rs, resyncs);
 	}
 	while (ep->gw_rx_tail != head && done < budget) {
 		unsigned int off = gw_slot_off(true, ep->gw_rx_tail);
@@ -1715,10 +1946,10 @@ static int gw_rx(struct omi_ep *ep, int budget)
 		bar_inval(ep, off, sizeof(*h));
 		len = READ_ONCE(h->len);
 		if (len < ETH_HLEN || len > OMI_GW_DATA) {
-			omi_inc(&ep->rs, errors);
+			omi_inc(&rxq->rs, errors);
 		} else {
 			bar_inval(ep, off + sizeof(*h), len);
-			rx_deliver(ep, h + 1, len, OMI_FDB_GW, false);
+			rx_deliver(rxq, h, len, OMI_FDB_GW, false);
 		}
 		ep->gw_rx_tail++;
 		done++;
@@ -1732,32 +1963,33 @@ static int gw_rx(struct omi_ep *ep, int budget)
 	return done;
 }
 
-static bool rx_pending(struct omi_ep *ep);
+static u32 rx_pending(struct omi_ep *ep);
 
 static int omi_napi(struct napi_struct *napi, int budget)
 {
-	struct omi_ep *ep = container_of(napi, struct omi_ep, napi);
+	struct omi_rxq *rxq = container_of(napi, struct omi_rxq, napi);
+	struct omi_ep *ep = rxq->ep;
 	int work = 0;
 	unsigned int k;
 
-	omi_inc(&ep->rs, polls);
+	omi_inc(&rxq->rs, polls);
 	if (ep->self < OMI_MAX_NODES) {
 		for (k = 0; k < OMI_N_RINGS && work < budget; k++) {
-			unsigned int r = (ep->rx_rr + k) % OMI_N_RINGS;
+			unsigned int r = (rxq->rr + k) % OMI_N_RINGS;
 
 			if (r != ep->self)
-				work += rx_ring(ep, r, budget - work);
+				work += rx_ring(rxq, r, budget - work);
 		}
-		ep->rx_rr++;
+		rxq->rr++;
 	}
-	if (work < budget)
-		work += gw_rx(ep, budget - work);
+	if (!rxq->idx && work < budget)
+		work += gw_rx(rxq, budget - work);
 	/* A doorbell can be seen before the head it follows: the two
 	 * writes take different paths (ITS, DRAM). Look once more after
 	 * completing, so such frames do not wait for the backup poll.
 	 */
 	if (work < budget && napi_complete_done(napi, work) &&
-	    READ_ONCE(ep->db_bar_pci) && rx_pending(ep))
+	    READ_ONCE(ep->db_bar_pci) && (rx_pending(ep) & BIT(rxq->idx)))
 		napi_schedule(napi);
 	return work;
 }
@@ -1765,10 +1997,11 @@ static int omi_napi(struct napi_struct *napi, int budget)
 /* ---------------------------------------------------------------- */
 /* Control                                                           */
 
-/* Is there anything for NAPI? Lockless hints; NAPI rechecks. */
-static bool rx_pending(struct omi_ep *ep)
+/* Which RX queues have something to do? Lockless hints; NAPI rechecks. */
+static u32 rx_pending(struct omi_ep *ep)
 {
-	unsigned int r;
+	u32 pend = 0;
+	unsigned int r, q;
 
 	if (ep->self < OMI_MAX_NODES) {
 		for (r = 0; r < OMI_N_RINGS; r++) {
@@ -1783,16 +2016,26 @@ static bool rx_pending(struct omi_ep *ep)
 			epoch = READ_ONCE(prod->token);
 			if (!epoch)
 				continue;
-			if (epoch != READ_ONCE(pr->rx_epoch) ||
-			    READ_ONCE(prod->head) != READ_ONCE(pr->rx_tail))
-				return true;
+			for (q = 0; q < ep->nq; q++) {
+				struct omi_peer_rxq *rq = &pr->rq[q];
+
+				if (epoch != READ_ONCE(rq->epoch)) {
+					pend |= BIT(q);
+					continue;
+				}
+				if (q < READ_ONCE(rq->nq) &&
+				    rx_head(prod, q) != READ_ONCE(rq->tail))
+					pend |= BIT(q);
+			}
 			/* An ack can only go out once we have a window. */
 			if (READ_ONCE(pr->rx_ack) && smp_load_acquire(&pr->ack_ok))
-				return true;
+				pend |= BIT(0);
 		}
 	}
 	bar_inval(ep, gw_off() + offsetof(struct omi_gw, rc_head), sizeof(u32));
-	return READ_ONCE(ep->gw->rc_head) != READ_ONCE(ep->gw_rx_tail);
+	if (READ_ONCE(ep->gw->rc_head) != READ_ONCE(ep->gw_rx_tail))
+		pend |= BIT(0);
+	return pend;
 }
 
 static void hdr_publish(struct omi_ep *ep)
@@ -1806,25 +2049,32 @@ static void hdr_publish(struct omi_ep *ep)
 static void peer_down(struct omi_ep *ep, unsigned int p)
 {
 	struct omi_peer *pr = &ep->peer[p];
-	u32 target;
+	u32 target[OMI_MAX_QUEUES];
+	unsigned int q;
 
 	spin_lock_bh(&ep->tx_lock);
 	if (pr->state == OMI_PEER_UP)
 		omi_inc(&ep->cs, peer_down);
 	pr->state = OMI_PEER_DOWN;
 	pr->stalled = false;
-	pr->db_ok = false;
-	pr->epoch = 0;
+	WRITE_ONCE(pr->db_ok, false);
+	WRITE_ONCE(pr->epoch, 0);
 	/* Its BAR may move before it comes back: no acks or credits
 	 * through the old window until peer_set() has re-pointed it.
 	 */
 	WRITE_ONCE(pr->ack_ok, false);
-	ep->up_mask &= ~BIT(p);
-	/* Runs built from now on leave p out; wait for the ones before. */
-	target = ep->build_gen;
+	WRITE_ONCE(ep->up_mask, ep->up_mask & ~BIT(p));
 	spin_unlock_bh(&ep->tx_lock);
-	while ((s32)(READ_ONCE(ep->done_gen) - target) < 0 && ep->tx_task)
-		usleep_range(20, 50);
+	/* Runs built from now on leave p out; wait for the ones before. */
+	for (q = 0; q < ep->nq; q++) {
+		spin_lock_bh(&ep->txq[q].lock);
+		target[q] = ep->txq[q].build_gen;
+		spin_unlock_bh(&ep->txq[q].lock);
+	}
+	for (q = 0; q < ep->nq; q++)
+		while ((s32)(READ_ONCE(ep->txq[q].done_gen) - target[q]) < 0 &&
+		       ep->nch && ep->ch[q % ep->nch].task)
+			usleep_range(20, 50);
 	/* Until it connects again we cannot count on its doorbell. */
 	set_bit(p, &ep->rx_nodb);
 	dev_info(ep->dev, "peer %u down\n", p);
@@ -1835,13 +2085,21 @@ static void peer_connect(struct omi_ep *ep, unsigned int p)
 {
 	struct omi_peer *pr = &ep->peer[p];
 	void __iomem *prod = pr->win + BAR_OFF(rx_prod[ep->self]);
+	u32 feat = OMI_FEAT_DOORBELL;
+	unsigned int q;
 
-	/* head before token: a receiver that sees the token sees head.
-	 * Both are posted writes from this CPU through one window, and
-	 * the barrier in writel() keeps them in order.
+	/* Heads and features before the token: a receiver that sees the
+	 * token sees them. All are posted writes from this CPU through one
+	 * window, and the barrier in writel() keeps them in order.
 	 */
 	writel(0, prod + offsetof(struct omi_prod, head));
-	writel(OMI_FEAT_DOORBELL, prod + offsetof(struct omi_prod, features));
+	if (ep->nq > 1) {
+		feat |= OMI_FEAT_MQ;
+		for (q = 1; q < ep->nq; q++)
+			writel(0, prod + offsetof(struct omi_prod, head_q[q - 1]));
+		writel(ep->nq, prod + offsetof(struct omi_prod, nq));
+	}
+	writel(feat, prod + offsetof(struct omi_prod, features));
 	writel(pr->token, prod + offsetof(struct omi_prod, feat_token));
 	writel(pr->token, prod + offsetof(struct omi_prod, token));
 	pr->conn_sent = jiffies;
@@ -1895,13 +2153,11 @@ static void peer_set(struct omi_ep *ep, unsigned int p, u32 epoch, u64 pci,
 
 	spin_lock_bh(&ep->tx_lock);
 	memcpy(pr->mac, mac, ETH_ALEN);
-	pr->epoch = epoch;
+	WRITE_ONCE(pr->epoch, epoch);
 	pr->token = token;
 	pr->conn_start = jiffies;
 	pr->state = OMI_PEER_CONNECTING;
-	pr->db_ok = false;
-	pr->head = 0;
-	pr->tail = 0;
+	WRITE_ONCE(pr->db_ok, false);
 	pr->full_since = 0;
 	spin_unlock_bh(&ep->tx_lock);
 	peer_connect(ep, p);
@@ -1963,9 +2219,73 @@ static void table_apply(struct omi_ep *ep)
 	hdr_publish(ep);
 }
 
+/* txq locks held. Queue q of peer p cannot take another frame. */
+static bool peer_q_full(struct omi_ep *ep, unsigned int p, unsigned int q)
+{
+	struct omi_peer *pr = &ep->peer[p];
+	struct omi_peer_txq *t = &pr->tq[q];
+
+	return q < pr->nq && t->queued + (t->head - t->tail) >= pr->slots - 1;
+}
+
+static void txq_lock_all(struct omi_ep *ep)
+{
+	unsigned int q;
+
+	for (q = 0; q < ep->nq; q++)
+		spin_lock_nested(&ep->txq[q].lock, q);
+}
+
+static void txq_unlock_all(struct omi_ep *ep)
+{
+	unsigned int q;
+
+	for (q = ep->nq; q-- > 0;)
+		spin_unlock(&ep->txq[q].lock);
+}
+
+/* The peer accepted our connect: take its offer and start sending. */
+static void peer_up(struct omi_ep *ep, unsigned int p, struct omi_cons *c)
+{
+	struct omi_peer *pr = &ep->peer[p];
+	bool offer = READ_ONCE(c->db_token) == pr->token;
+	u32 feat = offer ? READ_ONCE(c->features) : 0;
+	u32 db_off = READ_ONCE(c->db_off), db_data = READ_ONCE(c->db_data);
+	bool db = (feat & OMI_FEAT_DOORBELL) && !(db_off & 3) &&
+		  db_off <= OPENMIOP_BAR_SIZE - 4;
+	u8 nq = (feat & OMI_FEAT_MQ) && READ_ONCE(c->nq) == ep->nq ? ep->nq : 1;
+	unsigned int q;
+
+	if (db) {
+		for (q = 0; q < nq; q++)
+			ep->scratch->db[p][q] = db_data + q;
+		dma_sync_single_for_device(ep->dev,
+			ep->scratch_dma + offsetof(struct omi_scratch, db[p]),
+			sizeof(ep->scratch->db[p]), DMA_TO_DEVICE);
+	}
+	spin_lock_bh(&ep->tx_lock);
+	txq_lock_all(ep);
+	pr->state = OMI_PEER_UP;
+	WRITE_ONCE(pr->nq, nq);
+	WRITE_ONCE(pr->slots, OMI_RING_SLOTS / nq);
+	for (q = 0; q < OMI_MAX_QUEUES; q++) {
+		pr->tq[q].head = 0;
+		pr->tq[q].tail = q < nq ? READ_ONCE(*(u32 *)((void *)ep->bar +
+						    cons_tail_off(p, q))) : 0;
+	}
+	pr->db_off = db_off;
+	WRITE_ONCE(pr->db_ok, db);
+	WRITE_ONCE(ep->up_mask, ep->up_mask | BIT(p));
+	txq_unlock_all(ep);
+	spin_unlock_bh(&ep->tx_lock);
+	omi_inc(&ep->cs, peer_up);
+	dev_info(ep->dev, "peer %u up, %u queue%s%s\n", p, nq, nq > 1 ? "s" : "",
+		 db ? ", doorbell" : "");
+}
+
 static void peers_poll(struct omi_ep *ep)
 {
-	unsigned int p;
+	unsigned int p, q;
 
 	for (p = 0; p < OMI_N_RINGS; p++) {
 		struct omi_peer *pr = &ep->peer[p];
@@ -1976,27 +2296,7 @@ static void peers_poll(struct omi_ep *ep)
 		c = (void *)ep->bar + BAR_OFF(tx_cons[p]);
 		bar_inval(ep, BAR_OFF(tx_cons[p]), sizeof(*c));
 		if (READ_ONCE(c->ack) == pr->token) {
-			u32 db_off = READ_ONCE(c->db_off);
-			bool db = READ_ONCE(c->db_token) == pr->token &&
-				  (READ_ONCE(c->features) & OMI_FEAT_DOORBELL) &&
-				  !(db_off & 3) && db_off <= OPENMIOP_BAR_SIZE - 4;
-
-			if (db) {
-				ep->scratch->db[p] = READ_ONCE(c->db_data);
-				dma_sync_single_for_device(ep->dev,
-					ep->scratch_dma + offsetof(struct omi_scratch, db[p]),
-					sizeof(u32), DMA_TO_DEVICE);
-			}
-			spin_lock_bh(&ep->tx_lock);
-			pr->state = OMI_PEER_UP;
-			pr->head = 0;
-			pr->tail = READ_ONCE(c->tail);
-			pr->db_off = db_off;
-			pr->db_ok = db;
-			ep->up_mask |= BIT(p);
-			spin_unlock_bh(&ep->tx_lock);
-			omi_inc(&ep->cs, peer_up);
-			dev_info(ep->dev, "peer %u up%s\n", p, db ? ", doorbell" : "");
+			peer_up(ep, p, c);
 		} else if (time_after(jiffies, pr->conn_sent + OMI_CONNECT_RETRY)) {
 			if (time_after(jiffies, pr->conn_start + OMI_CONNECT_RENEW))
 				peer_renew_token(ep, p);
@@ -2004,37 +2304,44 @@ static void peers_poll(struct omi_ep *ep)
 		}
 	}
 
-	/* A peer whose ring stayed full for OMI_STALL_TIMEOUT is not
-	 * reading (interface down, stuck). Stop waiting for it so the
-	 * shared queue keeps moving; frames to it are dropped until it
-	 * returns credit.
+	/* A peer with a queue that stayed full for OMI_STALL_TIMEOUT is
+	 * not reading (interface down, stuck). Stop waiting for it so the
+	 * queues keep moving; frames to it are dropped until it returns
+	 * credit.
 	 */
 	spin_lock_bh(&ep->tx_lock);
+	txq_lock_all(ep);
 	for (p = 0; p < OMI_N_RINGS; p++) {
 		struct omi_peer *pr = &ep->peer[p];
-		u32 old = pr->tail;
+		u32 old = 0, now = 0;
+		bool full = false;
 
 		if (pr->state != OMI_PEER_UP)
 			continue;
-		peer_refresh_tail(ep, p);
+		for (q = 0; q < pr->nq; q++) {
+			old += pr->tq[q].tail;
+			peer_refresh_tail(ep, p, q);
+			now += pr->tq[q].tail;
+			/* Same test as xmit uses to stop the queue: once a
+			 * peer has no room, nothing reaches the TX thread any
+			 * more, so the stall has to be seen here.
+			 */
+			full |= peer_q_full(ep, p, q);
+		}
 		if (pr->stalled) {
-			if (pr->tail != old) {
+			if (now != old) {
 				pr->stalled = false;
 				pr->full_since = 0;
-				ep->up_mask |= BIT(p);
+				WRITE_ONCE(ep->up_mask, ep->up_mask | BIT(p));
 			}
 			continue;
 		}
-		/* Same test as xmit uses to stop the queue: once a peer has
-		 * no room, nothing reaches the TX thread any more, so the
-		 * stall has to be seen here.
-		 */
-		if (!peers_have_room(ep, BIT(p))) {
+		if (full && now == old) {
 			if (!pr->full_since) {
 				pr->full_since = jiffies | 1;
 			} else if (time_after(jiffies, pr->full_since + OMI_STALL_TIMEOUT)) {
 				pr->stalled = true;
-				ep->up_mask &= ~BIT(p);
+				WRITE_ONCE(ep->up_mask, ep->up_mask & ~BIT(p));
 				omi_inc(&ep->cs, stalls);
 				dev_warn_ratelimited(ep->dev,
 						     "peer %u not consuming, dropping its frames\n",
@@ -2044,8 +2351,10 @@ static void peers_poll(struct omi_ep *ep)
 			pr->full_since = 0;
 		}
 	}
-	if (omi_maybe_wake(ep))
-		omi_inc(&ep->cs, queue_wakes);
+	for (q = 0; q < ep->nq; q++)
+		if (omi_maybe_wake(ep, &ep->txq[q]))
+			omi_inc(&ep->cs, queue_wakes);
+	txq_unlock_all(ep);
 	spin_unlock_bh(&ep->tx_lock);
 }
 
@@ -2124,8 +2433,9 @@ static int ctl_thread(void *data)
 	struct omi_ep *ep = data;
 	struct net_device *ndev = ep->ndev;
 	unsigned long next_ctl = jiffies;
-	unsigned int idle = 0;
+	unsigned int idle = 0, q;
 	bool running, doorbells;
+	u32 sched, pend;
 
 	set_user_nice(current, -20);
 	while (!kthread_should_stop()) {
@@ -2159,33 +2469,33 @@ static int ctl_thread(void *data)
 		doorbells = ep->db_bar_pci &&
 			    (!READ_ONCE(ep->rx_nodb) ||
 			     time_after(jiffies, READ_ONCE(ep->nodb_rx) + OMI_NODB_QUIET));
-		if (running && doorbells &&
-		    test_bit(NAPI_STATE_SCHED, &ep->napi.state)) {
-			idle = OMI_POLL_BUSY_LOOPS;
-			usleep_range_state(OMI_POLL_DB_US, 2 * OMI_POLL_DB_US, TASK_IDLE);
-		} else if (running && test_bit(NAPI_STATE_SCHED, &ep->napi.state)) {
-			/* NAPI is still draining (or disabled): it reschedules
-			 * itself while it has work, so there is nothing to kick.
-			 */
-			idle = 0;
-			usleep_range_state(20, 50, TASK_IDLE);
-		} else if (running && rx_pending(ep)) {
-			/* Nothing raises an interrupt for a peer write, so this
-			 * thread stands in for the RX IRQ. local_bh_enable()
-			 * runs the NAPI poll before returning.
+		sched = 0;
+		for (q = 0; running && q < ep->nq; q++)
+			if (test_bit(NAPI_STATE_SCHED, &ep->rxq[q].napi.state))
+				sched |= BIT(q);
+		/* NAPI contexts still draining (or disabled) reschedule
+		 * themselves while they have work: nothing to kick there.
+		 */
+		pend = running ? rx_pending(ep) & ~sched : 0;
+		if (pend) {
+			/* Nothing raised an interrupt for these (a sender
+			 * without a doorbell, or a lost one): this thread
+			 * stands in for it. local_bh_enable() runs the polls.
 			 */
 			idle = 0;
 			omi_inc(&ep->cs, napi_kicks);
 			local_bh_disable();
-			napi_schedule(&ep->napi);
+			for (q = 0; q < ep->nq; q++)
+				if (pend & BIT(q))
+					napi_schedule(&ep->rxq[q].napi);
 			local_bh_enable();
 			cond_resched();
 		} else if (doorbells) {
 			idle = OMI_POLL_BUSY_LOOPS;
 			usleep_range_state(OMI_POLL_DB_US, 2 * OMI_POLL_DB_US, TASK_IDLE);
-		} else if (idle < OMI_POLL_BUSY_LOOPS) {
+		} else if (sched || idle < OMI_POLL_BUSY_LOOPS) {
 			/* TASK_IDLE: a sleeping poller is not load. */
-			idle++;
+			idle = sched ? 0 : idle + 1;
 			usleep_range_state(20, 50, TASK_IDLE);
 		} else {
 			usleep_range_state(OMI_POLL_IDLE_US, 2 * OMI_POLL_IDLE_US,
@@ -2201,110 +2511,141 @@ static int ctl_thread(void *data)
 static int omi_open(struct net_device *ndev)
 {
 	struct omi_ep *ep = netdev_priv(ndev);
+	unsigned int q, c;
 
-	napi_enable(&ep->napi);
-	ep->tx_task = kthread_run(tx_thread, ep, "omi-tx");
-	if (IS_ERR(ep->tx_task)) {
-		int err = PTR_ERR(ep->tx_task);
+	for (q = 0; q < ep->nq; q++)
+		napi_enable(&ep->rxq[q].napi);
+	for (c = 0; c < ep->nch; c++) {
+		struct omi_chan *ch = &ep->ch[c];
 
-		ep->tx_task = NULL;
-		napi_disable(&ep->napi);
-		return err;
+		ch->task = kthread_run(tx_thread, ch, "omi-tx%u", c);
+		if (IS_ERR(ch->task)) {
+			int err = PTR_ERR(ch->task);
+
+			ch->task = NULL;
+			while (c-- > 0) {
+				kthread_stop(ep->ch[c].task);
+				ep->ch[c].task = NULL;
+			}
+			for (q = 0; q < ep->nq; q++)
+				napi_disable(&ep->rxq[q].napi);
+			return err;
+		}
 	}
-	netif_start_queue(ndev);
+	netif_tx_start_all_queues(ndev);
 	return 0;
 }
 
 static int omi_stop(struct net_device *ndev)
 {
 	struct omi_ep *ep = netdev_priv(ndev);
+	unsigned int q, c;
 
 	netif_tx_disable(ndev);
-	if (ep->tx_task) {
-		kthread_stop(ep->tx_task);
-		ep->tx_task = NULL;
+	for (c = 0; c < ep->nch; c++) {
+		if (ep->ch[c].task) {
+			kthread_stop(ep->ch[c].task);
+			ep->ch[c].task = NULL;
+		}
 	}
-	txq_purge(ep);
-	napi_disable(&ep->napi);
+	for (q = 0; q < ep->nq; q++) {
+		txq_purge(ep, &ep->txq[q]);
+		napi_disable(&ep->rxq[q].napi);
+	}
 	return 0;
 }
+
+#define omi_read(st, f) ({						\
+	unsigned int __start;						\
+	u64 __v;							\
+	do {								\
+		__start = u64_stats_fetch_begin(&(st)->syncp);		\
+		__v = u64_stats_read(&(st)->f);				\
+	} while (u64_stats_fetch_retry(&(st)->syncp, __start));		\
+	__v;								\
+})
 
 static void omi_get_stats64(struct net_device *ndev,
 			    struct rtnl_link_stats64 *s)
 {
 	struct omi_ep *ep = netdev_priv(ndev);
-	unsigned int start;
+	unsigned int i;
 
-	do {
-		start = u64_stats_fetch_begin(&ep->xs.syncp);
-		s->tx_packets = u64_stats_read(&ep->xs.packets);
-		s->tx_bytes = u64_stats_read(&ep->xs.bytes);
-		s->tx_dropped = u64_stats_read(&ep->xs.dropped);
-	} while (u64_stats_fetch_retry(&ep->xs.syncp, start));
-	do {
-		start = u64_stats_fetch_begin(&ep->ts.syncp);
-		s->tx_dropped += u64_stats_read(&ep->ts.dropped);
-		s->tx_errors = u64_stats_read(&ep->ts.dma_errors);
-	} while (u64_stats_fetch_retry(&ep->ts.syncp, start));
-	do {
-		start = u64_stats_fetch_begin(&ep->rs.syncp);
-		s->rx_packets = u64_stats_read(&ep->rs.packets);
-		s->rx_bytes = u64_stats_read(&ep->rs.bytes);
-		s->rx_errors = u64_stats_read(&ep->rs.errors);
-		s->rx_dropped = u64_stats_read(&ep->rs.dropped);
-	} while (u64_stats_fetch_retry(&ep->rs.syncp, start));
+	for (i = 0; i < ep->nq; i++) {
+		struct omi_xmit_stats *xs = &ep->txq[i].xs;
+		struct omi_rx_stats *rs = &ep->rxq[i].rs;
+
+		s->tx_packets += omi_read(xs, packets);
+		s->tx_bytes += omi_read(xs, bytes);
+		s->tx_dropped += omi_read(xs, dropped);
+		s->rx_packets += omi_read(rs, packets);
+		s->rx_bytes += omi_read(rs, bytes);
+		s->rx_errors += omi_read(rs, errors);
+		s->rx_dropped += omi_read(rs, dropped);
+	}
+	for (i = 0; i < ep->nch; i++) {
+		s->tx_dropped += omi_read(&ep->ch[i].ts, dropped);
+		s->tx_errors += omi_read(&ep->ch[i].ts, dma_errors);
+	}
 }
 
 static const struct net_device_ops omi_netdev_ops = {
 	.ndo_open = omi_open,
 	.ndo_stop = omi_stop,
 	.ndo_start_xmit = omi_xmit,
+	.ndo_select_queue = omi_select_queue,
 	.ndo_get_stats64 = omi_get_stats64,
 	.ndo_validate_addr = eth_validate_addr,
 };
 
-/* ethtool -S. Each group has its own writer context. */
-#define OMI_STAT(name, grp, f) { name, offsetof(struct omi_ep, grp) + \
-	offsetof(typeof(((struct omi_ep *)0)->grp), f), \
-	offsetof(struct omi_ep, grp) + offsetof(typeof(((struct omi_ep *)0)->grp), syncp) }
+/* ethtool -S: each counter summed over the queues (xmit, RX) or
+ * channels (TX threads) it lives in; each instance has its own writer.
+ */
+enum omi_stat_grp { OMI_XS, OMI_TS, OMI_RS, OMI_CS };
+
+#define OMI_STAT(name, g, type, f) { name, g, offsetof(type, f), offsetof(type, syncp) }
 
 static const struct {
 	const char name[ETH_GSTRING_LEN];
+	enum omi_stat_grp grp;
 	size_t off;
 	size_t sync;
 } omi_stats[] = {
-	OMI_STAT("tx_gw_packets", xs, gw_packets),
-	OMI_STAT("tx_gw_ring_full", xs, gw_full),
-	OMI_STAT("tx_queue_stops", xs, queue_stops),
-	OMI_STAT("tx_p2p_frames", ts, p2p_frames),
-	OMI_STAT("tx_dma_runs", ts, dma_runs),
-	OMI_STAT("tx_dma_elements", ts, dma_elems),
-	OMI_STAT("tx_dma_errors", ts, dma_errors),
-	OMI_STAT("tx_dropped_late", ts, dropped),
-	OMI_STAT("tx_peer_gone_drops", ts, peer_full_drops),
-	OMI_STAT("tx_queue_wakes", ts, queue_wakes),
-	OMI_STAT("tx_dma_wait_ns", ts, dma_wait_ns),
-	OMI_STAT("tx_dma_bytes", ts, dma_bytes),
-	OMI_STAT("tx_dma_irq_lost", ts, irq_lost),
-	OMI_STAT("tx_doorbells", ts, doorbells),
-	OMI_STAT("rx_p2p_packets", rs, p2p_packets),
-	OMI_STAT("rx_gw_packets", rs, gw_packets),
-	OMI_STAT("rx_bad_len", rs, errors),
-	OMI_STAT("rx_alloc_drops", rs, dropped),
-	OMI_STAT("rx_resyncs", rs, resyncs),
-	OMI_STAT("rx_connects", rs, connects),
-	OMI_STAT("rx_napi_polls", rs, polls),
-	OMI_STAT("ctl_poll_cycles", cs, poll_cycles),
-	OMI_STAT("ctl_napi_kicks", cs, napi_kicks),
-	OMI_STAT("ctl_table_updates", cs, table_updates),
-	OMI_STAT("ctl_peer_up", cs, peer_up),
-	OMI_STAT("ctl_peer_down", cs, peer_down),
-	OMI_STAT("ctl_peer_stalls", cs, stalls),
-	OMI_STAT("ctl_queue_wakes", cs, queue_wakes),
-	OMI_STAT("ctl_link_resets", cs, link_resets),
-	OMI_STAT("ctl_connect_renew", cs, connect_renew),
-	OMI_STAT("ctl_doorbell_windows", cs, db_windows),
+	OMI_STAT("tx_gw_packets", OMI_XS, struct omi_xmit_stats, gw_packets),
+	OMI_STAT("tx_gw_ring_full", OMI_XS, struct omi_xmit_stats, gw_full),
+	OMI_STAT("tx_queue_stops", OMI_XS, struct omi_xmit_stats, queue_stops),
+	OMI_STAT("tx_p2p_frames", OMI_TS, struct omi_tx_stats, p2p_frames),
+	OMI_STAT("tx_dma_runs", OMI_TS, struct omi_tx_stats, dma_runs),
+	OMI_STAT("tx_dma_elements", OMI_TS, struct omi_tx_stats, dma_elems),
+	OMI_STAT("tx_dma_errors", OMI_TS, struct omi_tx_stats, dma_errors),
+	OMI_STAT("tx_dropped_late", OMI_TS, struct omi_tx_stats, dropped),
+	OMI_STAT("tx_peer_gone_drops", OMI_TS, struct omi_tx_stats, peer_full_drops),
+	OMI_STAT("tx_queue_wakes", OMI_TS, struct omi_tx_stats, queue_wakes),
+	OMI_STAT("tx_dma_wait_ns", OMI_TS, struct omi_tx_stats, dma_wait_ns),
+	OMI_STAT("tx_dma_bytes", OMI_TS, struct omi_tx_stats, dma_bytes),
+	OMI_STAT("tx_dma_irq_lost", OMI_TS, struct omi_tx_stats, irq_lost),
+	OMI_STAT("tx_doorbells", OMI_TS, struct omi_tx_stats, doorbells),
+	OMI_STAT("rx_p2p_packets", OMI_RS, struct omi_rx_stats, p2p_packets),
+	OMI_STAT("rx_gw_packets", OMI_RS, struct omi_rx_stats, gw_packets),
+	OMI_STAT("rx_bad_len", OMI_RS, struct omi_rx_stats, errors),
+	OMI_STAT("rx_alloc_drops", OMI_RS, struct omi_rx_stats, dropped),
+	OMI_STAT("rx_resyncs", OMI_RS, struct omi_rx_stats, resyncs),
+	OMI_STAT("rx_connects", OMI_RS, struct omi_rx_stats, connects),
+	OMI_STAT("rx_napi_polls", OMI_RS, struct omi_rx_stats, polls),
+	OMI_STAT("ctl_poll_cycles", OMI_CS, struct omi_ctl_stats, poll_cycles),
+	OMI_STAT("ctl_napi_kicks", OMI_CS, struct omi_ctl_stats, napi_kicks),
+	OMI_STAT("ctl_table_updates", OMI_CS, struct omi_ctl_stats, table_updates),
+	OMI_STAT("ctl_peer_up", OMI_CS, struct omi_ctl_stats, peer_up),
+	OMI_STAT("ctl_peer_down", OMI_CS, struct omi_ctl_stats, peer_down),
+	OMI_STAT("ctl_peer_stalls", OMI_CS, struct omi_ctl_stats, stalls),
+	OMI_STAT("ctl_queue_wakes", OMI_CS, struct omi_ctl_stats, queue_wakes),
+	OMI_STAT("ctl_link_resets", OMI_CS, struct omi_ctl_stats, link_resets),
+	OMI_STAT("ctl_connect_renew", OMI_CS, struct omi_ctl_stats, connect_renew),
+	OMI_STAT("ctl_doorbell_windows", OMI_CS, struct omi_ctl_stats, db_windows),
 };
+
+/* Per-queue RX packets, so ethtool -S shows the RSS spread. */
+#define OMI_QSTATS	OMI_MAX_QUEUES
 
 static void omi_get_drvinfo(struct net_device *ndev, struct ethtool_drvinfo *info)
 {
@@ -2318,7 +2659,7 @@ static void omi_get_drvinfo(struct net_device *ndev, struct ethtool_drvinfo *inf
 
 static int omi_get_sset_count(struct net_device *ndev, int sset)
 {
-	return sset == ETH_SS_STATS ? ARRAY_SIZE(omi_stats) : -EOPNOTSUPP;
+	return sset == ETH_SS_STATS ? ARRAY_SIZE(omi_stats) + OMI_QSTATS : -EOPNOTSUPP;
 }
 
 static void omi_get_strings(struct net_device *ndev, u32 sset, u8 *buf)
@@ -2329,24 +2670,63 @@ static void omi_get_strings(struct net_device *ndev, u32 sset, u8 *buf)
 		return;
 	for (i = 0; i < ARRAY_SIZE(omi_stats); i++)
 		memcpy(buf + i * ETH_GSTRING_LEN, omi_stats[i].name, ETH_GSTRING_LEN);
+	for (i = 0; i < OMI_QSTATS; i++)
+		snprintf(buf + (ARRAY_SIZE(omi_stats) + i) * ETH_GSTRING_LEN,
+			 ETH_GSTRING_LEN, "rx_q%d_packets", i);
+}
+
+static u64 omi_stat_one(void *grp, size_t off, size_t sync)
+{
+	const struct u64_stats_sync *sy = grp + sync;
+	const u64_stats_t *v = grp + off;
+	unsigned int start;
+	u64 x;
+
+	do {
+		start = u64_stats_fetch_begin(sy);
+		x = u64_stats_read(v);
+	} while (u64_stats_fetch_retry(sy, start));
+	return x;
 }
 
 static void omi_get_ethtool_stats(struct net_device *ndev,
 				  struct ethtool_stats *stats, u64 *data)
 {
 	struct omi_ep *ep = netdev_priv(ndev);
-	int i;
+	unsigned int i, k;
 
 	for (i = 0; i < ARRAY_SIZE(omi_stats); i++) {
-		const struct u64_stats_sync *sync = (void *)ep + omi_stats[i].sync;
-		const u64_stats_t *v = (void *)ep + omi_stats[i].off;
-		unsigned int start;
+		size_t off = omi_stats[i].off, sync = omi_stats[i].sync;
 
-		do {
-			start = u64_stats_fetch_begin(sync);
-			data[i] = u64_stats_read(v);
-		} while (u64_stats_fetch_retry(sync, start));
+		data[i] = 0;
+		switch (omi_stats[i].grp) {
+		case OMI_XS:
+			for (k = 0; k < ep->nq; k++)
+				data[i] += omi_stat_one(&ep->txq[k].xs, off, sync);
+			break;
+		case OMI_TS:
+			for (k = 0; k < ep->nch; k++)
+				data[i] += omi_stat_one(&ep->ch[k].ts, off, sync);
+			break;
+		case OMI_RS:
+			for (k = 0; k < ep->nq; k++)
+				data[i] += omi_stat_one(&ep->rxq[k].rs, off, sync);
+			break;
+		case OMI_CS:
+			data[i] = omi_stat_one(&ep->cs, off, sync);
+			break;
+		}
 	}
+	for (k = 0; k < OMI_QSTATS; k++)
+		data[i + k] = k < ep->nq ? omi_read(&ep->rxq[k].rs, packets) : 0;
+}
+
+static void omi_get_channels(struct net_device *ndev, struct ethtool_channels *ch)
+{
+	struct omi_ep *ep = netdev_priv(ndev);
+
+	ch->max_combined = OMI_MAX_QUEUES;
+	ch->combined_count = ep->nq;
 }
 
 static const struct ethtool_ops omi_ethtool_ops = {
@@ -2355,6 +2735,7 @@ static const struct ethtool_ops omi_ethtool_ops = {
 	.get_sset_count = omi_get_sset_count,
 	.get_strings = omi_get_strings,
 	.get_ethtool_stats = omi_get_ethtool_stats,
+	.get_channels = omi_get_channels,
 };
 
 /* ---------------------------------------------------------------- */
@@ -2598,9 +2979,9 @@ static int omi_alloc_bar(struct omi_ep *ep)
 
 static irqreturn_t omi_db_isr(int irq, void *data)
 {
-	struct omi_ep *ep = data;
+	struct omi_rxq *rxq = data;
 
-	napi_schedule(&ep->napi);
+	napi_schedule(&rxq->napi);
 	return IRQ_HANDLED;
 }
 
@@ -2609,7 +2990,33 @@ static void omi_db_write_msg(struct msi_desc *desc, struct msi_msg *msg)
 	struct platform_device *d = to_platform_device(desc->dev);
 	struct omi_ep *ep = platform_get_drvdata(d);
 
-	ep->dbv[d->id >> 8].msg = *msg;
+	if (desc->msi_index < OMI_MAX_QUEUES)
+		ep->dbv[d->id >> 8].msg[desc->msi_index] = *msg;
+}
+
+/* RX queue q runs on the q-th fastest online CPU (the A76 cores on
+ * RK3588), as a hint: irqbalance or the admin may move it.
+ */
+static unsigned int db_queue_cpu(unsigned int q)
+{
+	unsigned int cpu, best, n = 0, order[NR_CPUS > 64 ? 64 : NR_CPUS];
+	unsigned long used = 0;
+
+	for (n = 0; n < ARRAY_SIZE(order) && n < num_online_cpus(); n++) {
+		best = nr_cpu_ids;
+		for_each_online_cpu(cpu) {
+			if (cpu >= 64 || (used & BIT_ULL(cpu)))
+				continue;
+			if (best == nr_cpu_ids ||
+			    arch_scale_cpu_capacity(cpu) > arch_scale_cpu_capacity(best))
+				best = cpu;
+		}
+		if (best == nr_cpu_ids)
+			break;
+		used |= BIT_ULL(best);
+		order[n] = best;
+	}
+	return n ? order[q % n] : 0;
 }
 
 static void db_teardown(struct omi_ep *ep)
@@ -2621,10 +3028,15 @@ static void db_teardown(struct omi_ep *ep)
 	ep->db_bar_pci = 0;
 	for (i = 0; i < ARRAY_SIZE(ep->dbv); i++) {
 		struct omi_dbv *v = &ep->dbv[i];
+		unsigned int q;
 
-		if (v->irq > 0)
-			free_irq(v->irq, ep);
-		v->irq = 0;
+		for (q = 0; q < OMI_MAX_QUEUES; q++) {
+			if (v->irq[q] > 0) {
+				irq_set_affinity_hint(v->irq[q], NULL);
+				free_irq(v->irq[q], &ep->rxq[q]);
+			}
+			v->irq[q] = 0;
+		}
 		if (v->pdev) {
 			platform_device_msi_free_irqs_all(&v->pdev->dev);
 			platform_device_unregister(v->pdev);
@@ -2668,7 +3080,8 @@ static struct device_node *db_msi_map_node(struct platform_device *pdev)
  * DeviceID of the vector is msi-map(bus << 8): exactly the ID the
  * controller attaches to a write from the endpoint on that bus. The bus
  * numbers belong to the RC and may change; covering them all means no
- * coordination with it. Senders all write the same event id (0).
+ * coordination with it. Each vector device has one event per RX queue:
+ * a sender rings queue q with db_data + q.
  */
 static int db_setup(struct omi_ep *ep, struct platform_device *pdev)
 {
@@ -2677,7 +3090,7 @@ static int db_setup(struct omi_ep *ep, struct platform_device *pdev)
 	const __be32 *map;
 	u32 *vals, devid;
 	u64 addr = 0;
-	unsigned int i;
+	unsigned int i, q;
 	int len, ret;
 
 	src = db_msi_map_node(pdev);
@@ -2745,25 +3158,32 @@ static int db_setup(struct omi_ep *ep, struct platform_device *pdev)
 		}
 		v->pdev = d;
 		dev_set_msi_domain(&d->dev, dom);
-		ret = platform_device_msi_init_and_alloc_irqs(&d->dev, 1, omi_db_write_msg);
+		ret = platform_device_msi_init_and_alloc_irqs(&d->dev, ep->nq,
+							      omi_db_write_msg);
 		if (ret)
 			break;
-		ret = request_irq(msi_get_virq(&d->dev, 0), omi_db_isr, 0,
-				  dev_name(&d->dev), ep);
+		for (q = 0; q < ep->nq && !ret; q++) {
+			int irq = msi_get_virq(&d->dev, q);
+
+			snprintf(v->name[q], sizeof(v->name[q]), "omi-rx%u-bus%u", q, i);
+			ret = request_irq(irq, omi_db_isr, 0, v->name[q], &ep->rxq[q]);
+			if (ret)
+				break;
+			v->irq[q] = irq;
+			irq_set_affinity_and_hint(irq, cpumask_of(db_queue_cpu(q)));
+			a = (u64)v->msg[q].address_hi << 32 | v->msg[q].address_lo;
+			if (!addr) {
+				addr = a;
+				ep->db_data = v->msg[q].data;
+			}
+			if (a != addr || v->msg[q].data != ep->db_data + q) {
+				dev_err(ep->dev, "doorbell vector %u/%u: msg %#llx/%#x, expected %#llx/%#x\n",
+					i, q, a, v->msg[q].data, addr, ep->db_data + q);
+				ret = -EINVAL;
+			}
+		}
 		if (ret)
 			break;
-		v->irq = msi_get_virq(&d->dev, 0);
-		a = (u64)v->msg.address_hi << 32 | v->msg.address_lo;
-		if (!addr) {
-			addr = a;
-			ep->db_data = v->msg.data;
-		}
-		if (a != addr || v->msg.data != ep->db_data) {
-			dev_err(ep->dev, "doorbell vector %u: msg %#llx/%#x, expected %#llx/%#x\n",
-				i, a, v->msg.data, addr, ep->db_data);
-			ret = -EINVAL;
-			break;
-		}
 	}
 	if (ret) {
 		db_teardown(ep);
@@ -2772,8 +3192,8 @@ static int db_setup(struct omi_ep *ep, struct platform_device *pdev)
 	ep->db_xlate = addr & ~(u64)(OMI_DB_WIN_SIZE - 1);
 	ep->db_word = addr & (OMI_DB_WIN_SIZE - 1);
 	ep->db_ok = true;
-	dev_info(ep->dev, "RX doorbell: %u ITS vectors, translater %#llx data %#x\n",
-		 (unsigned int)ARRAY_SIZE(ep->dbv) - 1, addr, ep->db_data);
+	dev_info(ep->dev, "RX doorbell: %u buses x %u queues, translater %#llx data %#x\n",
+		 (unsigned int)ARRAY_SIZE(ep->dbv) - 1, ep->nq, addr, ep->db_data);
 	return 0;
 }
 
@@ -2794,6 +3214,7 @@ static int openmiop_probe(struct platform_device *pdev)
 {
 	struct omi_ep *ep;
 	struct net_device *ndev;
+	unsigned int i, nq;
 	int ret;
 
 	BUILD_BUG_ON(sizeof(struct omi_hdr) != 64);
@@ -2809,11 +3230,18 @@ static int openmiop_probe(struct platform_device *pdev)
 	BUILD_BUG_ON(OMI_SCRATCH_OFF + sizeof(struct omi_scratch) > OMI_DB_WIN_OFF);
 	BUILD_BUG_ON(OMI_DB_WIN_OFF + OMI_DB_WIN_SIZE > OPENMIOP_BAR_SIZE);
 	BUILD_BUG_ON(sizeof(struct omi_prod) != 64 || sizeof(struct omi_cons) != 64);
-	BUILD_BUG_ON(offsetof(struct omi_scratch, ll) % 64);
+	BUILD_BUG_ON(offsetof(struct omi_chan_scratch, ll) % 64);
+	BUILD_BUG_ON(!is_power_of_2(OMI_MAX_QUEUES) ||
+		     OMI_RING_SLOTS / OMI_MAX_QUEUES < 2 * OMI_TX_BATCH);
 	BUILD_BUG_ON(OMI_N_RINGS > OMI_MAX_NODES || OMI_MAX_NODES > 8);
 	BUILD_BUG_ON(!is_power_of_2(OMI_RING_SLOTS) || !is_power_of_2(OMI_GW_SLOTS));
 
-	ndev = alloc_etherdev(sizeof(*ep));
+	/* Queue pairs: a power of two (ring slots split evenly), at most
+	 * one per CPU.
+	 */
+	nq = rounddown_pow_of_two(clamp_t(uint, queues, 1,
+					  min_t(uint, OMI_MAX_QUEUES, num_online_cpus())));
+	ndev = alloc_etherdev_mqs(sizeof(*ep), nq, nq);
 	if (!ndev)
 		return -ENOMEM;
 
@@ -2821,20 +3249,43 @@ static int openmiop_probe(struct platform_device *pdev)
 	ep->dev = &pdev->dev;
 	ep->ndev = ndev;
 	ep->self = OMI_MAX_NODES;
+	ep->nq = nq;
 	spin_lock_init(&ep->tx_lock);
-	init_waitqueue_head(&ep->tx_wait);
-	init_waitqueue_head(&ep->tx_done_wq);
-	u64_stats_init(&ep->xs.syncp);
-	u64_stats_init(&ep->ts.syncp);
-	u64_stats_init(&ep->rs.syncp);
+	spin_lock_init(&ep->gw_lock);
 	u64_stats_init(&ep->cs.syncp);
-	platform_set_drvdata(pdev, ep);
+	for (i = 0; i < OMI_MAX_QUEUES; i++) {
+		struct omi_txq *txq = &ep->txq[i];
+		struct omi_rxq *rxq = &ep->rxq[i];
 
-	ep->txq = devm_kcalloc(&pdev->dev, OMI_TXQ_SIZE, sizeof(*ep->txq), GFP_KERNEL);
-	if (!ep->txq) {
-		ret = -ENOMEM;
-		goto err_free;
+		spin_lock_init(&txq->lock);
+		txq->idx = i;
+		u64_stats_init(&txq->xs.syncp);
+		rxq->ep = ep;
+		rxq->idx = i;
+		u64_stats_init(&rxq->rs.syncp);
+		if (i >= nq)
+			continue;
+		txq->ring = devm_kcalloc(&pdev->dev, OMI_TXQ_SIZE, sizeof(*txq->ring),
+					 GFP_KERNEL);
+		if (!txq->ring) {
+			ret = -ENOMEM;
+			goto err_free;
+		}
 	}
+	for (i = 0; i < OMI_MAX_CH; i++) {
+		struct omi_chan *ch = &ep->ch[i];
+
+		ch->ep = ep;
+		ch->idx = i;
+		init_waitqueue_head(&ch->wait);
+		init_waitqueue_head(&ch->done_wq);
+		u64_stats_init(&ch->ts.syncp);
+	}
+	for (i = 0; i < OMI_MAX_NODES; i++) {
+		ep->peer[i].nq = 1;
+		ep->peer[i].slots = OMI_RING_SLOTS;
+	}
+	platform_set_drvdata(pdev, ep);
 
 	ret = omi_map_regs(pdev, ep);
 	if (ret)
@@ -2910,23 +3361,21 @@ static int openmiop_probe(struct platform_device *pdev)
 		goto err_dma;
 	edma_init(ep);
 	if (ep->edma && tx_irq) {
-		/* Which dmaN line carries write channel 0 is not documented;
-		 * listen on all of them, the handler only takes channel 0 bits.
-		 */
-		static const char * const names[] = { "dma0", "dma1", "dma2", "dma3" };
-		unsigned int i;
+		/* Write channel c raises line "dma<c>" (seen on RK3588). */
+		for (i = 0; i < ep->nch; i++) {
+			struct omi_chan *ch = &ep->ch[i];
+			char name[8];
+			int irq;
 
-		for (i = 0; i < ARRAY_SIZE(names); i++) {
-			int irq = platform_get_irq_byname_optional(pdev, names[i]);
-
+			snprintf(name, sizeof(name), "dma%u", i);
+			irq = platform_get_irq_byname_optional(pdev, name);
 			if (irq > 0 && !devm_request_irq(&pdev->dev, irq, omi_edma_isr,
-							 IRQF_SHARED, "openmiop-edma", ep))
-				ep->tx_irq = irq;
+							 IRQF_SHARED, "openmiop-edma", ch))
+				ch->irq = irq;
+			else
+				dev_warn(ep->dev, "no interrupt for eDMA channel %u, polling it\n", i);
 		}
-		if (ep->tx_irq)
-			edma_set_mask(ep);
-		else
-			dev_warn(ep->dev, "no eDMA interrupt, polling\n");
+		edma_set_mask(ep);
 	}
 	if (ep->edma) {
 		ep->ob = ioremap(ep->ob_phys, (size_t)OMI_MAX_NODES * OPENMIOP_BAR_SIZE);
@@ -2948,7 +3397,8 @@ static int openmiop_probe(struct platform_device *pdev)
 	ndev->mtu = 9000;
 	ndev->features |= NETIF_F_SG | NETIF_F_GRO | NETIF_F_RXCSUM;
 	ndev->hw_features |= NETIF_F_SG | NETIF_F_GRO | NETIF_F_RXCSUM;
-	netif_napi_add(ndev, &ep->napi, omi_napi);
+	for (i = 0; i < nq; i++)
+		netif_napi_add(ndev, &ep->rxq[i].napi, omi_napi);
 	netif_carrier_off(ndev);
 	/* No sender has connected: none rings yet. */
 	ep->rx_nodb = GENMASK(OMI_MAX_NODES - 1, 0);
@@ -2972,16 +3422,18 @@ static int openmiop_probe(struct platform_device *pdev)
 		goto err_unreg;
 	}
 
-	dev_info(&pdev->dev, "%s mac %pM epoch %#x eDMA %s\n", ndev->name,
-		 ndev->dev_addr, ep->epoch,
-		 !ep->edma ? "off" : ep->tx_irq ? "on (irq)" : "on (polled)");
+	dev_info(&pdev->dev, "%s mac %pM epoch %#x eDMA %s, %u queues, %u channels\n",
+		 ndev->name, ndev->dev_addr, ep->epoch,
+		 !ep->edma ? "off" : ep->ch[0].irq ? "on (irq)" : "on (polled)",
+		 ep->nq, ep->nch);
 	return 0;
 
 err_unreg:
 	unregister_netdev(ndev);
 err_hw:
 	db_teardown(ep);
-	netif_napi_del(&ep->napi);
+	for (i = 0; i < ep->nq; i++)
+		netif_napi_del(&ep->rxq[i].napi);
 	if (ep->ob)
 		iounmap(ep->ob);
 	hw_stop(ep);
@@ -3006,6 +3458,7 @@ err_free:
 static void openmiop_teardown(struct platform_device *pdev)
 {
 	struct omi_ep *ep = platform_get_drvdata(pdev);
+	unsigned int i;
 
 	/* ctl first: it touches the netdev and connects peers. Then
 	 * unregister stops TX and NAPI: no more writes into peer BARs.
@@ -3014,7 +3467,8 @@ static void openmiop_teardown(struct platform_device *pdev)
 	unregister_netdev(ep->ndev);
 	db_teardown(ep);
 	bar_leave(ep);
-	netif_napi_del(&ep->napi);
+	for (i = 0; i < ep->nq; i++)
+		netif_napi_del(&ep->rxq[i].napi);
 	disable_outbound(ep);
 	if (ep->ob)
 		iounmap(ep->ob);
