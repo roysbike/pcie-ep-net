@@ -46,6 +46,8 @@
 #define OPENMIOP_BAR_SIZE	(16u * 1024u * 1024u)
 
 #define OMI_MAX_NODES		8u
+/* Queues per sender/receiver pair (OMI_FEAT_MQ). */
+#define OMI_MAX_QUEUES		4u
 
 /* omi_hdr.flags */
 #define OMI_F_UP		0x1u	/* header valid, rings initialised */
@@ -109,9 +111,13 @@ struct omi_peer_entry {
  * per connect, so a stale acknowledgement can never match.
  */
 struct omi_prod {
-	__u32 head;
+	__u32 head;		/* queue 0 */
 	__u32 token;		/* sender's connect token */
-	__u8 pad[56];
+	__u32 features;		/* OMI_FEAT_* the sender supports */
+	__u32 feat_token;	/* = token when features and nq belong to it */
+	__u32 nq;		/* OMI_FEAT_MQ: the sender's queue count */
+	__u32 head_q[OMI_MAX_QUEUES - 1];	/* OMI_FEAT_MQ: queues 1.. */
+	__u8 pad[32];
 };
 
 /* ---- 0x0600: one line per remote node, written by that node ----
@@ -120,10 +126,41 @@ struct omi_prod {
  * echoing our token.
  */
 struct omi_cons {
-	__u32 tail;
+	__u32 tail;		/* queue 0 */
 	__u32 ack;		/* = our token once node i accepted it */
-	__u8 pad[56];
+	__u32 features;		/* OMI_FEAT_* node i offers us */
+	__u32 db_off;		/* doorbell word in node i's BAR */
+	__u32 db_data;		/* value to write there, + queue index */
+	__u32 db_token;		/* = ack when the offer (features .. nq) belongs to it */
+	__u32 nq;		/* OMI_FEAT_MQ: queues node i set up for us */
+	__u32 tail_q[OMI_MAX_QUEUES - 1];	/* OMI_FEAT_MQ: queues 1.. */
+	__u8 pad[24];
 };
+
+/*
+ * Optional features, negotiated per connection. A peer that does not
+ * know them never writes these fields; *_token ties them to the
+ * current connect token, so values from an earlier connection never
+ * count.
+ *
+ * OMI_FEAT_DOORBELL, receiver: after a run's head writes, the sender
+ * also writes db_data at db_off in the receiver's BAR. The receiver
+ * maps that address onto an interrupt (on RK3588: an inbound iATU
+ * window onto the GIC ITS translater), so it need not poll its rings.
+ * Sender: it rings when offered.
+ *
+ * OMI_FEAT_MQ: the sender's ring area in the receiver's BAR is split
+ * into nq rings of ring_slots / nq slots each, ring q at
+ * ring_off(sender) + q * (ring_slots / nq) * slot_size. Queue q has its
+ * own head (prod.head or prod.head_q[q - 1]) and credit (cons.tail or
+ * cons.tail_q[q - 1]), and its doorbell value is db_data + q. One queue
+ * is written by one eDMA channel and read by one NAPI context, so flows
+ * that stay on a queue stay in order. Used only when both sides
+ * announce the same nq; otherwise the pair uses one ring (queue 0) with
+ * all ring_slots.
+ */
+#define OMI_FEAT_DOORBELL	0x1u
+#define OMI_FEAT_MQ		0x2u
 
 struct omi_bar_head {
 	struct omi_hdr hdr;
@@ -139,10 +176,12 @@ struct omi_bar_head {
  */
 struct omi_slot_hdr {
 	__u32 len;
-	__u32 flags;
+	__u32 flags;		/* OMI_SLOT_* */
 	__u32 mask;		/* gateway: node indices that already have it */
-	__u32 pad;
+	__u32 hash;		/* OMI_SLOT_HASH: the sender's flow hash */
 };
+
+#define OMI_SLOT_HASH		0x1u	/* hash is valid (L4 flow hash) */
 
 /* ---- gateway (EP <-> RC), at hdr.gw_off ----
  * ep_prod/rc_cons: frames from the EP to the RC.
@@ -173,6 +212,9 @@ struct omi_gw {
 #define OMI_N_RINGS		4u
 /* Local eDMA scratch. Peers and the RC never write here. */
 #define OMI_SCRATCH_OFF		0xf00000u
+/* 64 KiB of BAR0 that this implementation maps onto its doorbell. */
+#define OMI_DB_WIN_OFF		0xff0000u
+#define OMI_DB_WIN_SIZE		0x10000u
 
 #define OMI_GW_DATA		(OMI_GW_SLOT - sizeof(struct omi_slot_hdr))
 #define OMI_SLOT_DATA		(OMI_SLOT - sizeof(struct omi_slot_hdr))
