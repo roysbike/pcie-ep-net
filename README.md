@@ -11,7 +11,8 @@ It is an independent implementation, not Mixtile's MIOP driver, and
 contains no Mixtile code or firmware. License: GPL-2.0-or-later
 ([LICENSE](LICENSE)).
 
-Current release: **v0.1.0-rc.2** (protocol v4). See
+Current release: **v0.2.0-rc.1** (protocol v4 framing; RX/TX interrupts and
+multiqueue negotiated per connection). See
 [CHANGELOG.md](CHANGELOG.md) and [Compatible releases](#compatible-releases).
 
 ## Architecture
@@ -43,10 +44,15 @@ Current release: **v0.1.0-rc.2** (protocol v4). See
   (10.20.0.1). It is a userspace program using sysfs; **no BMC kernel
   module is needed** (only `kmod-tun`).
 * **Data path:** blade-to-blade frames are posted `MemWr` TLPs from the
-  sender's eDMA engine into a per-sender ring in the receiver's BAR. The
-  switch routes them by address (the ASM2824 has no ACS). The receiver
-  polls its rings (NAPI + GRO) and returns credits with posted writes.
-  Endpoints never read each other.
+  sender's eDMA engines into per-sender, per-queue rings in the
+  receiver's BAR. The switch routes them by address (the ASM2824 has no
+  ACS). After its frames the sender writes a doorbell word that the
+  receiver maps onto a GIC ITS interrupt (Linux 6.10+), which runs the
+  queue's NAPI context (GRO) on its own CPU; credits return as posted
+  writes. Endpoints never read each other.
+* **Queues (RSS):** 4 queue pairs by default. The flow hash picks the
+  queue, the two eDMA write channels serve two queues each in parallel,
+  and each queue has its own RX interrupt and NAPI context.
 
 Details: [docs/architecture.md](docs/architecture.md).
 
@@ -62,7 +68,11 @@ Details: [docs/architecture.md](docs/architecture.md).
   serial number.
 * BAR layout (16 MiB): header, RC control line, peer table, per-sender
   producer and credit lines, BMC gateway rings, P2P rings (4 senders ×
-  256 slots × 10 KiB) at `0x200000`, eDMA scratch at `0xf00000`.
+  256 slots × 10 KiB, split into one ring per queue when both ends
+  agree) at `0x200000`, eDMA scratch at `0xf00000`, doorbell window at
+  `0xff0000`.
+* Optional features per connection (`OMI_FEAT_DOORBELL`, `OMI_FEAT_MQ`),
+  tied to the connect token: v0.1 peers simply do not offer them.
 * Write-only endpoint-to-endpoint control: connect tokens, acks and
   credits are posted writes; per-node epochs reject stale state.
 * L2: unicast by peer table and learned MACs, broadcast/multicast to all
@@ -89,7 +99,7 @@ Gen3 x2.
 ### Cluster Box (BMC)
 
 Recommended: install the ClusterBox firmware
-[mixtile-clusterbox-mt7620a-openwrt v0.1.0-rc.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0-rc.1),
+[mixtile-clusterbox-mt7620a-openwrt v0.1.0-rc.3](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0-rc.3),
 which contains the helper as the `openmiop` package and starts it at boot.
 
 On other Cluster Box firmware, use the release asset
@@ -98,8 +108,8 @@ On other Cluster Box firmware, use the release asset
 
 ```sh
 sha256sum -c SHA256SUMS
-tar xzf openmiop-0.1.0-rc.2-clusterbox-bmc-mipsel.tar.gz
-cd openmiop-0.1.0-rc.2-clusterbox-bmc-mipsel
+tar xzf openmiop-0.2.0-rc.1-clusterbox-bmc-mipsel.tar.gz
+cd openmiop-0.2.0-rc.1-clusterbox-bmc-mipsel
 ssh <bmc> 'cat > /tmp/openmiop-rc' < openmiop-rc
 ssh <bmc> 'cat > /tmp/openmiop.init' < openmiop.init
 # as root on the BMC (prefix each command with sudo when logged in as a user):
@@ -115,7 +125,7 @@ The BMC gets `omi0` = 10.20.0.1/24, MTU 9000. Log: `/tmp/openmiop-rc.log`.
 
 ### Blade 3 with Talos
 
-Use the [mixtile-talos v0.1.0-rc.2](https://github.com/roysbike/mixtile-talos/releases/tag/v0.1.0-rc.2)
+Use the [mixtile-talos v0.2.0-rc.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.2.0-rc.1)
 installer image. The module is built into it as a system extension;
 nothing has to be compiled. The release notes there have the machine
 configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
@@ -123,7 +133,7 @@ configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
 ### Blade 3 with Debian or Ubuntu
 
 Install the DKMS package from the
-[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.2).
+[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.2.0-rc.1).
 DKMS builds the module for the running kernel (6.1 or newer; the
 kernel's headers must be installed). CI installs it on Debian 12,
 Debian 13, Ubuntu 22.04 (HWE kernel) and Ubuntu 24.04 (arm64) and checks
@@ -133,7 +143,7 @@ that the module builds for each distribution kernel. On the Mixtile Debian
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-sudo apt install ./openmiop-dkms_0.1.0-rc.2_all.deb
+sudo apt install ./openmiop-dkms_0.2.0-rc.1_all.deb
 echo 10.20.0.<last octet of the management address>/24 | sudo tee /etc/openmiop.addr
 sudo reboot            # or: sudo systemctl start openmiop
 ```
@@ -156,7 +166,9 @@ On a blade:
 ```sh
 ip -d link show omi0          # UP, LOWER_UP, mtu 9000
 dmesg | grep openmiop         # "link up", "node N", "peer M up"
-ethtool -S omi0               # per-peer counters, tx_stalled, rx_dropped
+ethtool -S omi0               # counters; rx_q<n>_packets per queue
+ethtool -l omi0               # queue pairs (Combined)
+grep -E 'omi-rx|openmiop-edma' /proc/interrupts   # RX doorbells per queue, TX done
 ping -c3 10.20.0.1            # BMC over the gateway
 ping -c3 -M do -s 8972 10.20.0.<peer>   # jumbo frame to another blade
 ```
@@ -184,6 +196,7 @@ IPv6 multicast; `scripts/bench.sh` runs iperf3 and SHA-256 transfers.
 
 All members must speak the same protocol version (v4 here). The header
 carries the version; a v3 endpoint is not activated by a v4 helper.
+v0.1 and v0.2 blades mix: interrupts and queues are negotiated per pair.
 
 ## Troubleshooting
 
@@ -198,7 +211,23 @@ carries the version; a v3 endpoint is not activated by a v4 helper.
 
 More: [docs/operations.md](docs/operations.md).
 
-## Tested configuration and results (2026-10-06)
+## Tested configuration and results
+
+### v0.2.0-rc.1 (2026-10-08)
+
+Four Blade 3 on Talos v1.14.2 (6.18.54) with this driver, BMC on
+ClusterBox firmware v0.1.0-rc.3, MTU 9000, Gen3 x2, a loaded Cozystack
+cluster on top.
+
+| Test | Result |
+| --- | --- |
+| Every ordered pair, 4 TCP streams | 7.9-8.4 Gbit/s (4.3-4.7 when the flows hashed onto one or two queues) |
+| Four senders at once (ring), 4 streams each | 22.2 Gbit/s total (rc.2: 11.7) |
+| One TCP stream | 4.1-4.8 Gbit/s |
+| CPU under load | `omi-ctl` ~1 %, TX thread ~13-18 % per channel (rc.2: ~6 % and ~92 %) |
+| Errors / drops | none |
+
+### v0.1.0-rc.2 (2026-10-06)
 
 Cluster Box, four Blade 3: two Debian 12 (vendor 6.1.99), two Talos
 v1.14.2, the BMC: five members on one `omi0` segment. MTU 9000, all
@@ -219,12 +248,12 @@ in `docs/bench/`.
 
 ## Known limitations
 
-* RX is polled by a kernel thread; interrupt-driven RX is not
-  implemented or tested.
-* No multiqueue; one TX queue and one NAPI context.
-* TX polls the eDMA done bit (one core busy while sending).
-* Talos receives ~20 % slower than Debian (6.4 vs 8.0 Gbit/s); not
-  investigated.
+* One flow uses one queue and one eDMA channel: ~4.7 Gbit/s per flow.
+* Interrupt-driven RX needs Linux 6.10+ and the GIC ITS; older kernels
+  (Mixtile Debian 6.1) poll RX. v0.2 is not hardware-tested on Debian.
+* No checksum/GSO offload; fixed 10 KiB slots.
+* A BMC reboot takes the whole fabric down for minutes; services that
+  replicate over `omi0` (DRBD) may need attention afterwards.
 * BMC root-port re-enumeration pauses all fabric traffic ~1-2 s when a
   blade appears without a BAR address (in rc.2 peers then reconnect by
   themselves; in rc.1 a moved peer could stay "connecting"). A blade that disappears without
@@ -236,12 +265,12 @@ in `docs/bench/`.
 
 ## Compatible releases
 
-| OpenMIOP Stack v0.1.0-rc.2 | |
+| OpenMIOP Stack v0.2.0-rc.1 | |
 | --- | --- |
-| Protocol | OpenMIOP v4 (wire format unchanged since rc.1) |
-| Blade driver | [pcie-ep-net v0.1.0-rc.2](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.2) |
-| Blade OS | [mixtile-talos v0.1.0-rc.2](https://github.com/roysbike/mixtile-talos/releases/tag/v0.1.0-rc.2) |
-| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.1.0-rc.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0-rc.1) (the BMC helper did not change in rc.2) |
+| Protocol | OpenMIOP v4 framing, features `OMI_FEAT_DOORBELL`, `OMI_FEAT_MQ` negotiated per connection |
+| Blade driver | [pcie-ep-net v0.2.0-rc.1](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.2.0-rc.1) |
+| Blade OS | [mixtile-talos v0.2.0-rc.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.2.0-rc.1) |
+| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.1.0-rc.3](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0-rc.3) (BMC side unchanged by v0.2) |
 
 ## Build
 

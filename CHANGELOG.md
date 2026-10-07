@@ -3,6 +3,93 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0-rc.1] - 2026-10-08
+
+Interrupts, multiqueue (RSS) and two eDMA channels. Wire format still
+protocol v4: the new features are negotiated per connection, so v0.1
+blades and the BMC helper keep working with v0.2 blades. Part of
+OpenMIOP Stack v0.2.0-rc.1.
+
+### Added
+
+- **TX completion interrupt.** eDMA runs end with the done interrupt of
+  their channel (line `dma<c>`) instead of a busy-wait: the TX thread
+  slept ~92 % of a core away before, ~13-18 % per channel now
+  (`tx_irq=0` restores polling).
+- **RX doorbell (interrupt-driven RX).** After its frames and head
+  writes, the sender's eDMA writes one word into a 64 KiB window of the
+  receiver's BAR that an inbound iATU region maps onto the GIC ITS
+  translater, so the write raises an MSI on the receiver and NAPI runs
+  there. The receiver creates one ITS vector per possible sender bus
+  (DeviceID = requester ID through the controller's `msi-map`) and per
+  queue. The ctl thread then polls only every 1-2 ms (gateway ring,
+  lost doorbells): `omi-ctl` ~6 % -> ~1 % of a core. Needs Linux 6.10+
+  and the GIC ITS; otherwise, or with `rx_doorbell=0`, RX is polled as
+  before.
+- **Multiqueue / RSS.** `queues=` (default 4; a power of two, at most
+  one per CPU) queue pairs. The stack picks the TX queue from the flow
+  hash, so a flow stays on one queue; each eDMA write channel (2 on
+  RK3588) has its own thread and serves half of the queues, so both run
+  in parallel. The receiver splits each sender's ring area into one
+  ring per queue, has one NAPI context and one doorbell vector per
+  queue, and pins (as a hint) queue q's vector to the q-th fastest CPU
+  (the A76 cores). The flow hash travels in the slot header and becomes
+  the skb hash (RPS/RFS). `ethtool -l` shows the queues, `ethtool -S`
+  `rx_q<n>_packets`.
+- `ethtool -S`: `tx_dma_irq_lost`, `tx_doorbells`,
+  `ctl_doorbell_windows`.
+
+### Changed
+
+- Protocol (still v4 framing, `OMI_FEAT_*`): the sender announces
+  `features` and `nq` with its connect token; the receiver offers its
+  doorbell (`db_off`, `db_data`) and the same `nq` with its ack, plus a
+  head and a credit word per queue. All in the existing 64-byte
+  producer and credit lines. Pairs that do not agree use one ring with
+  all slots; frames that can reach such a peer (and floods, multicast,
+  the gateway) always take queue 0.
+- Inbound iATU: the BAR match moved from region 0 to region 1; region 0
+  is the doorbell window (the lower region wins where they overlap).
+- Locking: one lock per TX queue, `tx_lock` for peer state only, a
+  separate lock for the gateway TX ring; statistics per queue/channel.
+
+### Tested
+
+On the lab Cluster Box: four Blade 3 on Talos v1.14.2 (6.18.54) with
+this driver (mixtile-talos development builds), BMC on ClusterBox
+firmware v0.1.0-rc.3, MTU 9000, all links Gen3 x2, a loaded Cozystack
+cluster (Cilium, DRBD) on top:
+
+- Every ordered pair, 4 TCP streams: 7.9-8.4 Gbit/s (two pairs ~4.3-4.7
+  when the four flows hashed onto one or two queues). With one queue
+  (development build with the interrupts, same cluster, Gen3 x2):
+  4.3-4.4 Gbit/s; rc.2 one stream on Gen3 x2: ~5 Gbit/s.
+- Ring of four senders at once, 4 streams each: 22.2 Gbit/s total
+  (rc.2: 11.7).
+- One TCP stream: 4.1-4.8 Gbit/s, about as before (one flow = one queue
+  = one eDMA channel).
+- No driver errors or drops (`tx_dma_errors`, `rx_resyncs`,
+  `rx_bad_len`, `tx_dma_irq_lost`: 0).
+- Rolling upgrades with mixed peers (rc.2 polled <-> dev doorbell, one
+  queue <-> four queues) during the rollout; BMC reboot (firmware
+  update) and hard resets of all four blades afterwards: all twelve
+  directions came back with 4 queues and doorbells.
+- Debian/Ubuntu: module builds and the DKMS package installs in CI
+  (6.1, 6.12, Ubuntu kernels); not run on hardware with v0.2 (on 6.1
+  kernels the doorbell is compiled out, RX is polled).
+
+### Known limitations
+
+- A single flow is limited to one queue and one eDMA channel (~4.7
+  Gbit/s here); TX waits for the done interrupt and a thread wakeup
+  between runs.
+- No checksum or GSO offload yet; fixed 10 KiB slots (64 per queue with
+  4 queues).
+- A BMC reboot takes the whole fabric down for minutes (the BMC is the
+  PCIe root and resets the switch). On the lab cluster DRBD 9.3.4
+  deadlocked afterwards (`__drbd_md_sync` waiting on md_buffer) until
+  every node was rebooted; this is outside the driver.
+
 ## [0.1.0-rc.2] - 2026-10-06
 
 Driver fix and packaging release. Protocol v4 is unchanged; the BMC
@@ -167,5 +254,6 @@ all four endpoints; the Debian module built from this source repeated
   this box, MPS other than 128/256, helper restart under load with four
   endpoints.
 
+[0.2.0-rc.1]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.2.0-rc.1
 [0.1.0-rc.2]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.1

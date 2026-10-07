@@ -1,3 +1,0 @@
-# Experiment only, see omi-dbtest.c. Not part of the driver.
-obj-m += omi-dbtest.o
-ccflags-y += -I$(src)/../../drivers/openmiop
