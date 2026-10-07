@@ -229,12 +229,18 @@ struct omi_batch {
 
 /* Without an RX interrupt the ctl thread polls. It polls every
  * 20-50 us while traffic is recent, then every 200-400 us, so an idle
- * link costs little CPU. Busy loops * ~40 us is about 80 ms. When every
- * connected sender rings our doorbell it only polls at the idle rate,
- * for the gateway ring and for a doorbell that arrives before its data.
+ * link costs little CPU. Busy loops * ~40 us is about 80 ms. While
+ * doorbells carry the P2P traffic (every sender that sent in the last
+ * OMI_NODB_QUIET rings) it polls every 1-2 ms, for the gateway ring.
  */
 #define OMI_POLL_BUSY_LOOPS	2000
 #define OMI_POLL_IDLE_US	200
+/* Backup poll while doorbells carry the traffic: the gateway ring and
+ * a doorbell lost while the window moved.
+ */
+#define OMI_POLL_DB_US		1000
+/* Senders without a doorbell count as quiet after this long. */
+#define OMI_NODB_QUIET		(HZ / 10)
 #define OMI_CONNECT_RETRY	(HZ / 2)
 /* Still no ack after this long: connect again with a new token. The
  * receiver acks a token once; if that ack was lost (it went out through
@@ -379,6 +385,7 @@ struct omi_ep {
 	u32 db_word;			/* its offset in that page */
 	u32 db_data;			/* event id the senders write */
 	unsigned long rx_nodb;		/* connected senders that do not ring */
+	unsigned long nodb_rx;		/* jiffies: last frame from one of them */
 	struct device_node *db_np;
 	struct of_changeset db_ocs;
 	struct omi_dbv {
@@ -1682,6 +1689,8 @@ static int rx_ring(struct omi_ep *ep, unsigned int r, int budget)
 		avail--;
 		done++;
 	}
+	if (done && !pr->rx_db)
+		WRITE_ONCE(ep->nodb_rx, jiffies);
 	rx_credit(ep, r);
 	return done;
 }
@@ -1723,6 +1732,8 @@ static int gw_rx(struct omi_ep *ep, int budget)
 	return done;
 }
 
+static bool rx_pending(struct omi_ep *ep);
+
 static int omi_napi(struct napi_struct *napi, int budget)
 {
 	struct omi_ep *ep = container_of(napi, struct omi_ep, napi);
@@ -1741,8 +1752,13 @@ static int omi_napi(struct napi_struct *napi, int budget)
 	}
 	if (work < budget)
 		work += gw_rx(ep, budget - work);
-	if (work < budget)
-		napi_complete_done(napi, work);
+	/* A doorbell can be seen before the head it follows: the two
+	 * writes take different paths (ITS, DRAM). Look once more after
+	 * completing, so such frames do not wait for the backup poll.
+	 */
+	if (work < budget && napi_complete_done(napi, work) &&
+	    READ_ONCE(ep->db_bar_pci) && rx_pending(ep))
+		napi_schedule(napi);
 	return work;
 }
 
@@ -2137,13 +2153,16 @@ static int ctl_thread(void *data)
 		}
 
 		running = netif_running(ndev);
-		/* Every connected sender rings: polling is only the backup. */
-		doorbells = ep->db_bar_pci && !READ_ONCE(ep->rx_nodb);
+		/* Doorbells carry the traffic when every sender that sent
+		 * recently rings: polling is only the backup then.
+		 */
+		doorbells = ep->db_bar_pci &&
+			    (!READ_ONCE(ep->rx_nodb) ||
+			     time_after(jiffies, READ_ONCE(ep->nodb_rx) + OMI_NODB_QUIET));
 		if (running && doorbells &&
 		    test_bit(NAPI_STATE_SCHED, &ep->napi.state)) {
 			idle = OMI_POLL_BUSY_LOOPS;
-			usleep_range_state(OMI_POLL_IDLE_US, 2 * OMI_POLL_IDLE_US,
-					   TASK_IDLE);
+			usleep_range_state(OMI_POLL_DB_US, 2 * OMI_POLL_DB_US, TASK_IDLE);
 		} else if (running && test_bit(NAPI_STATE_SCHED, &ep->napi.state)) {
 			/* NAPI is still draining (or disabled): it reschedules
 			 * itself while it has work, so there is nothing to kick.
@@ -2161,7 +2180,10 @@ static int ctl_thread(void *data)
 			napi_schedule(&ep->napi);
 			local_bh_enable();
 			cond_resched();
-		} else if (idle < OMI_POLL_BUSY_LOOPS && !doorbells) {
+		} else if (doorbells) {
+			idle = OMI_POLL_BUSY_LOOPS;
+			usleep_range_state(OMI_POLL_DB_US, 2 * OMI_POLL_DB_US, TASK_IDLE);
+		} else if (idle < OMI_POLL_BUSY_LOOPS) {
 			/* TASK_IDLE: a sleeping poller is not load. */
 			idle++;
 			usleep_range_state(20, 50, TASK_IDLE);
