@@ -17,6 +17,12 @@
  *   edma PEER [OFF [CH]]   run the eDMA test
  *   db REGION [WIN_OFF]    (re)program the doorbell window
  *   dboff                  disable the doorbell window
+ *   db0 [SPARE [WIN_OFF]]  doorbell in region 0: copy region 0 (the BAR
+ *                          match) to SPARE (default 2), disable 0, then
+ *                          program 0 as the window. If the lowest region
+ *                          wins on overlap, this is the order that works.
+ *   db0off                 undo db0
+ *   peek OFF               read 16 bytes of BAR0 memory at OFF
  *   dump                   iATU regions, counters, vector
  *
  * Writes only registers of write channel `ch` (never 0), inbound region
@@ -87,6 +93,7 @@ static struct platform_device *mdev;	/* holds the MSI vector */
 static struct device *epdev;
 static int db_irq = -1, dma_irq[4] = { -1, -1, -1, -1 };
 static int db_region;			/* programmed region, 0: none */
+static int db0_spare;			/* db0: region holding the BAR match */
 static atomic_t db_count, dma_count[4];
 static struct msi_msg db_msg;
 static phys_addr_t bar_phys;
@@ -251,6 +258,91 @@ static int db_on(int r, u32 off)
 	return 0;
 }
 
+static void copy_region(int from, int to)
+{
+	static const u32 regs[] = { ATU_CTRL1, ATU_LBASE, ATU_UBASE, ATU_LIMIT,
+				    ATU_ULIMIT, ATU_LTARGET, ATU_UTARGET };
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(regs); i++)
+		writel(readl(ib(from) + regs[i]), ib(to) + regs[i]);
+	writel(readl(ib(from) + ATU_CTRL2), ib(to) + ATU_CTRL2);
+	udelay(10);
+}
+
+/* Each step leaves every BAR0 address with a valid translation. */
+static int db0_on(int spare, u32 off)
+{
+	void __iomem *b = ib(0);
+	u64 base, end, pci = bar_pci();
+
+	if (db_irq < 0)
+		return -ENODEV;
+	if (spare < 1 || spare > 15 || off & 0xffff || off >= OPENMIOP_BAR_SIZE)
+		return -EINVAL;
+	if (db0_spare)
+		return -EBUSY;
+	if (!pci)
+		return -EAGAIN;
+	if (!(readl(b + ATU_CTRL2) & ATU_ENABLE) || !(readl(b + ATU_CTRL2) & BIT(30))) {
+		pr_err("omi-dbtest: region 0 is not an enabled BAR match\n");
+		return -EINVAL;
+	}
+	if (readl(ib(spare) + ATU_CTRL2) & ATU_ENABLE)
+		return -EBUSY;
+	db_off();
+	copy_region(0, spare);
+	dump_region(spare);
+	writel(0, b + ATU_CTRL2);
+	udelay(10);
+	base = pci + off;
+	end = base + 0xffff;
+	writel(lower_32_bits(base), b + ATU_LBASE);
+	writel(upper_32_bits(base), b + ATU_UBASE);
+	writel(lower_32_bits(end), b + ATU_LIMIT);
+	writel(upper_32_bits(end), b + ATU_ULIMIT);
+	writel(lower_32_bits(MBI_ALIAS), b + ATU_LTARGET);
+	writel(upper_32_bits(MBI_ALIAS), b + ATU_UTARGET);
+	writel(upper_32_bits(end) != upper_32_bits(base) ? ATU_INCREASE : 0,
+	       b + ATU_CTRL1);
+	writel(ATU_ENABLE, b + ATU_CTRL2);
+	udelay(10);
+	db0_spare = spare;
+	dump_region(0);
+	pr_info("omi-dbtest: db0: write %#x at BAR0 offset %#x\n", db_msg.data,
+		off + (db_msg.address_lo & 0xffff));
+	return 0;
+}
+
+static void db0_off(void)
+{
+	if (!db0_spare)
+		return;
+	writel(0, ib(0) + ATU_CTRL2);
+	udelay(10);
+	copy_region(db0_spare, 0);
+	writel(0, ib(db0_spare) + ATU_CTRL2);
+	udelay(10);
+	pr_info("omi-dbtest: db0 undone, region 0 restored from %d\n", db0_spare);
+	db0_spare = 0;
+	dump_region(0);
+}
+
+static int peek(u32 off)
+{
+	u32 *p;
+
+	if (off & 3 || off > OPENMIOP_BAR_SIZE - 16)
+		return -EINVAL;
+	p = memremap(bar_phys + off, 16, MEMREMAP_WB);
+	if (!p)
+		return -ENOMEM;
+	dma_sync_single_for_cpu(epdev, bar_phys + off, 16, DMA_FROM_DEVICE);
+	pr_info("omi-dbtest: BAR0[%#x]: %08x %08x %08x %08x\n", off, p[0], p[1], p[2], p[3]);
+	memunmap(p);
+	return 0;
+}
+
 static int edma_test(int p, u32 off, int c)
 {
 	void __iomem *cr = edma + EDMA_CH(c);
@@ -322,6 +414,12 @@ static int cmd_set(const char *val, const struct kernel_param *kp)
 		ret = db_on(n > 1 ? a : region, n > 2 ? b : win_off);
 	else if (!strcmp(op, "dboff"))
 		db_off();
+	else if (!strcmp(op, "db0"))
+		ret = db0_on(n > 1 ? a : 2, n > 2 ? b : win_off);
+	else if (!strcmp(op, "db0off"))
+		db0_off();
+	else if (!strcmp(op, "peek"))
+		ret = peek(a);
 	else if (!strcmp(op, "dump"))
 		dump();
 	else
@@ -336,12 +434,13 @@ static const struct kernel_param_ops cmd_ops = {
 	.set = cmd_set,
 };
 module_param_cb(cmd, &cmd_ops, NULL, 0200);
-MODULE_PARM_DESC(cmd, "edma PEER [OFF [CH]] | db REGION [WIN_OFF] | dboff | dump");
+MODULE_PARM_DESC(cmd, "edma PEER [OFF [CH]] | db REGION [WIN_OFF] | dboff | db0 [SPARE [WIN_OFF]] | db0off | peek OFF | dump");
 
 static void cleanup(void)
 {
 	int i;
 
+	db0_off();
 	db_off();
 	if (db_irq >= 0)
 		free_irq(db_irq, NULL);
