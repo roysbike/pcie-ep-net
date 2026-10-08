@@ -45,6 +45,15 @@
 
 #define OPENMIOP_BAR_SIZE	(16u * 1024u * 1024u)
 
+/*
+ * Subsystem vendor/device of an endpoint that takes a push-mode offer
+ * (OMI_RC_PUSH): set in its config space before its link comes up, so
+ * the header is initialised and BAR writes land in it by the time the
+ * RC can read it. The RC reads nothing else from such an endpoint.
+ */
+#define OMI_SSVID_PUSH		0x4f4du
+#define OMI_SSID_PUSH		0x0001u
+
 #define OMI_MAX_NODES		8u
 /* Queues per sender/receiver pair (OMI_FEAT_MQ). */
 #define OMI_MAX_QUEUES		4u
@@ -55,6 +64,11 @@
 
 /* omi_ctl.flags */
 #define OMI_RC_UP		0x1u
+/* The RC never reads this BAR. Its gateway v2 offer (gw2_*) also says
+ * where the EP pushes its state (struct omi_gw2_ep); the RC activates
+ * the EP (OMI_RC_UP, ep_epoch) from that.
+ */
+#define OMI_RC_PUSH		0x2u
 
 /* Gateway slot flags (RC <-> EP). */
 #define OMI_GW_RELAYED		0x1u	/* RC copied this from another EP */
@@ -74,8 +88,14 @@ struct omi_hdr {
 	__u32 gw_slots;		/* per direction, power of two */
 	__u32 gw_slot_size;	/* bytes per gateway slot incl. header */
 	__u32 table_seen;	/* last omi_ctl.table_gen applied */
-	__u8 pad[12];
+	__u32 features;		/* OMI_HDR_*: what the RC may use */
+	__u32 db_off;		/* OMI_HDR_DOORBELL: doorbell word in this BAR */
+	__u32 db_data;		/* value the RC writes there */
 };
+
+/* omi_hdr.features. A v0.1 endpoint leaves them zero. */
+#define OMI_HDR_DOORBELL	0x1u	/* the RC may ring db_off with db_data */
+#define OMI_HDR_GW2		0x2u	/* takes an omi_ctl gateway v2 offer */
 
 /* ---- 0x0040: control, written by the RC ---- */
 struct omi_ctl {
@@ -89,8 +109,60 @@ struct omi_ctl {
 				 * line and the table are only valid for
 				 * that epoch
 				 */
-	__u8 pad[40];
+	/* Gateway v2 (OMI_HDR_GW2): the EP sends its gateway frames with
+	 * its eDMA into a ring in the RC's memory instead of its own BAR.
+	 * Valid while gw2_token != 0; a new token is a new ring.
+	 */
+	__u32 gw2_token;
+	__u32 gw2_ring_lo;	/* PCI address of the ring (omi_gw2 layout) */
+	__u32 gw2_ring_hi;
+	__u32 gw2_slots;	/* power of two */
+	__u32 gw2_slot_size;	/* bytes per slot incl. omi_slot_hdr */
+	__u8 pad[20];
 };
+
+/*
+ * Gateway v2 area in RC memory, per endpoint (64 KiB aligned):
+ *   0x00  omi_prod: head of the EP->RC ring, written by the EP's eDMA
+ *         after the frames, as for a P2P ring;
+ *   0x40  omi_gw2_ep: written by the EP's CPU through an outbound
+ *         window: its state (the fields of its header the RC needs)
+ *         and how far it consumed the RC->EP gateway ring of its own
+ *         BAR, so the RC never has to read the EP;
+ *   0x80  gw2_slots slots of the EP->RC ring (OMI_GW2_SLOT0).
+ * The slot header's mask lists the nodes that already have the frame,
+ * as in the v1 gateway. The RC returns EP->RC credit in the EP's
+ * tx_cons[OMI_RC_NODE] line (tail, and ack = gw2_token). The EP treats
+ * the RC as peer OMI_RC_NODE.
+ */
+#define OMI_RC_NODE		(OMI_MAX_NODES - 1)
+#define OMI_GW2_EP_OFF		0x40u
+#define OMI_GW2_SLOT0		0x80u
+#define OMI_GW2_ALIGN		0x10000u
+
+struct omi_gw2_ep {
+	__u32 rc_tail;		/* consumed of the RC->EP ring (omi_gw.rc_head) */
+	__u32 token;		/* = gw2_token the line belongs to; first push:
+				 * written after every other field
+				 */
+	/* Push mode (OMI_RC_PUSH): copies of the EP's header fields,
+	 * pushed when they change and every OMI_PUSH_REFRESH_MS.
+	 */
+	__u32 magic;
+	__u32 version;
+	__u32 epoch;
+	__u32 flags;		/* OMI_F_* */
+	__u32 table_seen;
+	__u32 features;		/* OMI_HDR_* */
+	__u32 db_off;
+	__u32 db_data;
+	__u8 mac[6];
+	__u8 pad0[2];
+	__u32 seq;		/* bumped on every push */
+	__u8 pad[12];
+};
+
+#define OMI_PUSH_REFRESH_MS	1000u
 
 /* ---- 0x0080: peer table, written by the RC ----
  * Entry i describes node i. epoch == 0: absent. The RC clears epoch
@@ -162,11 +234,32 @@ struct omi_cons {
 #define OMI_FEAT_DOORBELL	0x1u
 #define OMI_FEAT_MQ		0x2u
 
+/* ---- 0x0180: hello lines, one per remote node, written by that node ----
+ * Reconnect without the RC. After a fabric reset (Cluster Box reboot,
+ * re-enumeration) every endpoint gets a new epoch and the RC is not
+ * there yet to publish a table. An endpoint whose BAR came back at the
+ * address the last table gave it writes its new epoch into each peer it
+ * knew, at that peer's last known address. The receiver connects only
+ * if both views agree: to_mac is its own MAC, and mac and bar match
+ * what its own last table said about the sender. Epoch is written last.
+ * Ignored while the RC is up: then the table is authoritative.
+ */
+struct omi_hello {
+	__u32 epoch;		/* sender's hdr.epoch, 0: none */
+	__u8 mac[6];		/* sender */
+	__u8 to_mac[6];		/* receiver, as the sender knows it */
+	__u32 bar_lo;		/* sender's BAR0 */
+	__u32 bar_hi;
+	__u8 pad[8];
+};
+
 struct omi_bar_head {
 	struct omi_hdr hdr;
 	struct omi_ctl ctl;
 	struct omi_peer_entry peers[OMI_MAX_NODES];
-	__u8 pad[0x400 - 0x80 - OMI_MAX_NODES * sizeof(struct omi_peer_entry)];
+	struct omi_hello hello[OMI_MAX_NODES];
+	__u8 pad[0x400 - 0x80 - OMI_MAX_NODES * (sizeof(struct omi_peer_entry) +
+						  sizeof(struct omi_hello))];
 	struct omi_prod rx_prod[OMI_MAX_NODES];
 	struct omi_cons tx_cons[OMI_MAX_NODES];
 };
