@@ -3,7 +3,10 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.2.0-rc.2] - 2026-10-08
+
+Cluster Box helper only: the blade driver is the same as in rc.1, wire
+format still protocol v4. Part of OpenMIOP Stack v0.2.0-rc.2.
 
 ### Fixed
 
