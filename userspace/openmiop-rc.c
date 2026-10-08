@@ -9,9 +9,10 @@
  *   - restores BAR0, the command register and a uniform Max Payload
  *     Size after an endpoint reloads (probe resets its config space),
  *   - never sends a request to an endpoint whose link is down, has
- *     not been up for LINK_STABLE_MS, or is about to drop (leave): it
- *     watches Data Link Layer Link Active on the switch port instead,
- *     which the switch answers itself,
+ *     not been up for LINK_STABLE_MS, or is about to drop (leave, or
+ *     a release from nodectl before a reset or power cut): it watches
+ *     Data Link Layer Link Active on the switch port instead, which
+ *     the switch answers itself,
  *   - publishes a peer table into every endpoint so they can reach
  *     each other directly,
  *   - detaches an endpoint that announces it is leaving, and tells it
@@ -1251,6 +1252,39 @@ static void reenumerate(void)
 	msleep(500);
 }
 
+/*
+ * nodectl is about to pulse a blade's reset line or cut its power: the
+ * link will drop without a leave. It creates
+ * /var/run/openmiop-release.<switch port>, e.g. ...release.02:0c.0, and
+ * waits until we delete it. From then on no request goes to that
+ * endpoint until its link has dropped and come back stable.
+ */
+#define RELEASE_PREFIX	"/var/run/openmiop-release."
+
+static void releases_check(void)
+{
+	char path[64], buf[8];
+	int i;
+
+	for (i = 0; i < (int)OMI_MAX_NODES; i++) {
+		struct ep *e = &eps[i];
+
+		if (e->state == EP_NONE || !e->parent[0])
+			continue;
+		scpy(path, RELEASE_PREFIX);
+		scat(path, e->parent + 5);	/* "02:0c.0" */
+		if (read_file(path, buf, sizeof(buf)) < 0)
+			continue;
+		if (e->state != EP_QUIET)
+			ep_drop(e, "released for reset or power off", 0);
+		else
+			log_ep(e, "released for reset or power off");
+		e->need_down = now + LEAVE_DOWN_MS;
+		e->down_seen = e->link_downs - (e->link ? 0 : 1);
+		sc(4010 /* unlink */, (long)path, 0, 0, 0, 0, 0);
+	}
+}
+
 static int due(struct ep *e, u32 period)
 {
 	if ((s32)(now - e->next) < 0)
@@ -1414,6 +1448,7 @@ void _start(void)
 			reenumerate();
 			continue;
 		}
+		releases_check();
 		for (i = 0; i < (int)OMI_MAX_NODES; i++)
 			ep_step(i);
 		if (tables_dirty)
