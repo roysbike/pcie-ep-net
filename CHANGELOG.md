@@ -3,6 +3,36 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Cluster Box fabric outages when a blade's link drops.** A BAR read
+  by `openmiop-rc` in flight while a blade's link goes down stops the
+  MT7620A root complex (config reads return 0, then hang) until the
+  Cluster Box reboots, and that reboot resets the whole fabric. The
+  switch itself is not reset: the other blades keep their P2P links.
+  The helper now:
+  - takes the link state from Data Link Layer Link Active of the
+    blade's switch port (answered by the switch, never sent over the
+    blade link) and sends no request to a blade unless that bit has
+    been set for 1.5 s; it stops the moment the bit clears;
+  - after a leave, probes the blade again only once its link dropped
+    and came back (30 s fallback);
+  - honours a release from `nodectl` before a reset pulse or power cut
+    (`/var/run/openmiop-release.<switch port>`, deleted as the ack);
+  - uses the cached DEVCAP of each blade for the common MPS, rescans
+    the bus only when an empty switch port has its link up, polls an
+    idle gateway every 10 ms after a fresh link sample;
+  - timestamps its log, and dumps link and AER status of the root and
+    switch ports on link loss or an unannounced reset.
+
+  Tested on the Cluster Box: graceful reboots with the helper running
+  (4 of 4), hard resets with a release first (2 of 2: by hand and with
+  nodectl). A blade that loses power or crashes without a release can
+  still hit a read in flight; removing BAR reads from the BMC side
+  altogether is the follow-up.
+
 ## [0.2.0-rc.1] - 2026-10-08
 
 Interrupts, multiqueue (RSS) and two eDMA channels. Wire format still
