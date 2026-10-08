@@ -74,8 +74,14 @@ struct omi_hdr {
 	__u32 gw_slots;		/* per direction, power of two */
 	__u32 gw_slot_size;	/* bytes per gateway slot incl. header */
 	__u32 table_seen;	/* last omi_ctl.table_gen applied */
-	__u8 pad[12];
+	__u32 features;		/* OMI_HDR_*: what the RC may use */
+	__u32 db_off;		/* OMI_HDR_DOORBELL: doorbell word in this BAR */
+	__u32 db_data;		/* value the RC writes there */
 };
+
+/* omi_hdr.features. A v0.1 endpoint leaves them zero. */
+#define OMI_HDR_DOORBELL	0x1u	/* the RC may ring db_off with db_data */
+#define OMI_HDR_GW2		0x2u	/* takes an omi_ctl gateway v2 offer */
 
 /* ---- 0x0040: control, written by the RC ---- */
 struct omi_ctl {
@@ -89,7 +95,40 @@ struct omi_ctl {
 				 * line and the table are only valid for
 				 * that epoch
 				 */
-	__u8 pad[40];
+	/* Gateway v2 (OMI_HDR_GW2): the EP sends its gateway frames with
+	 * its eDMA into a ring in the RC's memory instead of its own BAR.
+	 * Valid while gw2_token != 0; a new token is a new ring.
+	 */
+	__u32 gw2_token;
+	__u32 gw2_ring_lo;	/* PCI address of the ring (omi_gw2 layout) */
+	__u32 gw2_ring_hi;
+	__u32 gw2_slots;	/* power of two */
+	__u32 gw2_slot_size;	/* bytes per slot incl. omi_slot_hdr */
+	__u8 pad[20];
+};
+
+/*
+ * Gateway v2 area in RC memory, per endpoint (64 KiB aligned):
+ *   0x00  omi_prod: head of the EP->RC ring, written by the EP's eDMA
+ *         after the frames, as for a P2P ring;
+ *   0x40  omi_gw2_ep: written by the EP's CPU through an outbound
+ *         window: how far it consumed the RC->EP gateway ring of its
+ *         own BAR, so the RC never has to read the EP;
+ *   0x80  gw2_slots slots of the EP->RC ring (OMI_GW2_SLOT0).
+ * The slot header's mask lists the nodes that already have the frame,
+ * as in the v1 gateway. The RC returns EP->RC credit in the EP's
+ * tx_cons[OMI_RC_NODE] line (tail, and ack = gw2_token). The EP treats
+ * the RC as peer OMI_RC_NODE.
+ */
+#define OMI_RC_NODE		(OMI_MAX_NODES - 1)
+#define OMI_GW2_EP_OFF		0x40u
+#define OMI_GW2_SLOT0		0x80u
+#define OMI_GW2_ALIGN		0x10000u
+
+struct omi_gw2_ep {
+	__u32 rc_tail;		/* consumed of the RC->EP ring (omi_gw.rc_head) */
+	__u32 token;		/* = gw2_token the value belongs to */
+	__u8 pad[56];
 };
 
 /* ---- 0x0080: peer table, written by the RC ----
