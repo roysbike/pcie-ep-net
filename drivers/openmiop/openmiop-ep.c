@@ -156,6 +156,10 @@ static uint queues = OMI_MAX_QUEUES;
 module_param(queues, uint, 0444);
 MODULE_PARM_DESC(queues, "TX/RX queue pairs (1-4); peers with the same count use one ring per queue");
 
+static bool autonomy = true;
+module_param(autonomy, bool, 0444);
+MODULE_PARM_DESC(autonomy, "After a fabric reset, reconnect to the peers of the last table without waiting for the Cluster Box helper");
+
 static uint lanes = 2;
 module_param(lanes, uint, 0444);
 MODULE_PARM_DESC(lanes, "Link width. 2 matches Blade 3 (the other two PHY lanes are the M.2 NVMe). 4 aggregates the PHY onto this controller and drops the NVMe");
@@ -265,6 +269,10 @@ struct omi_batch {
  * a window that was being re-pointed), only a new token gets a new one.
  */
 #define OMI_CONNECT_RENEW	(2 * HZ)
+/* Autonomy: our BAR must sit at its old address this long first. */
+#define OMI_AUTO_BAR_STABLE	HZ
+#define OMI_AUTO_PERIOD		(HZ / 20)
+#define OMI_HELLO_RESEND	(HZ / 2)
 #define OMI_STALL_TIMEOUT	(HZ / 10)
 #define OMI_DOWN_ACK_TIMEOUT_MS	2000
 
@@ -350,7 +358,7 @@ struct omi_rx_stats {			/* per RX queue: its NAPI */
 struct omi_ctl_stats {
 	u64_stats_t poll_cycles, napi_kicks, table_updates, peer_up,
 		    peer_down, stalls, queue_wakes, link_resets, connect_renew,
-		    db_windows;
+		    db_windows, hellos_tx, hellos_rx;
 	struct u64_stats_sync syncp;
 };
 
@@ -462,6 +470,21 @@ struct omi_ep {
 	struct omi_rxq rxq[OMI_MAX_QUEUES];
 	u32 gw_rx_tail;			/* queue 0 */
 	u64 fdb[OMI_FDB_SIZE];
+
+	/* The last table from the RC, kept to reconnect without it after
+	 * a fabric reset (ctl thread only).
+	 */
+	struct omi_known {
+		u64 pci;
+		u8 mac[ETH_ALEN];
+		bool valid;
+	} known[OMI_MAX_NODES];
+	u64 known_bar;			/* our BAR0 under that table, 0: none */
+	u16 known_devctl;		/* our Device Control under it */
+	u64 auto_bar;			/* BAR0 at the last check */
+	unsigned long auto_since;	/* jiffies: auto_bar seen since */
+	unsigned long auto_next;
+	unsigned long hello_next;
 
 	struct task_struct *ctl;
 	struct omi_ctl_stats cs;
@@ -575,6 +598,28 @@ static int program_inbound_bar0(struct omi_ep *ep)
 	return 0;
 }
 
+/* BAR0 address the host assigned (our own config space, via DBI). */
+static u64 dbi_bar(struct omi_ep *ep)
+{
+	return ((u64)readl(ep->dbi + PCI_BASE_ADDRESS_1) << 32 |
+		readl(ep->dbi + PCI_BASE_ADDRESS_0)) & ~0xfULL;
+}
+
+static u32 dbi_exp_cap(struct omi_ep *ep)
+{
+	u32 pos = readb(ep->dbi + PCI_CAPABILITY_LIST);
+	int ttl = 48;
+
+	while (pos >= 0x40 && ttl--) {
+		u16 h = readw(ep->dbi + pos);
+
+		if ((h & 0xff) == PCI_CAP_ID_EXP)
+			return pos;
+		pos = (h >> 8) & 0xfc;
+	}
+	return 0;
+}
+
 /* ctl thread. Map the doorbell window for the BAR address the RC
  * assigned, again whenever it moves. A doorbell written while the
  * window is off lands in unused BAR memory; the idle poll covers it.
@@ -586,8 +631,7 @@ static void db_window_update(struct omi_ep *ep)
 
 	if (!ep->db_ok)
 		return;
-	pci = ((u64)readl(ep->dbi + PCI_BASE_ADDRESS_1) << 32 |
-	       readl(ep->dbi + PCI_BASE_ADDRESS_0)) & ~0xfULL;
+	pci = dbi_bar(ep);
 	if (pci == ep->db_bar_pci)
 		return;
 	writel(0, base + PCIE_ATU_REGION_CTRL2);
@@ -2233,6 +2277,11 @@ static void table_apply(struct omi_ep *ep)
 			again = READ_ONCE(e->epoch);
 		} while (again != epoch);
 
+		ep->known[p].valid = epoch && pci && is_valid_ether_addr(mac);
+		if (ep->known[p].valid) {
+			ep->known[p].pci = pci;
+			memcpy(ep->known[p].mac, mac, ETH_ALEN);
+		}
 		if (p >= OMI_N_RINGS)
 			continue;
 		if (epoch == ep->peer[p].epoch && (!epoch || pci == ep->peer[p].pci))
@@ -2243,6 +2292,12 @@ static void table_apply(struct omi_ep *ep)
 			peer_set(ep, p, epoch, pci, mac);
 	}
 	ep->table_gen = gen;
+	ep->known_bar = dbi_bar(ep);
+	{
+		u32 cap = dbi_exp_cap(ep);
+
+		ep->known_devctl = cap ? readw(ep->dbi + cap + PCI_EXP_DEVCTL) : 0;
+	}
 	omi_inc(&ep->cs, table_updates);
 	WRITE_ONCE(ep->bar->hdr.table_seen, gen);
 	hdr_publish(ep);
@@ -2451,10 +2506,118 @@ static void link_reset(struct omi_ep *ep)
 	} while (!ep->epoch);
 	WRITE_ONCE(ep->bar->hdr.epoch, ep->epoch);
 	hdr_publish(ep);
+	/* Hellos from before the reset name epochs that are gone. */
+	memset(ep->bar->hello, 0, sizeof(ep->bar->hello));
+	bar_clean(ep, BAR_OFF(hello), sizeof(ep->bar->hello));
+	ep->auto_bar = 0;
 
 	rk_hiword(ep->apb, PCIE_CLIENT_HOT_RESET_CTRL,
 		  PCIE_LTSSM_APP_DLY2_DONE, PCIE_LTSSM_APP_DLY2_DONE);
 	dev_info(ep->dev, "link reset by host, new epoch %#x\n", ep->epoch);
+}
+
+/*
+ * ctl thread, while the RC is away (Cluster Box rebooting, helper not
+ * started yet). The host enumerated the switch again and gave our BAR
+ * its old address: enable ourselves as the helper would and reconnect
+ * to the peers of the last table through hello lines (see struct
+ * omi_hello). Posted writes only: a peer that is not there drops them.
+ */
+static void auto_step(struct omi_ep *ep)
+{
+	struct omi_hello *hl = ep->bar->hello;
+	const u8 *self_mac = ep->ndev->dev_addr;
+	u64 bar;
+	u32 cap;
+	u16 v;
+	unsigned int p;
+
+	if (!autonomy || ep->rc_up || !ep->known_bar || ep->self >= OMI_N_RINGS ||
+	    !ep->edma || !ep->ob || time_before(jiffies, ep->auto_next))
+		return;
+	ep->auto_next = jiffies + OMI_AUTO_PERIOD;
+	if (!link_is_up(ep))
+		return;
+	bar = dbi_bar(ep);
+	if (bar != ep->auto_bar) {
+		ep->auto_bar = bar;
+		ep->auto_since = jiffies;
+		return;
+	}
+	if (bar != ep->known_bar ||
+	    time_before(jiffies, ep->auto_since + OMI_AUTO_BAR_STABLE))
+		return;
+
+	v = readw(ep->dbi + PCI_COMMAND);
+	if ((v & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) !=
+	    (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) {
+		writew(v | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER,
+		       ep->dbi + PCI_COMMAND);
+		dev_info(ep->dev, "RC away, BAR back at %#llx: enabled ourselves\n", bar);
+	}
+	cap = dbi_exp_cap(ep);
+	if (cap && ep->known_devctl) {
+		v = readw(ep->dbi + cap + PCI_EXP_DEVCTL);
+		if ((v ^ ep->known_devctl) & PCI_EXP_DEVCTL_PAYLOAD)
+			writew((v & ~PCI_EXP_DEVCTL_PAYLOAD) |
+			       (ep->known_devctl & PCI_EXP_DEVCTL_PAYLOAD),
+			       ep->dbi + cap + PCI_EXP_DEVCTL);
+	}
+
+	/* Hellos to us: connect when both views of the pair agree. */
+	bar_inval(ep, BAR_OFF(hello), sizeof(ep->bar->hello));
+	for (p = 0; p < OMI_N_RINGS; p++) {
+		struct omi_known *k = &ep->known[p];
+		u32 epoch;
+		u64 hbar;
+
+		if (p == ep->self || !k->valid)
+			continue;
+		epoch = READ_ONCE(hl[p].epoch);
+		if (!epoch || epoch == ep->peer[p].epoch)
+			continue;
+		dma_rmb();
+		hbar = (u64)READ_ONCE(hl[p].bar_hi) << 32 | READ_ONCE(hl[p].bar_lo);
+		if (!ether_addr_equal(hl[p].to_mac, self_mac) ||
+		    !ether_addr_equal(hl[p].mac, k->mac) || hbar != k->pci) {
+			dev_info_ratelimited(ep->dev,
+				"hello from node %u does not match the last table\n", p);
+			continue;
+		}
+		if (ep->peer[p].epoch)
+			peer_down(ep, p);
+		dev_info(ep->dev, "node %u says hello, connecting without the RC\n", p);
+		peer_set(ep, p, epoch, k->pci, k->mac);
+		omi_inc(&ep->cs, hellos_rx);
+	}
+
+	/* Ours, to every known peer that is not up yet. */
+	if (time_before(jiffies, ep->hello_next))
+		return;
+	ep->hello_next = jiffies + OMI_HELLO_RESEND;
+	for (p = 0; p < OMI_N_RINGS; p++) {
+		struct omi_known *k = &ep->known[p];
+		struct omi_peer *pr = &ep->peer[p];
+		void __iomem *h;
+		u8 macs[2 * ETH_ALEN];
+
+		if (p == ep->self || !k->valid || pr->state == OMI_PEER_UP)
+			continue;
+		if (!pr->win_ok || pr->pci != k->pci) {
+			if (program_outbound(ep, p, k->pci))
+				continue;
+			pr->pci = k->pci;
+			smp_store_release(&pr->win_ok, true);
+		}
+		h = pr->win + BAR_OFF(hello[ep->self]);
+		memcpy(macs, self_mac, ETH_ALEN);
+		memcpy(macs + ETH_ALEN, k->mac, ETH_ALEN);
+		memcpy_toio(h + offsetof(struct omi_hello, mac), macs, sizeof(macs));
+		writel(lower_32_bits(bar), h + offsetof(struct omi_hello, bar_lo));
+		writel(upper_32_bits(bar), h + offsetof(struct omi_hello, bar_hi));
+		writel(ep->epoch, h + offsetof(struct omi_hello, epoch));
+		omi_inc(&ep->cs, hellos_tx);
+	}
 }
 
 static int ctl_thread(void *data)
@@ -2481,6 +2644,7 @@ static int ctl_thread(void *data)
 			db_window_update(ep);
 			rc_poll(ep);
 			table_apply(ep);
+			auto_step(ep);
 			peers_poll(ep);
 			if (ep->rc_up || ep->up_mask) {
 				if (!netif_carrier_ok(ndev))
@@ -2671,6 +2835,8 @@ static const struct {
 	OMI_STAT("ctl_link_resets", OMI_CS, struct omi_ctl_stats, link_resets),
 	OMI_STAT("ctl_connect_renew", OMI_CS, struct omi_ctl_stats, connect_renew),
 	OMI_STAT("ctl_doorbell_windows", OMI_CS, struct omi_ctl_stats, db_windows),
+	OMI_STAT("ctl_hellos_tx", OMI_CS, struct omi_ctl_stats, hellos_tx),
+	OMI_STAT("ctl_hellos_rx", OMI_CS, struct omi_ctl_stats, hellos_rx),
 };
 
 /* Per-queue RX packets, so ethtool -S shows the RSS spread. */
@@ -3249,6 +3415,8 @@ static int openmiop_probe(struct platform_device *pdev)
 	BUILD_BUG_ON(sizeof(struct omi_hdr) != 64);
 	BUILD_BUG_ON(sizeof(struct omi_ctl) != 64);
 	BUILD_BUG_ON(sizeof(struct omi_peer_entry) != 32);
+	BUILD_BUG_ON(sizeof(struct omi_hello) != 32);
+	BUILD_BUG_ON(BAR_OFF(hello) != 0x180);
 	BUILD_BUG_ON(BAR_OFF(rx_prod) != 0x400);
 	BUILD_BUG_ON(BAR_OFF(tx_cons) != 0x600);
 	BUILD_BUG_ON(sizeof(struct omi_bar_head) > OMI_GW_OFF);

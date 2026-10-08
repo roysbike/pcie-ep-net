@@ -162,11 +162,32 @@ struct omi_cons {
 #define OMI_FEAT_DOORBELL	0x1u
 #define OMI_FEAT_MQ		0x2u
 
+/* ---- 0x0180: hello lines, one per remote node, written by that node ----
+ * Reconnect without the RC. After a fabric reset (Cluster Box reboot,
+ * re-enumeration) every endpoint gets a new epoch and the RC is not
+ * there yet to publish a table. An endpoint whose BAR came back at the
+ * address the last table gave it writes its new epoch into each peer it
+ * knew, at that peer's last known address. The receiver connects only
+ * if both views agree: to_mac is its own MAC, and mac and bar match
+ * what its own last table said about the sender. Epoch is written last.
+ * Ignored while the RC is up: then the table is authoritative.
+ */
+struct omi_hello {
+	__u32 epoch;		/* sender's hdr.epoch, 0: none */
+	__u8 mac[6];		/* sender */
+	__u8 to_mac[6];		/* receiver, as the sender knows it */
+	__u32 bar_lo;		/* sender's BAR0 */
+	__u32 bar_hi;
+	__u8 pad[8];
+};
+
 struct omi_bar_head {
 	struct omi_hdr hdr;
 	struct omi_ctl ctl;
 	struct omi_peer_entry peers[OMI_MAX_NODES];
-	__u8 pad[0x400 - 0x80 - OMI_MAX_NODES * sizeof(struct omi_peer_entry)];
+	struct omi_hello hello[OMI_MAX_NODES];
+	__u8 pad[0x400 - 0x80 - OMI_MAX_NODES * (sizeof(struct omi_peer_entry) +
+						  sizeof(struct omi_hello))];
 	struct omi_prod rx_prod[OMI_MAX_NODES];
 	struct omi_cons tx_cons[OMI_MAX_NODES];
 };
