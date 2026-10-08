@@ -489,6 +489,14 @@ struct omi_ep {
 	unsigned long auto_next;
 	unsigned long hello_next;
 
+	/* Push mode (OMI_RC_PUSH): our state into the RC's memory, through
+	 * the window of OMI_RC_NODE (ctl thread; bar_leave() after it).
+	 */
+	u32 push_token;			/* offer we push for, 0: none */
+	u64 push_area;			/* its PCI address */
+	struct omi_gw2_ep push_last;
+	unsigned long push_next;	/* refresh */
+
 	struct task_struct *ctl;
 	struct omi_ctl_stats cs;
 };
@@ -815,6 +823,12 @@ static void program_config_space(struct omi_ep *ep)
 	dbi_ro_wr(ep, true);
 
 	writel((OPENMIOP_PCI_DEVICE << 16) | OPENMIOP_PCI_VENDOR, ep->dbi + PCI_VENDOR_ID);
+	/* We take push-mode offers. Our header is initialised and the BAR
+	 * translation follows before the link comes up (probe and
+	 * link_reset() both run this first), so a host that sees this may
+	 * write into the BAR.
+	 */
+	writel((OMI_SSID_PUSH << 16) | OMI_SSVID_PUSH, ep->dbi + PCI_SUBSYSTEM_VENDOR_ID);
 
 	classrev = readl(ep->dbi + PCI_CLASS_REVISION);
 	/* PCI_CLASS_NETWORK_ETHERNET is the 16-bit class (0x0200). */
@@ -2556,6 +2570,84 @@ static void rc_gw2_poll(struct omi_ep *ep, bool up)
 		 ring, slots, size);
 }
 
+/*
+ * Push our state into the RC's memory (struct omi_gw2_ep), on a change
+ * or every OMI_PUSH_REFRESH_MS, or now if all. Posted writes only; the
+ * token goes last so the first push is complete when the RC sees it.
+ */
+static void rc_push_write(struct omi_ep *ep, bool all)
+{
+	struct omi_peer *pr = &ep->peer[OMI_RC_NODE];
+	struct omi_hdr *h = &ep->bar->hdr;
+	struct omi_gw2_ep st;
+	void __iomem *g;
+	const u32 *w = (const u32 *)&st;
+	unsigned int i, first = offsetof(struct omi_gw2_ep, magic) / 4,
+		     last = offsetof(struct omi_gw2_ep, seq) / 4;
+
+	if (!ep->push_token || !pr->win_ok)
+		return;
+	memset(&st, 0, sizeof(st));
+	st.magic = OPENMIOP_MAGIC;
+	st.version = OPENMIOP_VERSION;
+	st.epoch = ep->epoch;
+	st.flags = READ_ONCE(h->flags);
+	st.table_seen = READ_ONCE(h->table_seen);
+	st.features = READ_ONCE(h->features);
+	st.db_off = READ_ONCE(h->db_off);
+	st.db_data = READ_ONCE(h->db_data);
+	memcpy(st.mac, h->mac, ETH_ALEN);
+	if (!all && !memcmp(&w[first], &((const u32 *)&ep->push_last)[first],
+			    (last - first) * 4) &&
+	    time_before(jiffies, ep->push_next))
+		return;
+	st.seq = ep->push_last.seq + 1;
+	/* Where we are in the RC->EP gateway ring: the RC starts there.
+	 * Not a reason to push by itself; gw_rx() updates it as it goes.
+	 */
+	st.rc_tail = READ_ONCE(ep->gw_rx_tail);
+	g = pr->win + OMI_GW2_EP_OFF;
+	writel(st.rc_tail, g + offsetof(struct omi_gw2_ep, rc_tail));
+	for (i = first; i <= last; i++)
+		writel(w[i], g + i * 4);
+	writel(ep->push_token, g + offsetof(struct omi_gw2_ep, token));
+	ep->push_last = st;
+	ep->push_next = jiffies + msecs_to_jiffies(OMI_PUSH_REFRESH_MS);
+}
+
+/* ctl thread. Follow the RC's push-mode offer in the control line. */
+static void rc_push_poll(struct omi_ep *ep)
+{
+	struct omi_ctl *ctl = &ep->bar->ctl;
+	struct omi_peer *pr = &ep->peer[OMI_RC_NODE];
+	u32 token = READ_ONCE(ctl->gw2_token);
+	u64 ring = (u64)READ_ONCE(ctl->gw2_ring_hi) << 32 | READ_ONCE(ctl->gw2_ring_lo);
+
+	if (!ep->ob || !(READ_ONCE(ctl->flags) & OMI_RC_PUSH) || !token || !ring ||
+	    (ring & (OMI_GW2_ALIGN - 1))) {
+		ep->push_token = 0;
+		return;
+	}
+	if (token != ep->push_token || ring != ep->push_area) {
+		/* rc_gw2_poll() took the gateway peer down already if the
+		 * offer changed under it; the window can move.
+		 */
+		if (!pr->win_ok || pr->pci != ring) {
+			if (program_outbound(ep, OMI_RC_NODE, ring))
+				return;
+			pr->pci = ring;
+			smp_store_release(&pr->win_ok, true);
+		}
+		ep->push_token = token;
+		ep->push_area = ring;
+		memset(&ep->push_last, 0, sizeof(ep->push_last));
+		dev_info(ep->dev, "RC push mode: state at %#llx\n", ring + OMI_GW2_EP_OFF);
+		rc_push_write(ep, true);
+		return;
+	}
+	rc_push_write(ep, false);
+}
+
 static void rc_poll(struct omi_ep *ep)
 {
 	struct omi_ctl *ctl = &ep->bar->ctl;
@@ -2581,6 +2673,7 @@ static void rc_poll(struct omi_ep *ep)
 		spin_unlock_bh(&ep->tx_lock);
 	}
 	rc_gw2_poll(ep, up);
+	rc_push_poll(ep);
 }
 
 /*
@@ -2621,6 +2714,13 @@ static void link_reset(struct omi_ep *ep)
 	} while (!ep->epoch);
 	WRITE_ONCE(ep->bar->hdr.epoch, ep->epoch);
 	hdr_publish(ep);
+	/* An offer from before the reset may name RC memory that is gone
+	 * (the Cluster Box rebooted): push nothing until a new one.
+	 */
+	ep->push_token = 0;
+	WRITE_ONCE(ep->bar->ctl.gw2_token, 0);
+	WRITE_ONCE(ep->bar->ctl.flags, 0);
+	bar_clean(ep, BAR_OFF(ctl), sizeof(ep->bar->ctl));
 	/* Hellos from before the reset name epochs that are gone. */
 	memset(ep->bar->hello, 0, sizeof(ep->bar->hello));
 	bar_clean(ep, BAR_OFF(hello), sizeof(ep->bar->hello));
@@ -3090,6 +3190,8 @@ static void bar_leave(struct omi_ep *ep)
 
 	ep->bar->hdr.flags |= OMI_F_DOWN;
 	hdr_publish(ep);
+	/* The ctl thread has stopped: tell a push-mode RC ourselves. */
+	rc_push_write(ep, true);
 	for (i = 0; i < OMI_DOWN_ACK_TIMEOUT_MS / 10; i++) {
 		bar_inval(ep, BAR_OFF(ctl), sizeof(*ctl));
 		if (READ_ONCE(ctl->down_ack) == ep->epoch)
@@ -3533,6 +3635,7 @@ static int openmiop_probe(struct platform_device *pdev)
 	BUILD_BUG_ON(sizeof(struct omi_peer_entry) != 32);
 	BUILD_BUG_ON(sizeof(struct omi_hello) != 32);
 	BUILD_BUG_ON(BAR_OFF(hello) != 0x180);
+	BUILD_BUG_ON(sizeof(struct omi_gw2_ep) != 64);
 	BUILD_BUG_ON(BAR_OFF(rx_prod) != 0x400);
 	BUILD_BUG_ON(BAR_OFF(tx_cons) != 0x600);
 	BUILD_BUG_ON(sizeof(struct omi_bar_head) > OMI_GW_OFF);
