@@ -8,6 +8,11 @@
  *     switch port it sits behind,
  *   - restores BAR0, the command register and a uniform Max Payload
  *     Size after an endpoint reloads (probe resets its config space),
+ *   - never sends a request to an endpoint whose link is down, has
+ *     not been up for LINK_STABLE_MS, or is about to drop (leave, or
+ *     a release from nodectl before a reset or power cut): it watches
+ *     Data Link Layer Link Active on the switch port instead, which
+ *     the switch answers itself,
  *   - publishes a peer table into every endpoint so they can reach
  *     each other directly,
  *   - detaches an endpoint that announces it is leaving, and tells it
@@ -73,6 +78,29 @@ typedef int s32;
 #define PCI_EXP_DEVCAP		4
 #define PCI_EXP_DEVCTL		8
 #define PCI_EXP_DEVCTL_MPS	0x00e0
+#define PCI_EXP_LNKSTA		0x12
+#define PCI_EXP_LNKSTA_DLLLA	0x2000
+#define PCI_EXT_CAP_ID_ERR	0x0001
+#define PCI_ERR_UNCOR_STATUS	4
+#define PCI_ERR_COR_STATUS	16
+
+/* A downstream port reports Data Link Layer Link Active itself, so
+ * reading its Link Status never sends anything over the blade's link.
+ * Every request to an endpoint (config or memory) waits until that bit
+ * has been set for LINK_STABLE_MS, and stops the moment it clears: a
+ * request in flight while a blade's link drops or retrains completes
+ * with a timeout on the MT7620A root port, and that can take the whole
+ * fabric down.
+ */
+#define LINK_POLL_MS	5
+#define LINK_STABLE_MS	1500
+/* After a leave the blade drops its link; wait for that before probing. */
+#define LEAVE_DOWN_MS	30000
+/* Header check of an active endpoint (magic, epoch, leave flag). */
+#define HDR_CHECK_MS	50
+/* Gateway poll of an endpoint without recent gateway traffic. */
+#define GW_IDLE_MS	10
+#define GW_BUSY_MS	100	/* stay at full rate this long after a frame */
 
 struct timespec32 {
 	s32 tv_sec;
@@ -196,6 +224,15 @@ static int mac_eq(const u8 *a, const u8 *b)
 		if (a[i] != b[i])
 			return 0;
 	return 1;
+}
+
+static int s_eq(const char *a, const char *b)
+{
+	while (*a && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
 }
 
 static void scpy(char *d, const char *s)
@@ -434,6 +471,19 @@ struct ep {
 	u32 quiet_until;
 	u32 next;			/* next config/poll time, ms */
 	int warned;
+	/* Link of the switch port in front of the endpoint. */
+	long pfd;			/* parent config fd, kept open */
+	u32 pcap;			/* parent PCIe capability */
+	int link;			/* DLLLA at the last sample */
+	u32 link_since;			/* when it was last set */
+	u32 link_next;			/* next sample */
+	u32 link_downs;			/* down events seen */
+	u32 need_down;			/* left: probe only after a link drop... */
+	u32 down_seen;			/* ...counted from this link_downs value */
+	u32 hdr_next;			/* next header check (active) */
+	u32 gw_next;			/* next gateway poll */
+	u32 gw_last;			/* last frame from the endpoint */
+	u32 mps_cap;			/* DEVCAP MPS + 1, read while linked */
 };
 
 static struct ep eps[OMI_MAX_NODES];
@@ -454,8 +504,21 @@ static u8 *gw_slot(struct ep *e, int rc_dir, u32 i)
 	       ((rc_dir ? OMI_GW_SLOTS : 0) + (i & (OMI_GW_SLOTS - 1))) * OMI_GW_SLOT;
 }
 
+static void ts(void)
+{
+	u32 t = now_ms();
+
+	wr("[");
+	decout(t / 1000);
+	wr(".");
+	wr(t % 1000 < 100 ? (t % 1000 < 10 ? "00" : "0") : "");
+	decout(t % 1000);
+	wr("] ");
+}
+
 static void log_ep(struct ep *e, const char *msg)
 {
+	ts();
 	wr("node ");
 	decout((u32)(e - eps));
 	wr(" ");
@@ -539,7 +602,7 @@ static int scan(void)
 {
 	char ports_bus[16];
 	unsigned bus, dev = 0;
-	int found = 0, ports = 0;
+	int found = 0, ports = 0, want = 0;
 
 	ports_bus[0] = 0;
 	for (bus = 1; bus < 32; bus++) {
@@ -573,18 +636,44 @@ static int scan(void)
 			log_ep(&eps[idx], "found");
 		}
 	}
-	if (!found)
-		return 1;
-	/* Count the downstream ports next to the first EP's parent. */
+	if (!found) {
+		/* No EP yet, so no parent known: the Cluster Box switch has
+		 * its downstream ports on bus 2. Elsewhere, rescan blindly.
+		 */
+		if (!dev_exists("0000:02:00.0"))
+			return 1;
+		scpy(ports_bus, "0000:02:00.0");
+	}
+	/* A rescan probes the bus behind every downstream port. Only ask
+	 * for one when a port without an EP has had its link up since the
+	 * previous scan: a blade trained after we enumerated. Probing a
+	 * port whose link is down or still training is what we avoid.
+	 */
 	bus = (unsigned)(hexval(ports_bus[5]) * 16 + hexval(ports_bus[6]));
 	for (dev = 0; dev < 32; dev++) {
+		static u32 up_before;
 		char sib[16];
+		u32 cap;
+		int i, has = 0;
 
 		make_bdf(sib, bus, dev);
-		if (dev_exists(sib))
-			ports++;
+		if (!dev_exists(sib))
+			continue;
+		ports++;
+		for (i = 0; i < (int)OMI_MAX_NODES; i++)
+			if (eps[i].state != EP_NONE && s_eq(eps[i].parent, sib))
+				has = 1;
+		cap = has ? 0 : find_exp_cap(sib);
+		if (cap && (cfg_rd16(sib, cap + PCI_EXP_LNKSTA) & PCI_EXP_LNKSTA_DLLLA)) {
+			if (up_before & (1u << dev))
+				want = 1;
+			up_before |= 1u << dev;
+		} else {
+			up_before &= ~(1u << dev);
+		}
 	}
-	return found < ports;
+	(void)ports;
+	return want;
 }
 
 /* MPS that every EP and every port in front of an EP supports. */
@@ -599,12 +688,9 @@ static u32 common_mps(void)
 
 		if (e->state == EP_NONE)
 			continue;
-		cap = find_exp_cap(e->bdf);
-		if (cap) {
-			v = cfg_rd32(e->bdf, cap + PCI_EXP_DEVCAP) & 7;
-			if (v < mps)
-				mps = v;
-		}
+		/* Only the cached value: this EP's link may be down now. */
+		if (e->mps_cap && e->mps_cap - 1 < mps)
+			mps = e->mps_cap - 1;
 		cap = find_exp_cap(e->parent);
 		if (cap) {
 			v = (cfg_rd16(e->parent, cap + PCI_EXP_DEVCTL) >> 5) & 7;
@@ -647,6 +733,8 @@ static int ep_restore(struct ep *e)
 		log_ep(e, "BAR0 restored");
 	}
 	cap = find_exp_cap(e->bdf);
+	if (cap)
+		e->mps_cap = (cfg_rd32(e->bdf, cap + PCI_EXP_DEVCAP) & 7) + 1;
 	mps = common_mps();
 	if (cap) {
 		ctl = cfg_rd16(e->bdf, cap + PCI_EXP_DEVCTL);
@@ -690,13 +778,144 @@ static void ep_unmap(struct ep *e)
 	e->bar = 0;
 }
 
+/* ---- link state of the switch port in front of an endpoint ---- */
+
+static u32 find_ext_cap(const char *bdf, u32 id)
+{
+	u32 pos = 0x100, h;
+	int ttl = 64;
+
+	while (pos >= 0x100 && ttl--) {
+		h = cfg_rd32(bdf, pos);
+		if (!h || h == 0xffffffff)
+			return 0;
+		if ((h & 0xffff) == id)
+			return pos;
+		pos = (h >> 20) & 0xffc;
+	}
+	return 0;
+}
+
+static u16 parent_lnksta(struct ep *e)
+{
+	char path[80];
+	u16 v = 0xffff;
+
+	if (!e->pcap) {
+		e->pcap = find_exp_cap(e->parent);
+		if (!e->pcap)
+			return 0xffff;
+	}
+	if (e->pfd <= 0) {
+		dev_path(path, e->parent, "config");
+		e->pfd = sc(SYS_open, (long)path, O_RDONLY, 0, 0, 0, 0);
+		if (e->pfd < 0) {
+			e->pfd = 0;
+			return 0xffff;
+		}
+	}
+	if (sc(SYS_lseek, e->pfd, (long)(e->pcap + PCI_EXP_LNKSTA), 0, 0, 0, 0) !=
+	    (long)(e->pcap + PCI_EXP_LNKSTA) ||
+	    sc(SYS_read, e->pfd, (long)&v, 2, 0, 0, 0) != 2)
+		return 0xffff;
+	return v;
+}
+
+static void port_dump(const char *bdf)
+{
+	u32 cap = find_exp_cap(bdf), aer = find_ext_cap(bdf, PCI_EXT_CAP_ID_ERR);
+
+	wr("  ");
+	wr(bdf);
+	if (cap) {
+		wr(" lnksta ");
+		hexout(cfg_rd16(bdf, cap + PCI_EXP_LNKSTA));
+	}
+	if (aer) {
+		wr(" uesta ");
+		hexout(cfg_rd32(bdf, aer + PCI_ERR_UNCOR_STATUS));
+		wr(" cesta ");
+		hexout(cfg_rd32(bdf, aer + PCI_ERR_COR_STATUS));
+	}
+	wr(" bus ");
+	hexout(cfg_rd32(bdf, 0x18));
+	wr("\n");
+}
+
+/* Root port, switch upstream port and the downstream ports: all answer
+ * config reads themselves, none of this goes over a blade link.
+ */
+static void fabric_dump(const char *why)
+{
+	char up[16];
+	int i;
+
+	ts();
+	wr("fabric: ");
+	wr(why);
+	wr("\n");
+	if (root_port[0])
+		port_dump(root_port);
+	up[0] = 0;
+	for (i = 0; i < (int)OMI_MAX_NODES; i++) {
+		if (eps[i].state == EP_NONE)
+			continue;
+		if (!up[0]) {
+			char path[80], link[160];
+			long n;
+			int k, slash = -1, prev = -1, pp = -1;
+
+			/* .../<root>/<upstream>/<downstream>/<ep> */
+			dev_path(path, eps[i].bdf, "");
+			path[slen(path) - 1] = 0;
+			n = sc(SYS_readlink, (long)path, (long)link, sizeof(link) - 1, 0, 0, 0);
+			for (k = 0; k < n; k++)
+				if (link[k] == '/') {
+					pp = prev;
+					prev = slash;
+					slash = k;
+				}
+			if (n > 0 && pp >= 0 && prev - pp - 1 == 12) {
+				memcpy(up, link + pp + 1, 12);
+				up[12] = 0;
+				port_dump(up);
+			}
+		}
+		port_dump(eps[i].parent);
+	}
+}
+
+/*
+ * Sample the link of e's switch port (at most every LINK_POLL_MS unless
+ * force). Returns 1 when it is up and has been for LINK_STABLE_MS.
+ */
+static int link_ok(struct ep *e, int force)
+{
+	u16 v;
+	int up;
+
+	if (force || (s32)(now - e->link_next) >= 0) {
+		e->link_next = now + LINK_POLL_MS;
+		v = parent_lnksta(e);
+		up = v != 0xffff && (v & PCI_EXP_LNKSTA_DLLLA);
+		if (up && !e->link)
+			e->link_since = now;
+		if (!up && e->link) {
+			e->link_downs++;
+			log_ep(e, "link down at the switch port");
+		}
+		e->link = up;
+	}
+	return e->link && now - e->link_since >= LINK_STABLE_MS;
+}
+
 /*
  * Forget the mapping and leave the EP alone for quiet_ms. Its link is
  * about to drop or just dropped: a read (config or memory) that is in
  * flight when a link goes down can be discarded by the switch, and a
  * completion timeout on the MT7620A root port takes the whole fabric
- * down. After the quiet period only config reads, which a downstream
- * port with its link down answers itself.
+ * down. Nothing goes to the EP again until its switch port has shown
+ * the link up for LINK_STABLE_MS (link_ok()).
  */
 static void ep_drop(struct ep *e, const char *why, u32 quiet_ms)
 {
@@ -728,6 +947,7 @@ static void ep_activate(struct ep *e, int idx)
 	wr32(&h->ctl.flags, OMI_RC_UP);
 	e->state = EP_ACTIVE;
 	tables_dirty = 1;
+	ts();
 	wr("node ");
 	decout((u32)idx);
 	wr(" active, BAR ");
@@ -867,12 +1087,12 @@ static void dispatch(int src, const u32 *buf, u32 len, u32 mask)
 			gw_put(&eps[k], buf, len, src >= 0 ? OMI_GW_RELAYED : 0);
 }
 
-static void gw_drain(int idx)
+static int gw_drain(int idx)
 {
 	struct ep *e = &eps[idx];
 	struct omi_gw *gw = GW(e);
 	u32 head = rd32(&gw->ep_head);
-	int budget = 32;
+	int budget = 32, got = 0;
 
 	if (head - e->ep_tail > OMI_GW_SLOTS)
 		e->ep_tail = head;	/* garbage; resync */
@@ -888,8 +1108,11 @@ static void gw_drain(int idx)
 			dispatch(idx, frame, len, mask);
 		}
 		e->ep_tail++;
+		got++;
 	}
-	wr32(&gw->ep_tail, e->ep_tail);
+	if (got)
+		wr32(&gw->ep_tail, e->ep_tail);
+	return got;
 }
 
 static void tap_drain(void)
@@ -1017,6 +1240,8 @@ static void reenumerate(void)
 
 	for (i = 0; i < (int)OMI_MAX_NODES; i++) {
 		ep_unmap(&eps[i]);
+		if (eps[i].pfd > 0)
+			sc(SYS_close, eps[i].pfd, 0, 0, 0, 0, 0);
 		memset(&eps[i], 0, sizeof(eps[i]));
 	}
 
@@ -1025,6 +1250,39 @@ static void reenumerate(void)
 	msleep(500);
 	write_file("/sys/bus/pci/rescan", "1");
 	msleep(500);
+}
+
+/*
+ * nodectl is about to pulse a blade's reset line or cut its power: the
+ * link will drop without a leave. It creates
+ * /var/run/openmiop-release.<switch port>, e.g. ...release.02:0c.0, and
+ * waits until we delete it. From then on no request goes to that
+ * endpoint until its link has dropped and come back stable.
+ */
+#define RELEASE_PREFIX	"/var/run/openmiop-release."
+
+static void releases_check(void)
+{
+	char path[64], buf[8];
+	int i;
+
+	for (i = 0; i < (int)OMI_MAX_NODES; i++) {
+		struct ep *e = &eps[i];
+
+		if (e->state == EP_NONE || !e->parent[0])
+			continue;
+		scpy(path, RELEASE_PREFIX);
+		scat(path, e->parent + 5);	/* "02:0c.0" */
+		if (read_file(path, buf, sizeof(buf)) < 0)
+			continue;
+		if (e->state != EP_QUIET)
+			ep_drop(e, "released for reset or power off", 0);
+		else
+			log_ep(e, "released for reset or power off");
+		e->need_down = now + LEAVE_DOWN_MS;
+		e->down_seen = e->link_downs - (e->link ? 0 : 1);
+		sc(4010 /* unlink */, (long)path, 0, 0, 0, 0, 0);
+	}
 }
 
 static int due(struct ep *e, u32 period)
@@ -1039,29 +1297,44 @@ static void ep_step(int idx)
 {
 	struct ep *e = &eps[idx];
 	struct omi_bar_head *h = HDR(e);
-	u32 magic, flags;
+	u32 magic, flags, poll;
+	int ok;
+
+	if (e->state == EP_NONE)
+		return;
+	ok = link_ok(e, 0);
+	if (e->bar && !e->link && e->state != EP_LEAVING) {
+		/* Not a single request more to this endpoint. */
+		ep_drop(e, "link lost", 0);
+		fabric_dump("link lost");
+		return;
+	}
 
 	switch (e->state) {
 	case EP_NONE:
 		return;
 	case EP_QUIET:
-		if ((s32)(now - e->quiet_until) >= 0)
-			e->state = EP_PROBE;
+		if ((s32)(now - e->quiet_until) < 0 || !ok)
+			return;
+		/* A leaver drops its link right after the ack: until that
+		 * happened, its link being up means nothing.
+		 */
+		if (e->need_down && e->link_downs == e->down_seen &&
+		    (s32)(now - e->need_down) < 0)
+			return;
+		e->need_down = 0;
+		e->state = EP_PROBE;
 		return;
 	case EP_PROBE:
-		if (!due(e, 200))
+		if (!due(e, 200) || !link_ok(e, 1))
 			return;
 		if (ep_restore(e) || ep_map(e))
 			return;
 		e->state = EP_WAIT;
 		return;
 	case EP_WAIT:
-		if (!due(e, 100))
+		if (!due(e, 100) || !link_ok(e, 1))
 			return;
-		if ((cfg_rd32(e->bdf, 0) & 0xffff) != OPENMIOP_PCI_VENDOR) {
-			ep_drop(e, "link lost", 500);
-			return;
-		}
 		magic = rd32(&h->hdr.magic);
 		flags = rd32(&h->hdr.flags);
 		if (magic == 0xffffffff) {
@@ -1084,38 +1357,58 @@ static void ep_step(int idx)
 			return;
 		}
 		ep_activate(e, idx);
+		e->hdr_next = now + HDR_CHECK_MS;
+		e->gw_next = now;
 		return;
 	case EP_LEAVING:
 		/* No reads of the leaver: it drops its link right after
 		 * the ack. Only the other EPs are read here.
 		 */
-		if (peers_detached() || now - e->leave_start > 1000) {
-			wr32(&h->ctl.down_ack, e->epoch);
+		if (!e->link || peers_detached() || now - e->leave_start > 1000) {
+			if (e->link)
+				wr32(&h->ctl.down_ack, e->epoch);
 			ep_drop(e, "detached", 3000);
+			e->need_down = now + LEAVE_DOWN_MS;
+			e->down_seen = e->link_downs - (e->link ? 0 : 1);
 		}
 		return;
 	case EP_ACTIVE:
 		break;
 	}
 
-	if (due(e, 100) && (cfg_rd32(e->bdf, 0) & 0xffff) != OPENMIOP_PCI_VENDOR) {
-		ep_drop(e, "link lost", 500);
-		return;
+	if ((s32)(now - e->hdr_next) >= 0) {
+		e->hdr_next = now + HDR_CHECK_MS;
+		if (!link_ok(e, 1)) {
+			ep_drop(e, "link lost", 0);
+			fabric_dump("link lost");
+			return;
+		}
+		magic = rd32(&h->hdr.magic);
+		if (magic != OPENMIOP_MAGIC || rd32(&h->hdr.epoch) != e->epoch) {
+			ep_drop(e, "reset without leaving", 500);
+			fabric_dump("reset without leaving");
+			return;
+		}
+		flags = rd32(&h->hdr.flags);
+		if (flags & OMI_F_DOWN) {
+			log_ep(e, "leaving");
+			e->state = EP_LEAVING;
+			e->leave_start = now;
+			tables_dirty = 1;
+			return;
+		}
 	}
-	magic = rd32(&h->hdr.magic);
-	if (magic != OPENMIOP_MAGIC || rd32(&h->hdr.epoch) != e->epoch) {
-		ep_drop(e, "reset without leaving", 500);
+	/* Gateway: every loop while frames flow, slower when idle, so an
+	 * unannounced reset of an idle blade rarely meets a read in flight.
+	 */
+	poll = now - e->gw_last < GW_BUSY_MS ? 0 : GW_IDLE_MS;
+	if ((s32)(now - e->gw_next) < 0)
 		return;
-	}
-	flags = rd32(&h->hdr.flags);
-	if (flags & OMI_F_DOWN) {
-		log_ep(e, "leaving");
-		e->state = EP_LEAVING;
-		e->leave_start = now;
-		tables_dirty = 1;
+	e->gw_next = now + poll;
+	if (poll && !link_ok(e, 1))
 		return;
-	}
-	gw_drain(idx);
+	if (gw_drain(idx))
+		e->gw_last = now;
 }
 
 void _start(void)
@@ -1155,6 +1448,7 @@ void _start(void)
 			reenumerate();
 			continue;
 		}
+		releases_check();
 		for (i = 0; i < (int)OMI_MAX_NODES; i++)
 			ep_step(i);
 		if (tables_dirty)
