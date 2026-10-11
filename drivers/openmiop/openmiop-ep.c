@@ -274,6 +274,11 @@ struct omi_batch {
 #define OMI_AUTO_PERIOD		(HZ / 20)
 #define OMI_HELLO_RESEND	(HZ / 2)
 #define OMI_STALL_TIMEOUT	(HZ / 10)
+/* Stalled this long: connect again. Nothing is sent to a stalled peer,
+ * so it may never return credit by itself; a new token makes it reset
+ * its rings and ack, or leaves the peer connecting if it is not there.
+ */
+#define OMI_STALL_RECONNECT	(2 * HZ)
 #define OMI_DOWN_ACK_TIMEOUT_MS	2000
 
 /* Source MAC learning for frames from bridges behind a peer. */
@@ -360,7 +365,8 @@ struct omi_rx_stats {			/* per RX queue: its NAPI */
 
 struct omi_ctl_stats {
 	u64_stats_t poll_cycles, napi_kicks, table_updates, peer_up,
-		    peer_down, stalls, queue_wakes, link_resets, connect_renew,
+		    peer_down, stalls, stall_reconnects, queue_wakes,
+		    link_resets, connect_renew,
 		    db_windows, hellos_tx, hellos_rx;
 	struct u64_stats_sync syncp;
 };
@@ -2174,11 +2180,26 @@ static void hdr_publish(struct omi_ep *ep)
 /* ctl thread. Stop sending to peer p and wait until no eDMA run that
  * may target it is in flight.
  */
+/* ctl thread. Wait for the runs built before a peer left up_mask. */
+static void peer_wait_runs(struct omi_ep *ep)
+{
+	u32 target[OMI_MAX_QUEUES];
+	unsigned int q;
+
+	for (q = 0; q < ep->nq; q++) {
+		spin_lock_bh(&ep->txq[q].lock);
+		target[q] = ep->txq[q].build_gen;
+		spin_unlock_bh(&ep->txq[q].lock);
+	}
+	for (q = 0; q < ep->nq; q++)
+		while ((s32)(READ_ONCE(ep->txq[q].done_gen) - target[q]) < 0 &&
+		       ep->nch && ep->ch[q % ep->nch].task)
+			usleep_range(20, 50);
+}
+
 static void peer_down(struct omi_ep *ep, unsigned int p)
 {
 	struct omi_peer *pr = &ep->peer[p];
-	u32 target[OMI_MAX_QUEUES];
-	unsigned int q;
 
 	spin_lock_bh(&ep->tx_lock);
 	if (pr->state == OMI_PEER_UP)
@@ -2194,15 +2215,7 @@ static void peer_down(struct omi_ep *ep, unsigned int p)
 	WRITE_ONCE(ep->up_mask, ep->up_mask & ~BIT(p));
 	spin_unlock_bh(&ep->tx_lock);
 	/* Runs built from now on leave p out; wait for the ones before. */
-	for (q = 0; q < ep->nq; q++) {
-		spin_lock_bh(&ep->txq[q].lock);
-		target[q] = ep->txq[q].build_gen;
-		spin_unlock_bh(&ep->txq[q].lock);
-	}
-	for (q = 0; q < ep->nq; q++)
-		while ((s32)(READ_ONCE(ep->txq[q].done_gen) - target[q]) < 0 &&
-		       ep->nch && ep->ch[q % ep->nch].task)
-			usleep_range(20, 50);
+	peer_wait_runs(ep);
 	/* Until it connects again we cannot count on its doorbell. */
 	set_bit(p, &ep->rx_nodb);
 	dev_info(ep->dev, "peer %u down\n", p);
@@ -2251,6 +2264,44 @@ static void peer_renew_token(struct omi_ep *ep, unsigned int p)
 	spin_unlock_bh(&ep->tx_lock);
 	omi_inc(&ep->cs, connect_renew);
 	dev_info_ratelimited(ep->dev, "peer %u: no ack, connecting again\n", p);
+}
+
+/* ctl thread. Peer p stalled for OMI_STALL_RECONNECT: connect again
+ * through the same window. The receiver resets its rings for the new
+ * token and acks; peer_up() then starts from head 0 with its tails.
+ */
+static void peer_reconnect(struct omi_ep *ep, unsigned int p)
+{
+	struct omi_peer *pr = &ep->peer[p];
+	u32 token;
+
+	spin_lock_bh(&ep->tx_lock);
+	if (pr->state != OMI_PEER_UP || !pr->stalled) {
+		spin_unlock_bh(&ep->tx_lock);
+		return;
+	}
+	/* Still stalled until it acks: xmit keeps dropping its unicast
+	 * instead of sending it to the gateway.
+	 */
+	pr->state = OMI_PEER_CONNECTING;
+	pr->full_since = 0;
+	WRITE_ONCE(pr->db_ok, false);
+	WRITE_ONCE(ep->up_mask, ep->up_mask & ~BIT(p));
+	spin_unlock_bh(&ep->tx_lock);
+	/* No run may write a head after peer_connect() resets them. */
+	peer_wait_runs(ep);
+
+	do {
+		token = get_random_u32();
+	} while (!token || token == pr->token);
+
+	spin_lock_bh(&ep->tx_lock);
+	pr->token = token;
+	pr->conn_start = jiffies;
+	spin_unlock_bh(&ep->tx_lock);
+	omi_inc(&ep->cs, stall_reconnects);
+	peer_connect(ep, p);
+	dev_warn(ep->dev, "peer %u stalled, connecting again\n", p);
 }
 
 static void peer_set(struct omi_ep *ep, unsigned int p, u32 epoch, u64 pci,
@@ -2409,6 +2460,8 @@ static void peer_up(struct omi_ep *ep, unsigned int p, struct omi_cons *c)
 	spin_lock_bh(&ep->tx_lock);
 	txq_lock_all(ep);
 	pr->state = OMI_PEER_UP;
+	WRITE_ONCE(pr->stalled, false);
+	pr->full_since = 0;
 	WRITE_ONCE(pr->nq, nq);
 	WRITE_ONCE(pr->slots, OMI_RING_SLOTS / nq);
 	for (q = 0; q < OMI_MAX_QUEUES; q++) {
@@ -2428,6 +2481,7 @@ static void peer_up(struct omi_ep *ep, unsigned int p, struct omi_cons *c)
 
 static void peers_poll(struct omi_ep *ep)
 {
+	unsigned long reconnect = 0;
 	unsigned int p, q;
 
 	for (p = 0; p < OMI_N_RINGS; p++) {
@@ -2450,7 +2504,7 @@ static void peers_poll(struct omi_ep *ep)
 	/* A peer with a queue that stayed full for OMI_STALL_TIMEOUT is
 	 * not reading (interface down, stuck). Stop waiting for it so the
 	 * queues keep moving; frames to it are dropped until it returns
-	 * credit.
+	 * credit, or until it acks a new connect after OMI_STALL_RECONNECT.
 	 */
 	spin_lock_bh(&ep->tx_lock);
 	txq_lock_all(ep);
@@ -2476,6 +2530,8 @@ static void peers_poll(struct omi_ep *ep)
 				pr->stalled = false;
 				pr->full_since = 0;
 				WRITE_ONCE(ep->up_mask, ep->up_mask | BIT(p));
+			} else if (time_after(jiffies, pr->full_since + OMI_STALL_RECONNECT)) {
+				reconnect |= BIT(p);
 			}
 			continue;
 		}
@@ -2499,6 +2555,9 @@ static void peers_poll(struct omi_ep *ep)
 			omi_inc(&ep->cs, queue_wakes);
 	txq_unlock_all(ep);
 	spin_unlock_bh(&ep->tx_lock);
+
+	for_each_set_bit(p, &reconnect, OMI_MAX_NODES)
+		peer_reconnect(ep, p);
 }
 
 /*
@@ -3046,6 +3105,7 @@ static const struct {
 	OMI_STAT("ctl_peer_up", OMI_CS, struct omi_ctl_stats, peer_up),
 	OMI_STAT("ctl_peer_down", OMI_CS, struct omi_ctl_stats, peer_down),
 	OMI_STAT("ctl_peer_stalls", OMI_CS, struct omi_ctl_stats, stalls),
+	OMI_STAT("ctl_stall_reconnects", OMI_CS, struct omi_ctl_stats, stall_reconnects),
 	OMI_STAT("ctl_queue_wakes", OMI_CS, struct omi_ctl_stats, queue_wakes),
 	OMI_STAT("ctl_link_resets", OMI_CS, struct omi_ctl_stats, link_resets),
 	OMI_STAT("ctl_connect_renew", OMI_CS, struct omi_ctl_stats, connect_renew),
