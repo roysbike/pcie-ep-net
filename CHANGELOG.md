@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0-rc.2] - 2026-10-12
+
+Cluster Box module fix only: `omi-rc` activates the blades right after
+a Cluster Box boot. Blade driver and userspace helper are the same as
+in 0.3.0-rc.1. Part of OpenMIOP Stack v0.3.0-rc.2.
+
 ### Fixed
 
 - **`omi-rc` loaded at boot activated the blades only ~5 min later.**
@@ -347,7 +353,8 @@ all four endpoints; the Debian module built from this source repeated
   this box, MPS other than 128/256, helper restart under load with four
   endpoints.
 
-[Unreleased]: https://github.com/roysbike/pcie-ep-net/compare/v0.3.0-rc.1...HEAD
+[Unreleased]: https://github.com/roysbike/pcie-ep-net/compare/v0.3.0-rc.2...HEAD
+[0.3.0-rc.2]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.0-rc.2
 [0.3.0-rc.1]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.0-rc.1
 [0.2.0-rc.2]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.2.0-rc.1
