@@ -5,14 +5,34 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-Blade driver 0.3.0-dev.2. Part of the next OpenMIOP Stack release.
+## [0.3.0-rc.1] - 2026-10-11
+
+Blade driver and a new Cluster Box kernel module. Wire format between
+blades is still protocol v4; the userspace helper `openmiop-rc` is the
+same as in 0.2.0-rc.2. Part of OpenMIOP Stack v0.3.0-rc.1.
 
 ### Added
 
-- **Push mode** (PR #8): the Cluster Box never reads a blade BAR; blades
-  push their state and reconnect P2P on their own after a fabric reset
-  (verified on hardware after Cluster Box reboots on 2026-10-08 and
-  2026-10-09). `omi-rc` kernel module for the Cluster Box.
+- **Blades keep the fabric up without the Cluster Box.** After a fabric
+  reset (Cluster Box reboot) a blade enables its BAR itself and the
+  blades reconnect P2P to each other through hello lines in their BARs,
+  ~12 s after the link reset and before the BMC side runs again.
+  Verified on hardware after Cluster Box reboots on 2026-10-08,
+  2026-10-09 and 2026-10-11.
+- **Push mode** (PR #8): the Cluster Box never reads a blade BAR. The
+  blade marks its config space (Subsystem ID `4f4d:0001`) and writes
+  its state into the Cluster Box's memory; the Cluster Box only writes
+  into blades. See [docs/push-mode.md](docs/push-mode.md). A push-mode
+  blade still works with the userspace helper.
+- **`omi-rc`, the Cluster Box side as a kernel module** (replaces
+  `openmiop-rc`; do not run both). Watches the switch port links,
+  restores the blades' config space, makes push-mode offers, publishes
+  the peer table, provides the BMC's `omi0` (same MAC as the helper) and
+  takes `nodectl`'s release through
+  `/sys/module/omi_rc/parameters/release`. Built and packaged by the
+  ClusterBox firmware (`kmod-omi-rc`). Tested on the Cluster Box: all
+  four blades active 1.6 s after loading, no P2P interruption, a blade
+  reset by `nodectl` with release first.
 
 ### Fixed
 
@@ -311,6 +331,9 @@ all four endpoints; the Debian module built from this source repeated
   this box, MPS other than 128/256, helper restart under load with four
   endpoints.
 
+[Unreleased]: https://github.com/roysbike/pcie-ep-net/compare/v0.3.0-rc.1...HEAD
+[0.3.0-rc.1]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.0-rc.1
+[0.2.0-rc.2]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.2.0-rc.1
 [0.1.0-rc.2]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/roysbike/pcie-ep-net/releases/tag/v0.1.0-rc.1

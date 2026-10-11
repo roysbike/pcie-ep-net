@@ -1,8 +1,8 @@
 # Push mode: the Cluster Box never reads a blade
 
-Status: implemented on branch `claude/rc-push` (blade driver and the
-`omi-rc` kernel module for the BMC), builds clean, not yet run on
-hardware.
+Status: released in v0.3.0-rc.1. Run on the lab Cluster Box since
+2026-10-11 (four blades, `omi-rc` loaded instead of the helper, blade
+reset with a `nodectl` release).
 
 ## Why
 
@@ -85,4 +85,4 @@ the area.
 
 - Re-enumeration of the bridge windows from the module (a blade whose
   BAR got no address is only logged); the helper's `reenumerate` path.
-- Selecting module or helper from the OpenWrt init script.
+- A blade crash or power cut without a release, on purpose.
