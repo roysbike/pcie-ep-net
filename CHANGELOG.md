@@ -3,6 +3,30 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+Blade driver 0.3.0-dev.2. Part of the next OpenMIOP Stack release.
+
+### Added
+
+- **Push mode** (PR #8): the Cluster Box never reads a blade BAR; blades
+  push their state and reconnect P2P on their own after a fabric reset
+  (verified on hardware after Cluster Box reboots on 2026-10-08 and
+  2026-10-09). `omi-rc` kernel module for the Cluster Box.
+
+### Fixed
+
+- **A peer that stalls right after it connects is dropped for good.**
+  A sender marks a peer stalled when one of its queues stays full for
+  100 ms, and only new credit cleared that. After a blade reboot its
+  peers sometimes saw no credit in the first 100 ms and dropped every
+  frame to it until it was reset again (seen 2026-10-11). A peer that
+  stays stalled for 2 s is now connected again with a new token; it
+  stays stalled until it acks. New counter `ctl_stall_reconnects`, log
+  `peer N stalled, connecting again`. Verified on hardware: recovered
+  in 2 s during a blade upgrade. Why the rebooted blade gives no credit
+  in its first 100 ms is still open.
+
 ## [0.2.0-rc.2] - 2026-10-08
 
 Cluster Box helper only: the blade driver is the same as in rc.1, wire
