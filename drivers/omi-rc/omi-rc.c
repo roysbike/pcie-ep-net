@@ -980,8 +980,14 @@ static int __init omi_rc_init(void)
 		rc = NULL;
 		return -ENODEV;
 	}
-	for (i = 0; i < rc->nports; i++)
+	for (i = 0; i < rc->nports; i++) {
 		rc->ep[i].gen = get_random_u32();	/* never the blade's stale one */
+		/* jiffies starts 5 min before its wrap: a deadline of 0
+		 * would only pass then, after a Cluster Box boot.
+		 */
+		rc->ep[i].link_next = jiffies;
+		rc->ep[i].rescan_at = jiffies;
+	}
 	hrtimer_init(&rc->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	rc->timer.function = rc_timer;
 	strscpy(ndev->name, "omi0", IFNAMSIZ);

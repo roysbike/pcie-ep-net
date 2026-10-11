@@ -5,6 +5,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`omi-rc` loaded at boot activated the blades only ~5 min later.**
+  32-bit jiffies starts 300 s before it wraps, and the first link
+  sample and the rescan of each port waited for a deadline of 0, which
+  only passes at that wrap. Loaded by the firmware init at 45 s, the
+  module left the blades alone until ~300 s: P2P between blades was
+  fine (they reconnect without the BMC), but the BMC gateway (default
+  route, DNS, NTP of the blades) was down. Seen after flashing
+  ClusterBox firmware v0.1.0-rc.5 on 2026-10-12. Both deadlines now
+  start at load time.
+
 ## [0.3.0-rc.1] - 2026-10-11
 
 Blade driver and a new Cluster Box kernel module. Wire format between
