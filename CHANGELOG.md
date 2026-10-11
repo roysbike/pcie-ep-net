@@ -33,6 +33,10 @@ same as in 0.2.0-rc.2. Part of OpenMIOP Stack v0.3.0-rc.1.
   ClusterBox firmware (`kmod-omi-rc`). Tested on the Cluster Box: all
   four blades active 1.6 s after loading, no P2P interruption, a blade
   reset by `nodectl` with release first.
+- **`openmiop.init` starts `omi-rc` when it is installed**
+  (`/lib/modules/<kernel>/omi-rc.ko`) and falls back to the helper if
+  it is missing or does not load; `touch /etc/openmiop.use-helper`
+  forces the helper. `stop` unloads the module.
 
 ### Fixed
 

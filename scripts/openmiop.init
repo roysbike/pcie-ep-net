@@ -1,15 +1,33 @@
 #!/bin/sh /etc/rc.common
-# Cluster Box side of openmiop. The helper finds the endpoints itself
-# (and rescans while a switch port is empty), so start it right away.
+# Cluster Box side of openmiop. The omi-rc kernel module (push mode, never
+# reads a blade) when it is installed, otherwise the userspace helper.
+# Both find the endpoints themselves, so start right away.
+# Touch /etc/openmiop.use-helper to run the helper even with the module
+# installed (blades without push mode).
 START=99
 STOP=10
 
 ADDR=10.20.0.1/24
+USE_HELPER=/etc/openmiop.use-helper
+
+use_module() {
+	[ ! -e "$USE_HELPER" ] && [ -e "/lib/modules/$(uname -r)/omi-rc.ko" ]
+}
+
+module_loaded() {
+	[ -d /sys/module/omi_rc ]
+}
 
 start() {
-	# The helper logs to stderr; keep it in tmpfs for debugging.
-	start-stop-daemon -S -b -m -p /var/run/openmiop-rc.pid -x /bin/sh -- \
-		-c "exec /usr/bin/openmiop-rc 2>>/tmp/openmiop-rc.log"
+	if module_loaded; then
+		:
+	elif use_module && insmod "/lib/modules/$(uname -r)/omi-rc.ko"; then
+		:
+	else
+		# The helper logs to stderr; keep it in tmpfs for debugging.
+		start-stop-daemon -S -b -m -p /var/run/openmiop-rc.pid -x /bin/sh -- \
+			-c "exec /usr/bin/openmiop-rc 2>>/tmp/openmiop-rc.log"
+	fi
 	i=0
 	while [ "$i" -lt 20 ] && ! ip link show omi0 >/dev/null 2>&1; do
 		i=$((i + 1))
@@ -23,4 +41,7 @@ start() {
 stop() {
 	start-stop-daemon -K -p /var/run/openmiop-rc.pid 2>/dev/null
 	rm -f /var/run/openmiop-rc.pid
+	if module_loaded; then
+		rmmod omi_rc
+	fi
 }
