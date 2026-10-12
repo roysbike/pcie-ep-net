@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `omi-rc`: the control thread no longer keeps the BMC load average at
+  1.0. It slept between passes with `usleep_range()`, which is an
+  uninterruptible (D state) sleep; it now sleeps in `TASK_IDLE` for the
+  same 1-2 ms.
+
 ## [0.3.0] - 2026-10-12
 
 First stable release of push mode. Same code as 0.3.0-rc.2. Part of

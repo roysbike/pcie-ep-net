@@ -797,6 +797,20 @@ static void ep_step(struct rc_ep *e)
 		ep_drop(e, "no state from the blade for 5 s", 0);
 }
 
+/*
+ * Sleep 1-2 ms between passes. usleep_range() sleeps uninterruptibly, so
+ * the thread sat in D state and kept the load average at 1.0 on an idle
+ * BMC. TASK_IDLE is the same sleep without counting towards the load;
+ * kthread_stop() still wakes it.
+ */
+static void ctl_pause(void)
+{
+	ktime_t t = ms_to_ktime(1);
+
+	set_current_state(TASK_IDLE);
+	schedule_hrtimeout_range(&t, NSEC_PER_MSEC, HRTIMER_MODE_REL);
+}
+
 static int ctl_thread(void *data)
 {
 	int i;
@@ -808,7 +822,7 @@ static int ctl_thread(void *data)
 		if (rc->tables_dirty)
 			tables_publish();
 		mutex_unlock(&rc->ctl_lock);
-		usleep_range(1000, 2000);
+		ctl_pause();
 	}
 	return 0;
 }
