@@ -11,7 +11,7 @@ It is an independent implementation, not Mixtile's MIOP driver, and
 contains no Mixtile code or firmware. License: GPL-2.0-or-later
 ([LICENSE](LICENSE)).
 
-Current release: **v0.3.0-rc.2** (protocol v4 framing between blades; push
+Current release: **v0.3.0** (protocol v4 framing between blades; push
 mode: the Cluster Box never reads a blade; blades reconnect without it). See
 [CHANGELOG.md](CHANGELOG.md) and [Compatible releases](#compatible-releases).
 
@@ -102,7 +102,7 @@ Gen3 x2.
 ### Cluster Box (BMC)
 
 Recommended: install the ClusterBox firmware
-[mixtile-clusterbox-mt7620a-openwrt v0.1.0-rc.6](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0-rc.6),
+[mixtile-clusterbox-mt7620a-openwrt v0.1.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0),
 which loads `omi-rc` at boot (`kmod-omi-rc`) and falls back to the helper
 (`openmiop` package). Upgrade all blades to v0.3 first: the module leaves
 blades without push mode alone.
@@ -113,8 +113,8 @@ On other Cluster Box firmware, use the release asset
 
 ```sh
 sha256sum -c SHA256SUMS
-tar xzf openmiop-0.3.0-rc.2-clusterbox-bmc-mipsel.tar.gz
-cd openmiop-0.3.0-rc.2-clusterbox-bmc-mipsel
+tar xzf openmiop-0.3.0-clusterbox-bmc-mipsel.tar.gz
+cd openmiop-0.3.0-clusterbox-bmc-mipsel
 ssh <bmc> 'cat > /tmp/openmiop-rc' < openmiop-rc
 ssh <bmc> 'cat > /tmp/openmiop.init' < openmiop.init
 # as root on the BMC (prefix each command with sudo when logged in as a user):
@@ -130,7 +130,7 @@ The BMC gets `omi0` = 10.20.0.1/24, MTU 9000. Log: `/tmp/openmiop-rc.log`.
 
 ### Blade 3 with Talos
 
-Use the [mixtile-talos v0.3.0-rc.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.3.0-rc.1)
+Use the [mixtile-talos v0.3.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.3.0)
 installer image. The module is built into it as a system extension;
 nothing has to be compiled. The release notes there have the machine
 configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
@@ -138,7 +138,7 @@ configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
 ### Blade 3 with Debian or Ubuntu
 
 Install the DKMS package from the
-[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.0-rc.2).
+[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.0).
 DKMS builds the module for the running kernel (6.1 or newer; the
 kernel's headers must be installed). CI installs it on Debian 12,
 Debian 13, Ubuntu 22.04 (HWE kernel) and Ubuntu 24.04 (arm64) and checks
@@ -148,7 +148,7 @@ that the module builds for each distribution kernel. On the Mixtile Debian
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-sudo apt install ./openmiop-dkms_0.3.0-rc.2_all.deb
+sudo apt install ./openmiop-dkms_0.3.0_all.deb
 echo 10.20.0.<last octet of the management address>/24 | sudo tee /etc/openmiop.addr
 sudo reboot            # or: sudo systemctl start openmiop
 ```
@@ -219,6 +219,21 @@ More: [docs/operations.md](docs/operations.md).
 
 ## Tested configuration and results
 
+### v0.3.0 (2026-10-12)
+
+Four Blade 3 on Talos v1.14.2 (mixtile-talos v0.3.0-rc.1, same driver),
+BMC on ClusterBox firmware v0.1.0-rc.6 with `omi-rc`, MTU 9000, Gen3
+x2, a loaded Cozystack cluster on top.
+
+| Test | Result |
+| --- | --- |
+| Every ordered pair, 1 TCP stream | 4.3-5.1 Gbit/s, 0 retransmits |
+| One pair, 4 TCP streams | 8.1 Gbit/s |
+| One pair bidirectional, 4 streams each way | 6.9 + 7.0 Gbit/s |
+| Four senders at once (ring), 4 streams each | 25.0 Gbit/s total |
+| Cluster Box boot | all blades active 1.6 s after `omi-rc` loads |
+| Blade reset (`nodectl` with release) | active again 14.5 s after the reset |
+
 ### v0.2.0-rc.1 (2026-10-08)
 
 Four Blade 3 on Talos v1.14.2 (6.18.54) with this driver, BMC on
@@ -260,7 +275,7 @@ in `docs/bench/`.
 * No checksum/GSO offload; fixed 10 KiB slots.
 * A BMC reboot resets every blade link; blades reconnect P2P by
   themselves after ~12 s (v0.3). On Blade 3 it also resets the M.2 NVMe
-  (shared PERST#): mixtile-talos v0.3.0-rc.1 recovers it.
+  (shared PERST#): mixtile-talos v0.3.0 recovers it.
 * BMC root-port re-enumeration pauses all fabric traffic ~1-2 s when a
   blade appears without a BAR address (in rc.2 peers then reconnect by
   themselves; in rc.1 a moved peer could stay "connecting"). This is
@@ -274,12 +289,12 @@ in `docs/bench/`.
 
 ## Compatible releases
 
-| OpenMIOP Stack v0.3.0-rc.2 | |
+| OpenMIOP Stack v0.3.0 | |
 | --- | --- |
 | Protocol | OpenMIOP v4 framing between blades, features `OMI_FEAT_DOORBELL`, `OMI_FEAT_MQ` negotiated per connection; push mode to the BMC |
-| Blade driver, BMC module | [pcie-ep-net v0.3.0-rc.2](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.0-rc.2) (blade driver unchanged since v0.3.0-rc.1) |
-| Blade OS | [mixtile-talos v0.3.0-rc.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.3.0-rc.1) |
-| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.1.0-rc.6](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0-rc.6) |
+| Blade driver, BMC module | [pcie-ep-net v0.3.0](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.0) |
+| Blade OS | [mixtile-talos v0.3.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.3.0) |
+| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.1.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0) |
 
 ## Build
 

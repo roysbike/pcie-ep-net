@@ -5,6 +5,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-12
+
+First stable release of push mode. Same code as 0.3.0-rc.2. Part of
+OpenMIOP Stack v0.3.0 (with mixtile-talos v0.3.0 and ClusterBox
+firmware v0.1.0).
+
+### Tested
+
+On the lab Cluster Box (four Blade 3 on Talos v1.14.2 with
+mixtile-talos v0.3.0-rc.1, BMC on ClusterBox firmware v0.1.0-rc.6):
+
+- Cluster Box boot with `omi-rc` loaded by the firmware init: module
+  loaded at 45.1 s, all four blades active at 46.7 s; the blades' DNS
+  through the BMC gateway answered again the same second; NVMe live on
+  all four blades, etcd 3/3, no faulty DRBD resources.
+- Blade reset with `nodectl` 2.0-3: released, link down 32 ms later,
+  blade active again 14.5 s after the reset, node Ready in ~46 s.
+- iperf3 over `omi0`: one TCP stream 4.3-5.1 Gbit/s on all 12 ordered
+  pairs with no retransmits; 4 streams 8.1 Gbit/s; bidirectional
+  4 streams 6.9 + 7.0 Gbit/s; four senders at once (ring), 4 streams
+  each, 25.0 Gbit/s total.
+
 ## [0.3.0-rc.2] - 2026-10-12
 
 Cluster Box module fix only: `omi-rc` activates the blades right after
