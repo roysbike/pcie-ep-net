@@ -11,7 +11,7 @@ It is an independent implementation, not Mixtile's MIOP driver, and
 contains no Mixtile code or firmware. License: GPL-2.0-or-later
 ([LICENSE](LICENSE)).
 
-Current release: **v0.3.0** (protocol v4 framing between blades; push
+Current release: **v0.3.1** (protocol v4 framing between blades; push
 mode: the Cluster Box never reads a blade; blades reconnect without it). See
 [CHANGELOG.md](CHANGELOG.md) and [Compatible releases](#compatible-releases).
 
@@ -102,7 +102,7 @@ Gen3 x2.
 ### Cluster Box (BMC)
 
 Recommended: install the ClusterBox firmware
-[mixtile-clusterbox-mt7620a-openwrt v0.1.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0),
+[mixtile-clusterbox-mt7620a-openwrt v0.1.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.1),
 which loads `omi-rc` at boot (`kmod-omi-rc`) and falls back to the helper
 (`openmiop` package). Upgrade all blades to v0.3 first: the module leaves
 blades without push mode alone.
@@ -113,8 +113,8 @@ On other Cluster Box firmware, use the release asset
 
 ```sh
 sha256sum -c SHA256SUMS
-tar xzf openmiop-0.3.0-clusterbox-bmc-mipsel.tar.gz
-cd openmiop-0.3.0-clusterbox-bmc-mipsel
+tar xzf openmiop-0.3.1-clusterbox-bmc-mipsel.tar.gz
+cd openmiop-0.3.1-clusterbox-bmc-mipsel
 ssh <bmc> 'cat > /tmp/openmiop-rc' < openmiop-rc
 ssh <bmc> 'cat > /tmp/openmiop.init' < openmiop.init
 # as root on the BMC (prefix each command with sudo when logged in as a user):
@@ -138,7 +138,7 @@ configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
 ### Blade 3 with Debian or Ubuntu
 
 Install the DKMS package from the
-[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.0).
+[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.1).
 DKMS builds the module for the running kernel (6.1 or newer; the
 kernel's headers must be installed). CI installs it on Debian 12,
 Debian 13, Ubuntu 22.04 (HWE kernel) and Ubuntu 24.04 (arm64) and checks
@@ -148,7 +148,7 @@ that the module builds for each distribution kernel. On the Mixtile Debian
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-sudo apt install ./openmiop-dkms_0.3.0_all.deb
+sudo apt install ./openmiop-dkms_0.3.1_all.deb
 echo 10.20.0.<last octet of the management address>/24 | sudo tee /etc/openmiop.addr
 sudo reboot            # or: sudo systemctl start openmiop
 ```
@@ -289,12 +289,12 @@ in `docs/bench/`.
 
 ## Compatible releases
 
-| OpenMIOP Stack v0.3.0 | |
+| OpenMIOP Stack v0.3.1 | |
 | --- | --- |
 | Protocol | OpenMIOP v4 framing between blades, features `OMI_FEAT_DOORBELL`, `OMI_FEAT_MQ` negotiated per connection; push mode to the BMC |
-| Blade driver, BMC module | [pcie-ep-net v0.3.0](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.0) |
-| Blade OS | [mixtile-talos v0.3.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.3.0) |
-| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.1.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.0) |
+| Blade driver, BMC module | [pcie-ep-net v0.3.1](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.1) |
+| Blade OS | [mixtile-talos v0.3.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.3.0) (same blade driver) |
+| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.1.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.1) |
 
 ## Build
 

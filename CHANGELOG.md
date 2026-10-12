@@ -5,6 +5,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-12
+
+Patch release for the BMC module. The blade driver is unchanged from
+0.3.0. Part of OpenMIOP Stack v0.3.1 (with ClusterBox firmware v0.1.1;
+mixtile-talos v0.3.0 stays current).
+
+### Fixed
+
+- `omi-rc`: the control thread no longer keeps the BMC load average at
+  1.0. It slept between passes with `usleep_range()`, which is an
+  uninterruptible (D state) sleep; it now sleeps in `TASK_IDLE` for the
+  same 1-2 ms.
+
+### Tested
+
+On the lab Cluster Box (firmware v0.1.0-rc.6 with this `omi-rc` loaded
+by hand, four Blade 3 on mixtile-talos v0.3.0): `[omi-rc]` in `IW`
+instead of `DW`, load average 1.08 -> 0.27 within 2 min; all four blades
+active 1.7 s after `insmod`; `omi0` ping between all blades and the BMC;
+`nodectl reset` of a blade: released, link down 28 ms later, active
+again 10.9 s after, node Ready in 57 s.
+
 ## [0.3.0] - 2026-10-12
 
 First stable release of push mode. Same code as 0.3.0-rc.2. Part of
