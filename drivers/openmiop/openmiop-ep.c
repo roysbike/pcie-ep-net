@@ -156,6 +156,10 @@ static uint queues = OMI_MAX_QUEUES;
 module_param(queues, uint, 0444);
 MODULE_PARM_DESC(queues, "TX/RX queue pairs (1-4); peers with the same count use one ring per queue");
 
+static bool gw_pull = true;
+module_param(gw_pull, bool, 0444);
+MODULE_PARM_DESC(gw_pull, "Read Cluster Box gateway frames with an eDMA read channel when the Cluster Box offers it (off: it writes them into the BAR)");
+
 static bool autonomy = true;
 module_param(autonomy, bool, 0444);
 MODULE_PARM_DESC(autonomy, "After a fabric reset, reconnect to the peers of the last table without waiting for the Cluster Box helper");
@@ -181,6 +185,20 @@ MODULE_PARM_DESC(lanes, "Link width. 2 matches Blade 3 (the other two PHY lanes 
 #define EDMA_WR_CTRL_HI		0x204
 #define EDMA_WR_LLP_LO		0x21c
 #define EDMA_WR_LLP_HI		0x220
+/* Read engine: a read channel emits MemRd TLPs to the PCIe address in
+ * SAR and writes the completions to local DRAM at DAR. Same element
+ * format and status bit layout as the write engine.
+ */
+#define EDMA_RD_ENB		0x02c
+#define EDMA_RD_DOORBELL	0x030
+#define EDMA_RD_INT_STATUS	0x0a0
+#define EDMA_RD_INT_MASK	0x0a8
+#define EDMA_RD_INT_CLEAR	0x0ac
+#define EDMA_RD_LL_ERR		0x0c4
+#define EDMA_RD_CTRL_LO		0x300
+#define EDMA_RD_CTRL_HI		0x304
+#define EDMA_RD_LLP_LO		0x31c
+#define EDMA_RD_LLP_HI		0x320
 #define EDMA_CTRL_CB		BIT(0)
 #define EDMA_CTRL_TCB		BIT(1)
 #define EDMA_CTRL_LLP		BIT(2)
@@ -215,6 +233,7 @@ struct edma_lli {
 #define OMI_LL_MAX		256	/* data + head + doorbell elements per run */
 #define OMI_MAX_SEGS		(MAX_SKB_FRAGS + 1)
 #define OMI_MAX_CH		2	/* eDMA write channels we drive */
+#define OMI_GW_PULL_BATCH	16	/* gateway slots per read run */
 
 /* Local scratch at OMI_SCRATCH_OFF: per channel its two linked lists
  * and the head values they copy into peers, per queue the slot headers,
@@ -229,6 +248,8 @@ struct omi_scratch {
 	struct omi_chan_scratch ch[OMI_MAX_CH];
 	struct omi_slot_hdr txh[OMI_MAX_QUEUES][OMI_TXQ_SIZE];
 	u32 db[OMI_MAX_NODES][OMI_MAX_QUEUES];	/* doorbell value per peer, queue */
+	/* Gateway pull: read channel 0's list, one run at a time. */
+	struct edma_lli rd_ll[OMI_GW_PULL_BATCH + 1] __aligned(64);
 };
 
 /* One eDMA run: a contiguous range of one queue's entries and the slots
@@ -359,7 +380,7 @@ struct omi_tx_stats {			/* per channel: its TX thread */
 
 struct omi_rx_stats {			/* per RX queue: its NAPI */
 	u64_stats_t packets, bytes, p2p_packets, gw_packets, errors,
-		    dropped, resyncs, connects, polls;
+		    dropped, resyncs, connects, polls, gw_pulls, gw_pull_errors;
 	struct u64_stats_sync syncp;
 };
 
@@ -448,6 +469,7 @@ struct omi_ep {
 	/* TX */
 	u8 nq;				/* queues (TX and RX) */
 	u8 nch;				/* eDMA channels in use */
+	u8 nrd;				/* read channels in use: 0 or 1 (gw_pull) */
 	spinlock_t tx_lock;		/* peer state; before any txq lock */
 	u8 up_mask;			/* peers in OMI_PEER_UP, not stalled */
 	struct omi_txq txq[OMI_MAX_QUEUES];
@@ -1008,6 +1030,21 @@ static void edma_init(struct omi_ep *ep)
 	edma_set_mask(ep);
 	writel(readl(ep->edma + EDMA_WR_LL_ERR) | GENMASK(ep->nch - 1, 0),
 	       ep->edma + EDMA_WR_LL_ERR);
+	/* Read channels: bits 19:16. Channel 0 pulls gateway frames, polled:
+	 * all read interrupts stay masked.
+	 */
+	ep->nrd = gw_pull && ((ctrl >> 16) & 0xf) ? 1 : 0;
+	writel(GENMASK(23, 16) | GENMASK(7, 0), ep->edma + EDMA_RD_INT_MASK);
+	if (ep->nrd)
+		writel(readl(ep->edma + EDMA_RD_LL_ERR) | BIT(0), ep->edma + EDMA_RD_LL_ERR);
+}
+
+static void edma_rd_reset(struct omi_ep *ep)
+{
+	writel(0, ep->edma + EDMA_RD_ENB);
+	udelay(10);
+	writel(EDMA_CH_BITS(0), ep->edma + EDMA_RD_INT_CLEAR);
+	writel(BIT(0), ep->edma + EDMA_RD_ENB);
 }
 
 /* After an abort or timeout: stop the engine and start it again. A run
@@ -2050,6 +2087,72 @@ static int rx_ring(struct omi_rxq *rxq, unsigned int r, int budget)
 	return done;
 }
 
+/*
+ * Gateway pull: copy the frames of the OMI_GW_PULL slots in [from, to)
+ * from the RC's pull ring into the same slots of our BAR, with read
+ * channel 0 in one polled run. The RC already wrote the slot headers
+ * here. False if the run failed; the caller drops those frames.
+ */
+static bool gw_pull_run(struct omi_ep *ep, u32 from, u32 to)
+{
+	struct edma_lli *ll = ep->scratch->rd_ll;
+	dma_addr_t ll_dma = ep->scratch_dma + offsetof(struct omi_scratch, rd_ll);
+	void __iomem *dma = ep->edma;
+	u64 ring;
+	u32 i;
+	int n = 0;
+
+	bar_inval(ep, BAR_OFF(ctl), sizeof(struct omi_ctl));
+	ring = (u64)READ_ONCE(ep->bar->ctl.gwp_ring_hi) << 32 |
+	       READ_ONCE(ep->bar->ctl.gwp_ring_lo);
+	for (i = from; i != to; i++) {
+		unsigned int off = gw_slot_off(true, i);
+		struct omi_slot_hdr *h = ep->cpu + off;
+		u32 len = READ_ONCE(h->len);
+
+		if (!(READ_ONCE(h->flags) & OMI_GW_PULL) ||
+		    len < ETH_HLEN || len > OMI_GW_DATA)
+			continue;
+		if (!ring)
+			return false;
+		ll_data(&ll[n++], true, len,
+			ring + (off - gw_slot_off(true, 0)) + sizeof(*h),
+			ep->dma + off + sizeof(*h));
+	}
+	if (!n)
+		return true;
+	ll[n - 1].control |= EDMA_CTRL_LIE;
+	ll_link(&ll[n], false, ll_dma);
+	dma_sync_single_for_device(ep->dev, ll_dma, (n + 1) * sizeof(*ll), DMA_TO_DEVICE);
+
+	writel(EDMA_CH_BITS(0), dma + EDMA_RD_INT_CLEAR);
+	writel(BIT(0), dma + EDMA_RD_ENB);
+	writel(EDMA_CTRL_CCS | EDMA_CTRL_LLE, dma + EDMA_RD_CTRL_LO);
+	writel(0, dma + EDMA_RD_CTRL_HI);
+	writel(lower_32_bits(ll_dma), dma + EDMA_RD_LLP_LO);
+	writel(upper_32_bits(ll_dma), dma + EDMA_RD_LLP_HI);
+	writel(0, dma + EDMA_RD_DOORBELL);
+
+	/* 16 slots of 9 KiB over the Cluster Box's Gen1 x1 take ~1 ms. */
+	for (i = 0; i < 20050; i++) {
+		u32 st = readl(dma + EDMA_RD_INT_STATUS);
+
+		if (st & EDMA_CH_ABORT(0))
+			break;
+		if (st & EDMA_CH_DONE(0)) {
+			writel(EDMA_CH_DONE(0), dma + EDMA_RD_INT_CLEAR);
+			return true;
+		}
+		if (i < 50)
+			cpu_relax();
+		else
+			udelay(1);
+	}
+	edma_rd_reset(ep);
+	dev_err_ratelimited(ep->dev, "gateway pull of %d frames failed\n", n);
+	return false;
+}
+
 static int gw_rx(struct omi_rxq *rxq, int budget)
 {
 	struct omi_ep *ep = rxq->ep;
@@ -2064,20 +2167,32 @@ static int gw_rx(struct omi_rxq *rxq, int budget)
 		omi_inc(&rxq->rs, resyncs);
 	}
 	while (ep->gw_rx_tail != head && done < budget) {
-		unsigned int off = gw_slot_off(true, ep->gw_rx_tail);
-		struct omi_slot_hdr *h = ep->cpu + off;
-		u32 len;
+		u32 end = ep->gw_rx_tail + min3(head - ep->gw_rx_tail, (u32)(budget - done),
+						(u32)OMI_GW_PULL_BATCH);
+		bool pulled = true;
+		u32 i;
 
-		bar_inval(ep, off, sizeof(*h));
-		len = READ_ONCE(h->len);
-		if (len < ETH_HLEN || len > OMI_GW_DATA) {
-			omi_inc(&rxq->rs, errors);
-		} else {
-			bar_inval(ep, off + sizeof(*h), len);
-			rx_deliver(rxq, h, len, OMI_FDB_GW, false);
+		for (i = ep->gw_rx_tail; i != end; i++)
+			bar_inval(ep, gw_slot_off(true, i), sizeof(struct omi_slot_hdr));
+		if (ep->nrd)
+			pulled = gw_pull_run(ep, ep->gw_rx_tail, end);
+		for (; ep->gw_rx_tail != end; ep->gw_rx_tail++, done++) {
+			unsigned int off = gw_slot_off(true, ep->gw_rx_tail);
+			struct omi_slot_hdr *h = ep->cpu + off;
+			u32 len = READ_ONCE(h->len);
+			bool pull = READ_ONCE(h->flags) & OMI_GW_PULL;
+
+			if (len < ETH_HLEN || len > OMI_GW_DATA) {
+				omi_inc(&rxq->rs, errors);
+			} else if (pull && !pulled) {
+				omi_inc(&rxq->rs, gw_pull_errors);
+			} else {
+				if (pull)
+					omi_inc(&rxq->rs, gw_pulls);
+				bar_inval(ep, off + sizeof(*h), len);
+				rx_deliver(rxq, h, len, OMI_FDB_GW, false);
+			}
 		}
-		ep->gw_rx_tail++;
-		done++;
 	}
 	if (done) {
 		struct omi_peer *rc = &ep->peer[OMI_RC_NODE];
@@ -3099,6 +3214,8 @@ static const struct {
 	OMI_STAT("rx_resyncs", OMI_RS, struct omi_rx_stats, resyncs),
 	OMI_STAT("rx_connects", OMI_RS, struct omi_rx_stats, connects),
 	OMI_STAT("rx_napi_polls", OMI_RS, struct omi_rx_stats, polls),
+	OMI_STAT("rx_gw_pulls", OMI_RS, struct omi_rx_stats, gw_pulls),
+	OMI_STAT("rx_gw_pull_errors", OMI_RS, struct omi_rx_stats, gw_pull_errors),
 	OMI_STAT("ctl_poll_cycles", OMI_CS, struct omi_ctl_stats, poll_cycles),
 	OMI_STAT("ctl_napi_kicks", OMI_CS, struct omi_ctl_stats, napi_kicks),
 	OMI_STAT("ctl_table_updates", OMI_CS, struct omi_ctl_stats, table_updates),
@@ -3856,6 +3973,8 @@ static int openmiop_probe(struct platform_device *pdev)
 	}
 	if (ep->edma) {
 		ep->bar->hdr.features |= OMI_HDR_GW2;
+		if (ep->nrd)
+			ep->bar->hdr.features |= OMI_HDR_GW_PULL;
 		hdr_publish(ep);
 		ep->ob = ioremap(ep->ob_phys, (size_t)OMI_MAX_NODES * OPENMIOP_BAR_SIZE);
 		if (!ep->ob)

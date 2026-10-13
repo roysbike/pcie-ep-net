@@ -57,6 +57,10 @@ static uint idle_us = 1000;
 module_param(idle_us, uint, 0644);
 MODULE_PARM_DESC(idle_us, "Gateway poll period when idle, us");
 
+static bool pull = true;
+module_param(pull, bool, 0444);
+MODULE_PARM_DESC(pull, "Let blades that can read gateway frames from our memory with their eDMA (off: copy every frame into the blade BAR)");
+
 static uint link_stable_ms = 1500;
 module_param(link_stable_ms, uint, 0644);
 MODULE_PARM_DESC(link_stable_ms, "A blade's link must be up this long before we touch it");
@@ -107,6 +111,9 @@ struct rc_ep {
 	void *area;			/* our memory it pushes into */
 	dma_addr_t area_dma;
 	size_t area_size;
+	void *pull_ring;		/* RC->EP slots the blade reads (OMI_GW_PULL) */
+	dma_addr_t pull_dma;
+	bool pull_on;			/* active blade reads them */
 	u32 token;
 	u32 epoch;
 	u8 mac[ETH_ALEN];
@@ -227,7 +234,20 @@ static bool tx_ep(struct rc_ep *e, const void *data, u32 len, u32 flags)
 	if (e->rc_head - rc_credit(e) >= OMI_GW_SLOTS)
 		goto out;
 	slot = rc_slot(e, e->rc_head);
-	memcpy_toio(slot + sizeof(struct omi_slot_hdr), data, len);
+	if (e->pull_on) {
+		/* Only the header goes over MMIO; the blade's eDMA reads the
+		 * frame from our memory. Cleaned before the head store.
+		 */
+		size_t off = (e->rc_head & (OMI_GW_SLOTS - 1)) * OMI_GW_SLOT +
+			     sizeof(struct omi_slot_hdr);
+
+		memcpy(e->pull_ring + off, data, len);
+		dma_sync_single_range_for_device(area_dev(e), e->pull_dma, off, len,
+						 DMA_TO_DEVICE);
+		flags |= OMI_GW_PULL;
+	} else {
+		memcpy_toio(slot + sizeof(struct omi_slot_hdr), data, len);
+	}
 	writel(flags, slot + offsetof(struct omi_slot_hdr, flags));
 	writel(0, slot + offsetof(struct omi_slot_hdr, mask));
 	writel(len, slot + offsetof(struct omi_slot_hdr, len));
@@ -510,6 +530,34 @@ static int ep_area(struct rc_ep *e)
 	return 0;
 }
 
+#define PULL_SIZE	(OMI_GW_SLOTS * OMI_GW_SLOT)
+
+/* Our copy of the RC->EP slots. Optional: without it frames go over MMIO. */
+static void ep_pull_ring(struct rc_ep *e)
+{
+	struct device *dev = area_dev(e);
+
+	if (!pull || e->pull_ring)
+		return;
+	e->pull_ring = alloc_pages_exact(PULL_SIZE, GFP_KERNEL);
+	if (!e->pull_ring)
+		return;
+	e->pull_dma = dma_map_single(dev, e->pull_ring, PULL_SIZE, DMA_TO_DEVICE);
+	if (dma_mapping_error(dev, e->pull_dma)) {
+		free_pages_exact(e->pull_ring, PULL_SIZE);
+		e->pull_ring = NULL;
+	}
+}
+
+static void ep_pull_free(struct rc_ep *e)
+{
+	if (!e->pull_ring)
+		return;
+	dma_unmap_single(area_dev(e), e->pull_dma, PULL_SIZE, DMA_TO_DEVICE);
+	free_pages_exact(e->pull_ring, PULL_SIZE);
+	e->pull_ring = NULL;
+}
+
 /*
  * Push-mode offer, posted writes into its BAR: the gateway v2 ring and
  * state line in our memory, acked in tx_cons[OMI_RC_NODE] first, token
@@ -539,6 +587,8 @@ static void ep_offer(struct rc_ep *e)
 	writel(upper_32_bits(e->area_dma), b + CTL_OFF(gw2_ring_hi));
 	writel(slots, b + CTL_OFF(gw2_slots));
 	writel(GW2_SLOT, b + CTL_OFF(gw2_slot_size));
+	writel(e->pull_ring ? lower_32_bits(e->pull_dma) : 0, b + CTL_OFF(gwp_ring_lo));
+	writel(e->pull_ring ? upper_32_bits(e->pull_dma) : 0, b + CTL_OFF(gwp_ring_hi));
 	writel(token, b + CTL_OFF(gw2_token));
 	writel(OMI_RC_PUSH, b + CTL_OFF(flags));
 	e->offer_at = jiffies;
@@ -556,6 +606,7 @@ static void ep_activate(struct rc_ep *e, struct omi_gw2_ep *st)
 	e->db_data = READ_ONCE(st->db_data);
 	if (e->db_off & 3 || e->db_off > OPENMIOP_BAR_SIZE - 4)
 		e->features &= ~OMI_HDR_DOORBELL;
+	e->pull_on = e->pull_ring && (e->features & OMI_HDR_GW_PULL);
 	e->rc_head = e->rc_tail = READ_ONCE(st->rc_tail);
 	e->last_seq = READ_ONCE(st->seq);
 	e->seen_at = jiffies;
@@ -570,9 +621,10 @@ static void ep_activate(struct rc_ep *e, struct omi_gw2_ep *st)
 	spin_unlock_bh(&e->txlock);
 	e->state = RS_ACTIVE;
 	rc->tables_dirty = true;
-	netdev_info(rc->ndev, "node %u active: %pM, BAR %#llx, epoch %#x%s\n", e->node, e->mac,
+	netdev_info(rc->ndev, "node %u active: %pM, BAR %#llx, epoch %#x%s%s\n", e->node, e->mac,
 		    (u64)e->bar_pci, e->epoch,
-		    e->features & OMI_HDR_DOORBELL ? ", doorbell" : "");
+		    e->features & OMI_HDR_DOORBELL ? ", doorbell" : "",
+		    e->pull_on ? ", gateway pull" : "");
 	napi_schedule(&rc->napi);
 }
 
@@ -725,6 +777,7 @@ static void ep_step(struct rc_ep *e)
 		}
 		if (ep_area(e))
 			return;
+		ep_pull_ring(e);
 		e->bar = ioremap(pci_resource_start(e->pdev, 0), OPENMIOP_BAR_SIZE);
 		if (!e->bar)
 			return;
@@ -960,6 +1013,7 @@ static void ep_release_all(void)
 		gw_off(e);
 		if (e->bar)
 			iounmap(e->bar);
+		ep_pull_free(e);
 		if (e->area) {
 			dma_unmap_single(area_dev(e), e->area_dma, e->area_size, DMA_BIDIRECTIONAL);
 			free_pages_exact(e->area, e->area_size);
