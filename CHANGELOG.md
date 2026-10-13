@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `omi-rc` builds with Linux 6.1 and later (`netif_napi_add()` lost its
+  weight argument), for ClusterBox firmware on OpenWrt 25.12 (Linux 6.12).
+
 ## [0.5.0] - 2026-10-14
 
 OpenMIOP Stack v0.5.0 (with mixtile-talos v0.5.0 and ClusterBox firmware
