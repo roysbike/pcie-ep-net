@@ -17,6 +17,10 @@ Current release: **v0.3.1** (protocol v4 framing between blades; push
 mode: the Cluster Box never reads a blade; blades reconnect without it). See
 [CHANGELOG.md](CHANGELOG.md) and [Compatible releases](#compatible-releases).
 
+Release candidate: **v0.4.0-rc.1**: blades read Cluster Box to blade
+gateway traffic with their eDMA ("gateway pull"), ~1.5x faster
+([release notes](docs/release-notes/v0.4.0-rc.1.md)).
+
 ## Hardware and who this is for
 
 The **Mixtile Cluster Box** is a small chassis for four **Mixtile Blade 3**
@@ -292,7 +296,7 @@ links Gen3 x2.
 | Talos ↔ Talos | 6.48 / 6.73 Gbit/s |
 | SHA-256 integrity | 1 GiB and 512 MiB transfers in all tested directions identical |
 | Five-member matrix | ping + jumbo between all members, IPv6 `ff02::1` |
-| Blade ↔ BMC gateway | management-grade, ~12 Mbit/s towards the BMC |
+| Blade ↔ BMC gateway (v0.3.0 / v0.4.0-rc.1) | blade → BMC ~320 Mbit/s; BMC → blade 130 / 204 Mbit/s (BMC CPU-bound) |
 
 Full list and recovery tests: [CHANGELOG.md](CHANGELOG.md), raw reports
 in `docs/bench/`.
@@ -313,7 +317,8 @@ in `docs/bench/`.
   a blade that disappears without the leave handshake (crash, power
   loss) can race a BMC read and wedge the fabric until the BMC reboots;
   `omi-rc` never reads a blade.
-* The BMC gateway is slow (management only).
+* The BMC gateway is limited by the MT7620A CPU: ~140-150 Mbit/s from
+  the LAN or internet to a blade with gateway pull (v0.4), ~90 without.
 * Not tested: more than four blades, MPS other than 128/256, helper
   restart under load with four endpoints.
 

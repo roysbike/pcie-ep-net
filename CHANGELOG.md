@@ -5,6 +5,42 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0-rc.1] - 2026-10-13
+
+Gateway pull: blades read Cluster Box to blade gateway frames with their
+eDMA instead of the BMC writing them over MMIO. Part of OpenMIOP Stack
+v0.4.0-rc.1 (with mixtile-talos v0.4.0-rc.1 and ClusterBox firmware
+v0.2.0-rc.1). Protocol stays v4; the feature is negotiated.
+
+### Added
+
+- `OMI_HDR_GW_PULL` (header feature), `omi_ctl.gwp_ring_lo/hi` and slot
+  flag `OMI_GW_PULL`: `omi-rc` keeps each blade's RC->EP slots in its
+  own memory and writes only the slot header and head into the blade's
+  BAR; the blade copies the frame with an eDMA read channel. See
+  `docs/push-mode.md`.
+- `openmiop-ep`: module parameter `gw_pull` (default on); counters
+  `rx_gw_pulls`, `rx_gw_pull_errors`.
+- `omi-rc`: module parameter `pull` (default on); "gateway pull" in the
+  `node N active` line.
+
+### Tested
+
+On the lab Cluster Box (BMC on firmware v0.1.1 with this `omi-rc`
+loaded by hand, .108 on a mixtile-talos test image with this driver,
+the other three blades on mixtile-talos v0.3.0), measured at the same
+time against a v0.3.0 blade:
+
+| | gateway pull | v0.3.0 (MMIO) |
+| --- | --- | --- |
+| BMC -> blade, iperf3 on the BMC | 204 Mbit/s | 130 Mbit/s |
+| LAN -> blade through the BMC (NAT, flow offloading) | 141-145 Mbit/s | 92-95 Mbit/s |
+| Internet -> blade | 152-155 Mbit/s | 97-106 Mbit/s |
+| Blade -> LAN | 264-272 Mbit/s | 267-276 Mbit/s |
+
+444 158 frames pulled, 0 pull errors, 0 bad lengths. Blades on v0.3.0
+kept working with this `omi-rc` (MMIO path).
+
 ## [0.3.1] - 2026-10-12
 
 Patch release for the BMC module. The blade driver is unchanged from

@@ -72,6 +72,34 @@ BMC to blade uses the v1 gateway ring in the blade's BAR (posted writes,
 then the blade's doorbell); the blade reports progress in `rc_tail` of
 the area.
 
+### Gateway pull (v0.4)
+
+Writing frames into a blade's BAR costs the MT7620A one uncached 32-bit
+PCIe write per word: BMC to blade stopped at ~90-130 Mbit/s with the BMC
+CPU at 99 %. With `OMI_HDR_GW_PULL` the blade fetches them instead:
+
+1. A blade with an eDMA read channel (RK3588: yes) sets
+   `OMI_HDR_GW_PULL` in its header features (module parameter
+   `gw_pull`, default on).
+2. `omi-rc` (parameter `pull`, default on) allocates per blade a copy of
+   the RC->EP slots in its own memory (`gw_slots` x `gw_slot_size`,
+   64 x 9280 bytes) and names it in the offer: `gwp_ring_lo/hi` in the
+   control line, written before `gw2_token`.
+3. For a blade that announced the feature, `omi-rc` copies a frame into
+   that ring slot (cached copy, then a cache clean of the frame), and
+   writes only the slot header, with `OMI_GW_PULL` in its flags, and
+   `rc_head` into the blade's BAR.
+4. The blade reads the frames of `OMI_GW_PULL` slots with read channel 0
+   into the same slots of its BAR, up to 16 slots per linked-list run,
+   polled (read interrupts stay masked), then delivers them as before
+   and reports `rc_tail` as before. A failed run drops those frames
+   (`rx_gw_pull_errors`) and resets the read engine.
+
+Old blades and an old `omi-rc` never meet an `OMI_GW_PULL` slot. Measured
+on the lab box on 2026-10-13: BMC to blade without NAT 130 ->
+204 Mbit/s, LAN to blade through the BMC's NAT 92 -> 143 Mbit/s; the BMC
+CPU is then the limit.
+
 ## Compatibility
 
 - A push-mode blade works with the userspace `openmiop-rc` as before:
