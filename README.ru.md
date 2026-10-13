@@ -12,16 +12,11 @@ BMC Cluster Box.
 Это независимая реализация, не драйвер MIOP от Mixtile; кода и прошивок
 Mixtile в ней нет. Лицензия: GPL-2.0-or-later ([LICENSE](LICENSE)).
 
-Текущий релиз: **v0.3.1** (протокол v4 между блейдами; push-режим: BMC
-никогда не читает память блейда, блейды переподключаются друг к другу
-без него). Подробности — в [CHANGELOG.md](CHANGELOG.md) и
+Текущий релиз: **v0.4.0** (протокол v4 между блейдами; push-режим: BMC
+никогда не читает память блейда; gateway pull: блейды сами забирают
+трафик от Cluster Box своим eDMA, примерно в 2 раза быстрее v0.3;
+[release notes](docs/release-notes/v0.4.0.md)). Подробности — в [CHANGELOG.md](CHANGELOG.md) и
 [совместимых релизах](README.md#compatible-releases).
-
-Релиз-кандидат: **v0.4.0-rc.2** — блейды сами забирают трафик от Cluster
-Box своим eDMA («gateway pull»), примерно в 1,5 раза быстрее
-([v0.4.0-rc.1](docs/release-notes/v0.4.0-rc.1.md)); в rc.2 исправлены
-ложные «зависания» пиров под нагрузкой, из-за которых блейд мог
-потерять шлюз ([release notes](docs/release-notes/v0.4.0-rc.2.md)).
 
 ## Оборудование и для кого это
 
@@ -65,9 +60,9 @@ Blade 3), которым нужно:
 
 | Где | Как |
 | --- | --- |
-| Cluster Box (BMC) | прошивка [mixtile-clusterbox-mt7620a-openwrt v0.1.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.1.1): `omi-rc` грузится при старте. На другой прошивке — архив `openmiop-<version>-clusterbox-bmc-mipsel.tar.gz`, см. [Install](README.md#install) |
-| Blade 3 с Talos | установщик [mixtile-talos v0.3.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.3.0): модуль уже встроен, собирать ничего не нужно |
-| Blade 3 с Debian/Ubuntu | DKMS-пакет из [релиза](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.3.1) (ядро 6.1+, заголовки ядра), затем адрес в `/etc/openmiop.addr` и перезагрузка, см. [Install](README.md#install) |
+| Cluster Box (BMC) | прошивка [mixtile-clusterbox-mt7620a-openwrt v0.2.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.2.0): `omi-rc` грузится при старте. На другой прошивке — архив `openmiop-<version>-clusterbox-bmc-mipsel.tar.gz`, см. [Install](README.md#install) |
+| Blade 3 с Talos | установщик [mixtile-talos v0.4.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.4.0): модуль уже встроен, собирать ничего не нужно |
+| Blade 3 с Debian/Ubuntu | DKMS-пакет из [релиза](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.4.0) (ядро 6.1+, заголовки ядра), затем адрес в `/etc/openmiop.addr` и перезагрузка, см. [Install](README.md#install) |
 
 Сначала обновите до v0.3 все блейды, потом BMC: модуль `omi-rc` не
 трогает блейды без push-режима. Адреса: BMC — 10.20.0.1/24, блейды —
