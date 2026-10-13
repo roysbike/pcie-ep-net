@@ -72,6 +72,12 @@
 
 /* Gateway slot flags (RC <-> EP). */
 #define OMI_GW_RELAYED		0x1u	/* RC copied this from another EP */
+/* RC -> EP (OMI_HDR_GW_PULL): the RC wrote only this slot header into
+ * the EP's BAR. The frame is at the same slot offset in the RC's pull
+ * ring (omi_ctl.gwp_ring_*), and the EP reads it with its eDMA before
+ * it uses the slot.
+ */
+#define OMI_GW_PULL		0x2u
 
 /* ---- 0x0000: header, written by the owning EP ---- */
 struct omi_hdr {
@@ -96,6 +102,7 @@ struct omi_hdr {
 /* omi_hdr.features. A v0.1 endpoint leaves them zero. */
 #define OMI_HDR_DOORBELL	0x1u	/* the RC may ring db_off with db_data */
 #define OMI_HDR_GW2		0x2u	/* takes an omi_ctl gateway v2 offer */
+#define OMI_HDR_GW_PULL		0x4u	/* reads OMI_GW_PULL slots from the RC */
 
 /* ---- 0x0040: control, written by the RC ---- */
 struct omi_ctl {
@@ -118,7 +125,14 @@ struct omi_ctl {
 	__u32 gw2_ring_hi;
 	__u32 gw2_slots;	/* power of two */
 	__u32 gw2_slot_size;	/* bytes per slot incl. omi_slot_hdr */
-	__u8 pad[20];
+	/* Gateway pull (OMI_HDR_GW_PULL): PCI address of the RC's copy of
+	 * the RC->EP slots, same geometry as in the EP's BAR (gw_slots
+	 * slots of gw_slot_size). Written before the first OMI_GW_PULL
+	 * slot; 0: none.
+	 */
+	__u32 gwp_ring_lo;
+	__u32 gwp_ring_hi;
+	__u8 pad[12];
 };
 
 /*
