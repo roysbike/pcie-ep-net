@@ -5,6 +5,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-14
+
+OpenMIOP Stack v0.5.0 (with mixtile-talos v0.5.0 and ClusterBox firmware
+v0.3.0). Protocol v4 unchanged; the new feature is negotiated.
+
+### Added
+
+- Gateway zero-copy (`OMI_HDR_GW_ZC`, slot flag `OMI_GW_ZC`): a pulling
+  blade reads unicast frames from the Cluster Box's stack straight from
+  the skb; `omi-rc` no longer copies them into the pull ring. The frame's
+  32-bit bus address goes in the slot header's `mask` field; the skb is
+  freed when the blade's `rc_tail` passes the slot. Broadcast, multicast
+  and blade-to-blade relays are still copied. Parameters `zc` (`omi-rc`)
+  and `gw_zc` (blade), counter `rx_gw_zc`. Negotiated: older blades and
+  BMCs keep the copy path.
+
 ## [0.4.0] - 2026-10-13
 
 Stable release of OpenMIOP Stack v0.4.0 (with mixtile-talos v0.4.0 and
