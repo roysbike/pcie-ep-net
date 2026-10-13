@@ -349,6 +349,7 @@ struct omi_peer {
 	u64 ring_pci;			/* PCI address of our ring 0 there */
 	u64 prod_pci;			/* PCI address of our omi_prod line there */
 	unsigned long full_since;
+	u32 seen_tail;			/* sum of tails at the last peers_poll() */
 	struct omi_peer_txq tq[OMI_MAX_QUEUES];
 
 	/* NAPI of queue 0 */
@@ -2390,6 +2391,9 @@ static void peer_reconnect(struct omi_ep *ep, unsigned int p)
 	struct omi_peer *pr = &ep->peer[p];
 	u32 token;
 
+	/* The RC is no blade: no rx_prod line in its ring area. */
+	if (p == OMI_RC_NODE)
+		return;
 	spin_lock_bh(&ep->tx_lock);
 	if (pr->state != OMI_PEER_UP || !pr->stalled) {
 		spin_unlock_bh(&ep->tx_lock);
@@ -2625,32 +2629,45 @@ static void peers_poll(struct omi_ep *ep)
 	txq_lock_all(ep);
 	for (p = 0; p < OMI_MAX_NODES; p++) {
 		struct omi_peer *pr = &ep->peer[p];
-		u32 old = 0, now = 0;
-		bool full = false;
+		u32 now = 0;
+		bool full = false, empty = true, moved;
 
 		if (pr->state != OMI_PEER_UP)
 			continue;
 		for (q = 0; q < pr->nq; q++) {
-			old += pr->tq[q].tail;
 			peer_refresh_tail(ep, p, q);
 			now += pr->tq[q].tail;
+			empty &= pr->tq[q].head == pr->tq[q].tail;
 			/* Same test as xmit uses to stop the queue: once a
 			 * peer has no room, nothing reaches the TX thread any
 			 * more, so the stall has to be seen here.
 			 */
 			full |= peer_q_full(ep, p, q);
 		}
+		/* Progress since the last pass, not since the refresh above:
+		 * the TX thread picks up credit too (a ring that looks full),
+		 * so under load this pass would never see the tail move. An
+		 * empty ring means the peer read all we sent: it is alive,
+		 * we are the slow side.
+		 */
+		moved = now != pr->seen_tail || empty;
+		pr->seen_tail = now;
 		if (pr->stalled) {
-			if (now != old) {
+			if (moved) {
 				pr->stalled = false;
 				pr->full_since = 0;
 				WRITE_ONCE(ep->up_mask, ep->up_mask | BIT(p));
-			} else if (time_after(jiffies, pr->full_since + OMI_STALL_RECONNECT)) {
+			} else if (p != OMI_RC_NODE &&
+				   time_after(jiffies, pr->full_since + OMI_STALL_RECONNECT)) {
+				/* Not the RC: it drains its ring on its own
+				 * when it has the CPU, and a new offer
+				 * (rc_gw2_poll()) is how it starts over.
+				 */
 				reconnect |= BIT(p);
 			}
 			continue;
 		}
-		if (full && now == old) {
+		if (full && !moved) {
 			if (!pr->full_since) {
 				pr->full_since = jiffies | 1;
 			} else if (time_after(jiffies, pr->full_since + OMI_STALL_TIMEOUT)) {
@@ -2730,10 +2747,12 @@ static void rc_gw2_poll(struct omi_ep *ep, bool up)
 	WRITE_ONCE(pr->slot_size, size);
 	pr->ring_pci = ring + OMI_GW2_SLOT0;
 	pr->prod_pci = ring;
-	for (q = 0; q < OMI_MAX_QUEUES; q++) {
-		pr->tq[q].head = 0;
-		pr->tq[q].tail = q ? 0 : READ_ONCE(c->tail);
-	}
+	/* Go on where the RC's credit is: 0 after a new offer, its tail
+	 * if the peer only went down. A head of 0 against an old tail
+	 * would look like a full ring forever.
+	 */
+	for (q = 0; q < OMI_MAX_QUEUES; q++)
+		pr->tq[q].head = pr->tq[q].tail = q ? 0 : READ_ONCE(c->tail);
 	WRITE_ONCE(pr->db_ok, false);
 	pr->state = OMI_PEER_UP;
 	WRITE_ONCE(ep->up_mask, ep->up_mask | BIT(OMI_RC_NODE));

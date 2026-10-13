@@ -336,7 +336,14 @@ static int rx_ep(struct rc_ep *e, int budget)
 	dma_sync_single_range_for_device(dev, e->area_dma, 0, sizeof(*prod), DMA_BIDIRECTIONAL);
 	avail = head - e->tail;
 	if (avail > n) {
-		e->tail = head;		/* garbage, or a new ring: resync */
+		/* Garbage, or a new ring: resync, and tell the blade, which
+		 * may wait for this credit with a full ring.
+		 */
+		net_warn_ratelimited("%s: node %u: gateway ring head %u, tail %u: resync\n",
+				     ndev->name, e->node, head, e->tail);
+		ndev->stats.rx_fifo_errors++;
+		e->tail = head;
+		writel(e->tail, e->bar + BAR_OFF(tx_cons[OMI_RC_NODE].tail));
 		return 0;
 	}
 	while (avail && done < budget) {
