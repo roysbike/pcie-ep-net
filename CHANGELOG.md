@@ -5,6 +5,34 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-13
+
+Stable release of OpenMIOP Stack v0.4.0 (with mixtile-talos v0.4.0 and
+ClusterBox firmware v0.2.0). Same code as 0.4.0-rc.2; this entry sums up
+0.4.0-rc.1 and 0.4.0-rc.2. Protocol v4 unchanged; gateway pull is
+negotiated, so v0.3.x blades and BMCs keep working with v0.4.0.
+
+### Added
+
+- Gateway pull (`OMI_HDR_GW_PULL`): blades read Cluster Box to blade
+  gateway frames from BMC memory with an eDMA read channel; LAN -> blade
+  through the BMC 92 -> 193-198 Mbit/s, BMC -> blade 130 -> 189-204
+  Mbit/s. Module parameters `gw_pull` (blade) and `pull` (`omi-rc`).
+
+### Fixed
+
+- False peer stalls under load and the gateway v2 reconnect deadlock that
+  could cut a blade off the gateway (0.4.0-rc.2).
+- `omi-rc` writes the credit when it resyncs a blade's gateway ring, logs
+  a warning, counts `rx_fifo_errors` (0.4.0-rc.2).
+
+### Known
+
+- When a blade reconnects, `omi-rc` may log two harmless
+  `gateway ring head ..., tail ...: resync` warnings (a stale head from the
+  previous connection in its ring area); the credit write keeps the ring
+  moving.
+
 ## [0.4.0-rc.2] - 2026-10-13
 
 Fixes found in the v0.4.0-rc.1 gateway soak. Part of OpenMIOP Stack
