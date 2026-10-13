@@ -5,6 +5,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Gateway v2 (blade -> BMC ring in BMC memory): a blade no longer
+  reconnects to the RC when the RC is slow to drain its ring (Cluster
+  Box CPU at 99 % under a long upload). The reconnect sent a blade
+  connect line into the RC's ring area (into slot 0) and came back up
+  with head 0 against the RC's old tail, so the ring looked full
+  forever: the blade lost the gateway (no LAN, internet, DNS, NTP over
+  omi0) and logged "peer 7 stalled, connecting again" every 2 s until
+  `omi-rc` was reloaded. A stalled RC now recovers by itself as soon as
+  it consumes again; a new offer is the only way to start over.
+- When the RC peer comes up again it continues at the RC's credit
+  instead of head 0.
+- `omi-rc`: when it resyncs a blade's ring (head out of range), it
+  writes the new credit to the blade at once, so a blade waiting for
+  credit with a full ring (also older blades with the bug above) gets
+  unstuck.
+
 ## [0.4.0-rc.1] - 2026-10-13
 
 Gateway pull: blades read Cluster Box to blade gateway frames with their
