@@ -17,9 +17,11 @@ Current release: **v0.3.1** (protocol v4 framing between blades; push
 mode: the Cluster Box never reads a blade; blades reconnect without it). See
 [CHANGELOG.md](CHANGELOG.md) and [Compatible releases](#compatible-releases).
 
-Release candidate: **v0.4.0-rc.1**: blades read Cluster Box to blade
+Release candidate: **v0.4.0-rc.2**: blades read Cluster Box to blade
 gateway traffic with their eDMA ("gateway pull"), ~1.5x faster
-([release notes](docs/release-notes/v0.4.0-rc.1.md)).
+([v0.4.0-rc.1](docs/release-notes/v0.4.0-rc.1.md)); rc.2 fixes false
+peer stalls under load that could cut a blade off the gateway
+([release notes](docs/release-notes/v0.4.0-rc.2.md)).
 
 ## Hardware and who this is for
 

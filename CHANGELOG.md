@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0-rc.2] - 2026-10-13
+
+Fixes found in the v0.4.0-rc.1 gateway soak. Part of OpenMIOP Stack
+v0.4.0-rc.2 (with mixtile-talos v0.4.0-rc.2 and ClusterBox firmware
+v0.2.0-rc.2). Protocol unchanged (v4).
+
 ### Fixed
 
 - False peer stalls under load: `peers_poll()` called a peer stalled

@@ -17,9 +17,11 @@ Mixtile в ней нет. Лицензия: GPL-2.0-or-later ([LICENSE](LICENSE)
 без него). Подробности — в [CHANGELOG.md](CHANGELOG.md) и
 [совместимых релизах](README.md#compatible-releases).
 
-Релиз-кандидат: **v0.4.0-rc.1** — блейды сами забирают трафик от Cluster
+Релиз-кандидат: **v0.4.0-rc.2** — блейды сами забирают трафик от Cluster
 Box своим eDMA («gateway pull»), примерно в 1,5 раза быстрее
-([release notes](docs/release-notes/v0.4.0-rc.1.md)).
+([v0.4.0-rc.1](docs/release-notes/v0.4.0-rc.1.md)); в rc.2 исправлены
+ложные «зависания» пиров под нагрузкой, из-за которых блейд мог
+потерять шлюз ([release notes](docs/release-notes/v0.4.0-rc.2.md)).
 
 ## Оборудование и для кого это
 
