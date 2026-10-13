@@ -160,6 +160,10 @@ static bool gw_pull = true;
 module_param(gw_pull, bool, 0444);
 MODULE_PARM_DESC(gw_pull, "Read Cluster Box gateway frames with an eDMA read channel when the Cluster Box offers it (off: it writes them into the BAR)");
 
+static bool gw_zc = true;
+module_param(gw_zc, bool, 0444);
+MODULE_PARM_DESC(gw_zc, "With gw_pull: also read frames straight from the Cluster Box's buffers (zero-copy on the BMC)");
+
 static bool autonomy = true;
 module_param(autonomy, bool, 0444);
 MODULE_PARM_DESC(autonomy, "After a fabric reset, reconnect to the peers of the last table without waiting for the Cluster Box helper");
@@ -381,7 +385,7 @@ struct omi_tx_stats {			/* per channel: its TX thread */
 
 struct omi_rx_stats {			/* per RX queue: its NAPI */
 	u64_stats_t packets, bytes, p2p_packets, gw_packets, errors,
-		    dropped, resyncs, connects, polls, gw_pulls, gw_pull_errors;
+		    dropped, resyncs, connects, polls, gw_pulls, gw_pull_errors, gw_zc;
 	struct u64_stats_sync syncp;
 };
 
@@ -2090,9 +2094,10 @@ static int rx_ring(struct omi_rxq *rxq, unsigned int r, int budget)
 
 /*
  * Gateway pull: copy the frames of the OMI_GW_PULL slots in [from, to)
- * from the RC's pull ring into the same slots of our BAR, with read
- * channel 0 in one polled run. The RC already wrote the slot headers
- * here. False if the run failed; the caller drops those frames.
+ * from the RC's pull ring (OMI_GW_ZC: from the RC buffer whose bus
+ * address is in the slot's mask) into the same slots of our BAR, with
+ * read channel 0 in one polled run. The RC already wrote the slot
+ * headers here. False if the run failed; the caller drops those frames.
  */
 static bool gw_pull_run(struct omi_ep *ep, u32 from, u32 to)
 {
@@ -2111,14 +2116,21 @@ static bool gw_pull_run(struct omi_ep *ep, u32 from, u32 to)
 		struct omi_slot_hdr *h = ep->cpu + off;
 		u32 len = READ_ONCE(h->len);
 
-		if (!(READ_ONCE(h->flags) & OMI_GW_PULL) ||
-		    len < ETH_HLEN || len > OMI_GW_DATA)
+		u32 flags = READ_ONCE(h->flags);
+		u64 src;
+
+		if (!(flags & OMI_GW_PULL) || len < ETH_HLEN || len > OMI_GW_DATA)
 			continue;
-		if (!ring)
-			return false;
-		ll_data(&ll[n++], true, len,
-			ring + (off - gw_slot_off(true, 0)) + sizeof(*h),
-			ep->dma + off + sizeof(*h));
+		if (flags & OMI_GW_ZC) {
+			src = READ_ONCE(h->mask);
+			if (!src)
+				return false;
+		} else {
+			if (!ring)
+				return false;
+			src = ring + (off - gw_slot_off(true, 0)) + sizeof(*h);
+		}
+		ll_data(&ll[n++], true, len, src, ep->dma + off + sizeof(*h));
 	}
 	if (!n)
 		return true;
@@ -2190,6 +2202,8 @@ static int gw_rx(struct omi_rxq *rxq, int budget)
 			} else {
 				if (pull)
 					omi_inc(&rxq->rs, gw_pulls);
+				if (READ_ONCE(h->flags) & OMI_GW_ZC)
+					omi_inc(&rxq->rs, gw_zc);
 				bar_inval(ep, off + sizeof(*h), len);
 				rx_deliver(rxq, h, len, OMI_FDB_GW, false);
 			}
@@ -3235,6 +3249,7 @@ static const struct {
 	OMI_STAT("rx_napi_polls", OMI_RS, struct omi_rx_stats, polls),
 	OMI_STAT("rx_gw_pulls", OMI_RS, struct omi_rx_stats, gw_pulls),
 	OMI_STAT("rx_gw_pull_errors", OMI_RS, struct omi_rx_stats, gw_pull_errors),
+	OMI_STAT("rx_gw_zc", OMI_RS, struct omi_rx_stats, gw_zc),
 	OMI_STAT("ctl_poll_cycles", OMI_CS, struct omi_ctl_stats, poll_cycles),
 	OMI_STAT("ctl_napi_kicks", OMI_CS, struct omi_ctl_stats, napi_kicks),
 	OMI_STAT("ctl_table_updates", OMI_CS, struct omi_ctl_stats, table_updates),
@@ -3993,7 +4008,8 @@ static int openmiop_probe(struct platform_device *pdev)
 	if (ep->edma) {
 		ep->bar->hdr.features |= OMI_HDR_GW2;
 		if (ep->nrd)
-			ep->bar->hdr.features |= OMI_HDR_GW_PULL;
+			ep->bar->hdr.features |= OMI_HDR_GW_PULL |
+						 (gw_zc ? OMI_HDR_GW_ZC : 0);
 		hdr_publish(ep);
 		ep->ob = ioremap(ep->ob_phys, (size_t)OMI_MAX_NODES * OPENMIOP_BAR_SIZE);
 		if (!ep->ob)

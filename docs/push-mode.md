@@ -100,6 +100,31 @@ on the lab box on 2026-10-13: BMC to blade without NAT 130 ->
 204 Mbit/s, LAN to blade through the BMC's NAT 92 -> 143 Mbit/s; the BMC
 CPU is then the limit.
 
+### Zero-copy (v0.5)
+
+Step 3 still costs the BMC a copy and a cache clean per frame. With
+`OMI_HDR_GW_ZC` the blade reads unicast frames from the BMC's own stack
+straight out of the skb:
+
+1. A pulling blade also sets `OMI_HDR_GW_ZC` (module parameter `gw_zc`,
+   default on).
+2. For such a blade (`omi-rc` parameter `zc`, default on), a unicast
+   frame from the BMC's stack (`ndo_start_xmit`, e.g. NAT from the LAN)
+   is not copied: `omi-rc` maps the skb (`dma_map_single`, which cleans
+   the cache lines), writes the slot header with
+   `OMI_GW_PULL | OMI_GW_ZC` and the frame's 32-bit bus address in the
+   header's `mask` field, and keeps the skb.
+3. The blade's read run takes `OMI_GW_ZC` slots from that address
+   instead of the pull ring.
+4. `omi-rc` frees the skb when the blade's `rc_tail` (pushed into BMC
+   memory as before) passes the slot, or when the gateway to that blade
+   goes down.
+
+Broadcast, multicast and frames relayed from another blade are still
+copied into the pull ring. A blade without the feature, and an old
+`omi-rc`, never meet an `OMI_GW_ZC` slot. Counter on the blade:
+`rx_gw_zc`.
+
 ## Compatibility
 
 - A push-mode blade works with the userspace `openmiop-rc` as before:

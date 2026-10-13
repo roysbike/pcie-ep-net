@@ -61,6 +61,10 @@ static bool pull = true;
 module_param(pull, bool, 0444);
 MODULE_PARM_DESC(pull, "Let blades that can read gateway frames from our memory with their eDMA (off: copy every frame into the blade BAR)");
 
+static bool zc = true;
+module_param(zc, bool, 0444);
+MODULE_PARM_DESC(zc, "Let pulling blades read unicast frames from our stack straight from the skb (off: copy them into the pull ring)");
+
 static uint link_stable_ms = 1500;
 module_param(link_stable_ms, uint, 0644);
 MODULE_PARM_DESC(link_stable_ms, "A blade's link must be up this long before we touch it");
@@ -114,6 +118,13 @@ struct rc_ep {
 	void *pull_ring;		/* RC->EP slots the blade reads (OMI_GW_PULL) */
 	dma_addr_t pull_dma;
 	bool pull_on;			/* active blade reads them */
+	bool zc_on;			/* and reads OMI_GW_ZC slots */
+	/* Zero-copy frames the blade may still read, per RC->EP slot
+	 * (txlock). Freed once its rc_tail passes the slot.
+	 */
+	struct sk_buff *zc_skb[OMI_GW_SLOTS];
+	dma_addr_t zc_dma[OMI_GW_SLOTS];
+	u32 zc_tail;
 	u32 token;
 	u32 epoch;
 	u8 mac[ETH_ALEN];
@@ -214,27 +225,90 @@ static u32 rc_credit(struct rc_ep *e)
 	return e->rc_tail;
 }
 
+/* txlock held. Free the zero-copy frames of the slots before upto. */
+static void zc_reap(struct rc_ep *e, u32 upto)
+{
+	for (; e->zc_tail != upto; e->zc_tail++) {
+		unsigned int i = e->zc_tail & (OMI_GW_SLOTS - 1);
+		struct sk_buff *skb = e->zc_skb[i];
+
+		if (!skb)
+			continue;
+		dma_unmap_single(area_dev(e), e->zc_dma[i], skb->len, DMA_TO_DEVICE);
+		dev_consume_skb_any(skb);
+		e->zc_skb[i] = NULL;
+	}
+}
+
+/* txlock held. Free all of them: the blade is gone or the gateway off.
+ * It may still be reading; that only reads stale memory.
+ */
+static void zc_free_all(struct rc_ep *e)
+{
+	unsigned int i;
+
+	for (i = 0; i < OMI_GW_SLOTS; i++) {
+		struct sk_buff *skb = e->zc_skb[i];
+
+		if (!skb)
+			continue;
+		dma_unmap_single(area_dev(e), e->zc_dma[i], skb->len, DMA_TO_DEVICE);
+		dev_kfree_skb_any(skb);
+		e->zc_skb[i] = NULL;
+	}
+}
+
 static void __iomem *rc_slot(struct rc_ep *e, u32 i)
 {
 	return e->bar + OMI_GW_OFF + sizeof(struct omi_gw) +
 	       (OMI_GW_SLOTS + (i & (OMI_GW_SLOTS - 1))) * OMI_GW_SLOT;
 }
 
+enum tx_result { TX_FAIL, TX_COPIED, TX_TAKEN };
+
 /* One frame into blade e's gateway ring, then its doorbell. Posted
- * writes only. False if its ring is full or it is not up.
+ * writes only. TX_FAIL if its ring is full or it is not up. With skb
+ * (data == skb->data) and a zero-copy blade the slot points at the skb
+ * and the ring owns it from now on (TX_TAKEN); otherwise the frame is
+ * copied (TX_COPIED) and the caller keeps skb.
  */
-static bool tx_ep(struct rc_ep *e, const void *data, u32 len, u32 flags)
+static enum tx_result tx_ep(struct rc_ep *e, const void *data, u32 len, u32 flags,
+			    struct sk_buff *skb)
 {
 	void __iomem *slot;
-	bool ok = false;
+	enum tx_result ret = TX_FAIL;
+	u32 zaddr = 0;
 
 	spin_lock(&e->txlock);
 	if (!e->gw_on || len > OMI_GW_DATA)
 		goto out;
 	if (e->rc_head - rc_credit(e) >= OMI_GW_SLOTS)
 		goto out;
+	zc_reap(e, e->rc_tail);
 	slot = rc_slot(e, e->rc_head);
-	if (e->pull_on) {
+	if (skb && e->zc_on) {
+		unsigned int i = e->rc_head & (OMI_GW_SLOTS - 1);
+		dma_addr_t d = dma_map_single(area_dev(e), skb->data, len, DMA_TO_DEVICE);
+
+		if (dma_mapping_error(area_dev(e), d)) {
+			skb = NULL;
+		} else if (upper_32_bits(d)) {
+			dma_unmap_single(area_dev(e), d, len, DMA_TO_DEVICE);
+			skb = NULL;
+		} else {
+			/* dma_map_single() cleaned the lines: the blade reads
+			 * the frame straight from the skb.
+			 */
+			e->zc_skb[i] = skb;
+			e->zc_dma[i] = d;
+			zaddr = lower_32_bits(d);
+			flags |= OMI_GW_PULL | OMI_GW_ZC;
+			ret = TX_TAKEN;
+		}
+	}
+	if (ret == TX_TAKEN) {
+		/* nothing to copy */
+	} else if (e->pull_on) {
 		/* Only the header goes over MMIO; the blade's eDMA reads the
 		 * frame from our memory. Cleaned before the head store.
 		 */
@@ -249,17 +323,18 @@ static bool tx_ep(struct rc_ep *e, const void *data, u32 len, u32 flags)
 		memcpy_toio(slot + sizeof(struct omi_slot_hdr), data, len);
 	}
 	writel(flags, slot + offsetof(struct omi_slot_hdr, flags));
-	writel(0, slot + offsetof(struct omi_slot_hdr, mask));
+	writel(zaddr, slot + offsetof(struct omi_slot_hdr, mask));
 	writel(len, slot + offsetof(struct omi_slot_hdr, len));
 	e->rc_head++;
 	/* writel() keeps the slot stores ahead of the head store. */
 	writel(e->rc_head, e->bar + GW_OFF(rc_head));
 	if (e->features & OMI_HDR_DOORBELL)
 		writel(e->db_data, e->bar + e->db_off);
-	ok = true;
+	if (ret == TX_FAIL)
+		ret = TX_COPIED;
 out:
 	spin_unlock(&e->txlock);
-	return ok;
+	return ret;
 }
 
 static int ep_by_mac(const u8 *mac)
@@ -289,7 +364,7 @@ static bool relay(int src, const u8 *frame, u32 len, u32 mask)
 			return src >= 0;
 		k = ep_by_mac(frame);
 		if (k >= 0) {
-			if (!(mask & BIT(k)) && !tx_ep(&rc->ep[k], frame, len, flags))
+			if (!(mask & BIT(k)) && !tx_ep(&rc->ep[k], frame, len, flags, NULL))
 				ndev->stats.tx_dropped++;
 			return false;
 		}
@@ -297,7 +372,7 @@ static bool relay(int src, const u8 *frame, u32 len, u32 mask)
 	/* Broadcast, multicast, unknown unicast: everyone else. */
 	for (k = 0; k < OMI_MAX_NODES; k++)
 		if (smp_load_acquire(&rc->ep[k].gw_on) && !(mask & BIT(k)) &&
-		    !tx_ep(&rc->ep[k], frame, len, flags))
+		    !tx_ep(&rc->ep[k], frame, len, flags, NULL))
 			ndev->stats.tx_dropped++;
 	return src >= 0;
 }
@@ -311,11 +386,28 @@ static netdev_tx_t rc_xmit(struct sk_buff *skb, struct net_device *ndev)
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
-	local_bh_disable();
-	relay(-1, skb->data, len, 0);
-	local_bh_enable();
 	ndev->stats.tx_packets++;
 	ndev->stats.tx_bytes += len;
+	local_bh_disable();
+	/* Unicast to one blade: hand it the skb (zero-copy if it can). */
+	if (!is_multicast_ether_addr(skb->data) &&
+	    !ether_addr_equal(skb->data, ndev->dev_addr)) {
+		int k = ep_by_mac(skb->data);
+
+		if (k >= 0) {
+			enum tx_result r = tx_ep(&rc->ep[k], skb->data, len, 0, skb);
+
+			local_bh_enable();
+			if (r == TX_TAKEN)
+				return NETDEV_TX_OK;
+			if (r == TX_FAIL)
+				ndev->stats.tx_dropped++;
+			dev_consume_skb_any(skb);
+			return NETDEV_TX_OK;
+		}
+	}
+	relay(-1, skb->data, len, 0);
+	local_bh_enable();
 	dev_consume_skb_any(skb);
 	return NETDEV_TX_OK;
 }
@@ -424,6 +516,9 @@ static void gw_off(struct rc_ep *e)
 	spin_unlock_bh(&e->txlock);
 	/* NAPI and xmit that saw gw_on finish before we unmap. */
 	synchronize_net();
+	spin_lock_bh(&e->txlock);
+	zc_free_all(e);
+	spin_unlock_bh(&e->txlock);
 }
 
 /*
@@ -614,7 +709,9 @@ static void ep_activate(struct rc_ep *e, struct omi_gw2_ep *st)
 	if (e->db_off & 3 || e->db_off > OPENMIOP_BAR_SIZE - 4)
 		e->features &= ~OMI_HDR_DOORBELL;
 	e->pull_on = e->pull_ring && (e->features & OMI_HDR_GW_PULL);
+	e->zc_on = zc && e->pull_on && (e->features & OMI_HDR_GW_ZC);
 	e->rc_head = e->rc_tail = READ_ONCE(st->rc_tail);
+	e->zc_tail = e->rc_head;
 	e->last_seq = READ_ONCE(st->seq);
 	e->seen_at = jiffies;
 	e->tail = 0;
@@ -631,7 +728,7 @@ static void ep_activate(struct rc_ep *e, struct omi_gw2_ep *st)
 	netdev_info(rc->ndev, "node %u active: %pM, BAR %#llx, epoch %#x%s%s\n", e->node, e->mac,
 		    (u64)e->bar_pci, e->epoch,
 		    e->features & OMI_HDR_DOORBELL ? ", doorbell" : "",
-		    e->pull_on ? ", gateway pull" : "");
+		    e->zc_on ? ", gateway pull, zero-copy" : e->pull_on ? ", gateway pull" : "");
 	napi_schedule(&rc->napi);
 }
 

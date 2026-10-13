@@ -78,6 +78,12 @@
  * it uses the slot.
  */
 #define OMI_GW_PULL		0x2u
+/* RC -> EP, with OMI_GW_PULL (OMI_HDR_GW_ZC): the frame is not in the
+ * pull ring but at the 32-bit bus address in the slot's mask field
+ * (the RC's own buffer, zero-copy). The RC keeps it until the EP's
+ * rc_tail passes the slot.
+ */
+#define OMI_GW_ZC		0x4u
 
 /* ---- 0x0000: header, written by the owning EP ---- */
 struct omi_hdr {
@@ -103,6 +109,7 @@ struct omi_hdr {
 #define OMI_HDR_DOORBELL	0x1u	/* the RC may ring db_off with db_data */
 #define OMI_HDR_GW2		0x2u	/* takes an omi_ctl gateway v2 offer */
 #define OMI_HDR_GW_PULL		0x4u	/* reads OMI_GW_PULL slots from the RC */
+#define OMI_HDR_GW_ZC		0x8u	/* also reads OMI_GW_ZC slots */
 
 /* ---- 0x0040: control, written by the RC ---- */
 struct omi_ctl {
