@@ -1,5 +1,7 @@
 # pcie-ep-net (openmiop)
 
+[English](README.md) · [Русский](README.ru.md)
+
 Ethernet between the Mixtile Blade 3 boards of a Mixtile Cluster Box, over
 the Cluster Box's internal PCIe switch. Each blade gets a network
 interface `omi0`; frames between blades are DMA writes from one blade's
@@ -14,6 +16,34 @@ contains no Mixtile code or firmware. License: GPL-2.0-or-later
 Current release: **v0.3.1** (protocol v4 framing between blades; push
 mode: the Cluster Box never reads a blade; blades reconnect without it). See
 [CHANGELOG.md](CHANGELOG.md) and [Compatible releases](#compatible-releases).
+
+## Hardware and who this is for
+
+The **Mixtile Cluster Box** is a small chassis for four **Mixtile Blade 3**
+boards. Inside it:
+
+* a management controller (BMC): MediaTek MT7620A (MIPS) with OpenWrt. It
+  switches the blades on and off, resets them, gives access to their
+  serial consoles and is the PCIe root complex of the box;
+* an ASMedia ASM2824 PCIe Gen3 switch: a Gen3 x2 link to each blade slot
+  and a Gen1 x1 uplink to the BMC.
+
+The **Mixtile Blade 3** is a compute board with the Rockchip RK3588
+(4× Cortex-A76 + 4× Cortex-A55), eMMC and an M.2 NVMe slot. Its PCIe 3.0
+x4 controller is split in two: lanes 0-1 go to the Cluster Box switch,
+lanes 2-3 to the NVMe. A Blade 3 also works on its own, without a
+Cluster Box.
+
+Mixtile ships the box with its own BMC firmware and its own blade
+network driver (MIOP). The **OpenMIOP Stack** is an independent open
+replacement for people who own a Cluster Box with Blade 3 boards (or a
+single Blade 3) and want:
+
+| You want | Repository |
+| --- | --- |
+| Ethernet between the blades over the PCIe switch (`omi0`, ~5 Gbit/s per flow, ~25 Gbit/s with four senders) | [pcie-ep-net](https://github.com/roysbike/pcie-ep-net) (this repository) |
+| Talos Linux (Kubernetes) on Blade 3, in a Cluster Box or on its own | [mixtile-talos](https://github.com/roysbike/mixtile-talos) |
+| Current OpenWrt on the BMC: blade power and consoles, firmware updates, the BMC side of OpenMIOP | [mixtile-clusterbox-mt7620a-openwrt](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt) |
 
 ## Architecture
 
