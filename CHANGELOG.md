@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-14
+
+OpenMIOP Stack v0.5.0 (with mixtile-talos v0.5.0 and ClusterBox firmware
+v0.3.0). Protocol v4 unchanged; the new feature is negotiated.
+
 ### Added
 
 - Gateway zero-copy (`OMI_HDR_GW_ZC`, slot flag `OMI_GW_ZC`): a pulling
