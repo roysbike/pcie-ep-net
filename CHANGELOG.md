@@ -7,21 +7,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- False peer stalls under load: `peers_poll()` called a peer stalled
+  when its queue looked full and the tail did not move between the two
+  reads of one pass, but the TX thread picks up credit as well, so
+  under load a healthy peer looked stuck. After 100 ms its frames were
+  dropped; having read everything already, it never returned credit
+  again, and only a reconnect 2 s later cleared the stall. Progress is
+  now counted against the tail seen at the last pass, and an empty ring
+  counts as alive. Seen on P2P peers (hundreds of stalls and
+  reconnects) and on the gateway.
 - Gateway v2 (blade -> BMC ring in BMC memory): a blade no longer
-  reconnects to the RC when the RC is slow to drain its ring (Cluster
-  Box CPU at 99 % under a long upload). The reconnect sent a blade
+  reconnects to the RC like to a blade. That reconnect sent a blade
   connect line into the RC's ring area (into slot 0) and came back up
   with head 0 against the RC's old tail, so the ring looked full
-  forever: the blade lost the gateway (no LAN, internet, DNS, NTP over
+  forever: the blade lost the gateway (LAN, internet, DNS, NTP over
   omi0) and logged "peer 7 stalled, connecting again" every 2 s until
-  `omi-rc` was reloaded. A stalled RC now recovers by itself as soon as
-  it consumes again; a new offer is the only way to start over.
-- When the RC peer comes up again it continues at the RC's credit
-  instead of head 0.
+  `omi-rc` was reloaded. Found on v0.4.0-rc.1 with ClusterBox firmware
+  v0.2.0-rc.1 under long blade -> LAN uploads. When the RC peer comes
+  up again it continues at the RC's credit.
 - `omi-rc`: when it resyncs a blade's ring (head out of range), it
-  writes the new credit to the blade at once, so a blade waiting for
-  credit with a full ring (also older blades with the bug above) gets
-  unstuck.
+  writes the new credit to the blade at once, logs a warning and counts
+  `rx_fifo_errors`.
 
 ## [0.4.0-rc.1] - 2026-10-13
 
