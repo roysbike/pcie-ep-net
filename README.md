@@ -13,11 +13,12 @@ It is an independent implementation, not Mixtile's MIOP driver, and
 contains no Mixtile code or firmware. License: GPL-2.0-or-later
 ([LICENSE](LICENSE)).
 
-Current release: **v0.5.0** (protocol v4 framing between blades; push
+Current release: **v0.5.1** (v0.5.0 plus a build fix for `omi-rc` on
+Linux 6.1+; protocol v4 framing between blades; push
 mode: the Cluster Box never reads a blade; gateway pull with zero-copy:
 blades read Cluster Box to blade traffic with their eDMA straight from
 the BMC's buffers, ~3x faster than v0.3).
-See the [release notes](docs/release-notes/v0.5.0.md),
+See the [release notes](docs/release-notes/v0.5.1.md),
 [CHANGELOG.md](CHANGELOG.md) and [Compatible releases](#compatible-releases).
 
 ## Hardware and who this is for
@@ -171,7 +172,7 @@ configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
 ### Blade 3 with Debian or Ubuntu
 
 Install the DKMS package from the
-[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.5.0).
+[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.5.1).
 DKMS builds the module for the running kernel (6.1 or newer; the
 kernel's headers must be installed). CI installs it on Debian 12,
 Debian 13, Ubuntu 22.04 (HWE kernel) and Ubuntu 24.04 (arm64) and checks
@@ -326,7 +327,7 @@ in `docs/bench/`.
 | OpenMIOP Stack v0.5.0 | |
 | --- | --- |
 | Protocol | OpenMIOP v4 framing between blades, features `OMI_FEAT_DOORBELL`, `OMI_FEAT_MQ` negotiated per connection; push mode, gateway pull (`OMI_HDR_GW_PULL`) and zero-copy (`OMI_HDR_GW_ZC`) to the BMC |
-| Blade driver, BMC module | [pcie-ep-net v0.5.0](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.5.0) |
+| Blade driver, BMC module | [pcie-ep-net v0.5.1](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.5.1) (v0.5.0 plus the `omi-rc` build fix for Linux 6.1+; same at run time) |
 | Blade OS | [mixtile-talos v0.5.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.5.0) |
 | ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.3.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.3.0) |
 
