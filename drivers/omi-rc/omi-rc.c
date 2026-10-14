@@ -37,6 +37,7 @@
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/pci.h>
+#include <linux/version.h>
 #include <linux/random.h>
 #include <linux/rtnetlink.h>
 #include <linux/skbuff.h>
@@ -1169,7 +1170,11 @@ static int __init omi_rc_init(void)
 	ndev->max_mtu = OMI_GW_DATA - ETH_HLEN;
 	ndev->features |= NETIF_F_GRO;
 	rc_mac(ndev);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	netif_napi_add(ndev, &rc->napi, rc_poll);	/* NAPI_POLL_WEIGHT */
+#else
 	netif_napi_add(ndev, &rc->napi, rc_poll, NAPI_POLL_WEIGHT);
+#endif
 	ret = register_netdev(ndev);
 	if (ret)
 		goto err_netdev;
