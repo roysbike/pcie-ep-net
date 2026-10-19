@@ -5,6 +5,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-19
+
+Fix for the Cluster Box module `omi-rc` on ClusterBox firmware with
+OpenWrt 25.12 (Linux 6.12). The blade driver is unchanged (same as 0.5.0)
+and protocol v4 is unchanged.
+
+### Fixed
+
+- `omi-rc` enables memory and bus mastering on every PCIe bridge between a
+  blade and the root port (the ASM2824 upstream and downstream ports) when
+  it attaches the blade. On Linux 6.12 nothing else does: no driver binds
+  the bridges and they stay at COMMAND 0000, so the switch rejected every
+  state write of the blades towards the BMC (`UnsupReq` in DevSta), blades
+  logged `RC push mode: state at ...` every second and omi0 had no peers.
+  On Linux 5.15 (firmware v0.3.0) the bridges were already enabled, so
+  nothing changes there.
+
 ## [0.5.1] - 2026-10-14
 
 Build fix only; nothing changes at run time (blade driver identical to

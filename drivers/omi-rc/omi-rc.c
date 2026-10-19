@@ -560,6 +560,29 @@ static u32 common_mps(void)
 }
 
 /*
+ * The switch ports above a blade forward its writes to the BMC (state,
+ * gateway rings) only with bus mastering on. Nothing else enables them:
+ * no driver binds the bridges (no PCIe port driver), and the kernel sets
+ * them only when a device below is enabled through a driver.
+ */
+static void bridges_enable(struct rc_ep *e)
+{
+	struct pci_dev *b;
+	u16 cmd;
+
+	for (b = pci_upstream_bridge(e->pdev); b; b = pci_upstream_bridge(b)) {
+		pci_read_config_word(b, PCI_COMMAND, &cmd);
+		if ((cmd & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) ==
+		    (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER))
+			continue;
+		pci_write_config_word(b, PCI_COMMAND,
+				      cmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+		netdev_info(rc->ndev, "node %u %s: bridge %s: memory and bus mastering enabled\n",
+			    e->node, pci_name(e->port), pci_name(b));
+	}
+}
+
+/*
  * Config space, the only requests that go to the blade itself, once
  * per attach and only with a stable link: put back what its probe
  * reset. 0 when it takes push-mode offers.
@@ -605,6 +628,7 @@ static int ep_restore(struct rc_ep *e)
 	    (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER))
 		pci_write_config_word(pdev, PCI_COMMAND,
 				      cmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+	bridges_enable(e);
 	return 0;
 }
 
