@@ -5,6 +5,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `openmiop-ep`: the TX threads and the eDMA done interrupts run on the
+  biggest cores (`arch_scale_cpu_capacity`; the Cortex-A76 on RK3588),
+  or on `tx_cpus`. The scheduler put them on the A55 as often as not; with
+  them on the A76 one flow went from 5.0-5.5 to 6.6-7.1 Gbit/s on all 12
+  pairs (set by hand on the lab).
+
+### Added
+
+- P2P checksum offload (`OMI_FEAT_CSUM`, slot flag `OMI_SLOT_CSUM`): the
+  netdev announces `NETIF_F_HW_CSUM`; a frame for a single blade that
+  offered the feature keeps its partial TCP/UDP checksum (start/offset in
+  the slot header), the receiver hands it on as `CHECKSUM_PARTIAL`.
+  Gateway frames, floods and older peers get the checksum completed as
+  before. `do_csum` was ~11 % of the sender's CPU time. Parameter
+  `p2p_csum` (default on). Negotiated: older blades are unaffected.
+
 ## [0.5.2] - 2026-10-19
 
 Fix for the Cluster Box module `omi-rc` on ClusterBox firmware with
