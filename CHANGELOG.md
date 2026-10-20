@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-20
+
+Blade-to-blade throughput: one TCP flow 7.8-8.0 Gbit/s between two v0.6
+blades (5.0-5.5 with v0.5). Protocol v4 framing unchanged; the new
+checksum offload is a per-connection feature, so v0.6 blades mix with
+older ones. `omi-rc` (BMC) is the same as in v0.5.2.
+
 ### Changed
 
 - `openmiop-ep`: the TX threads and the eDMA done interrupts run on the
@@ -22,6 +29,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Gateway frames, floods and older peers get the checksum completed as
   before. `do_csum` was ~11 % of the sender's CPU time. Parameter
   `p2p_csum` (default on). Negotiated: older blades are unaffected.
+  A frame already mapped for a peer that came back without the feature
+  is dropped (counted in `tx_peer_gone_drops`) rather than sent with a
+  partial checksum.
+
+### Tested
+
+On the Cluster Box, Talos v1.14.2, two blades on v0.6 and two on v0.5.0
+with the TX threads pinned by hand, a loaded Cozystack cluster on top:
+
+- One TCP flow: v0.6 <-> v0.6 7.82-7.98 Gbit/s; v0.6 <-> v0.5 5.9-7.2.
+  Four flows: 11.1-11.3 Gbit/s (10.0-10.5 without the offload).
+- Integrity with sha256 / per-datagram hashes: 4 GiB TCP over IPv4 and
+  IPv6 in both directions, UDP 24-8900 B datagrams over IPv4 and IPv6,
+  pod to pod over Kube-OVN Geneve (inner checksum partial), pod to
+  ClusterIP, and a NodePort download through the BMC gateway where the
+  forwarding blade completes the checksum and the workstation NIC checks
+  it: all identical, `InCsumErrors` 0 on every host.
+- One hour soak with iperf3 load and 1 GiB integrity loops alongside
+  (v0.6<->v0.6, v0.6<->v0.5, pod -> ClusterIP over Geneve, through the BMC
+  gateway): 1 232 transfers identical, no driver messages, DRBD clean.
 
 ## [0.5.2] - 2026-10-19
 
