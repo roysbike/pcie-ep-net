@@ -1345,13 +1345,17 @@ static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
 		bool room = true;
 
 		/* Peers that went down or stalled since xmit, that now have
-		 * fewer rings than this queue needs, or whose slots are too
-		 * small for the frame (the RC's gateway ring).
+		 * fewer rings than this queue needs, whose slots are too
+		 * small for the frame (the RC's gateway ring), or that came
+		 * back without OMI_FEAT_CSUM after tx_premap mapped a partial
+		 * checksum (the mapped frame can no longer be completed).
 		 */
 		m = d->mask & up;
 		for_each_set_bit(p, &m, OMI_MAX_NODES)
 			if (q >= READ_ONCE(ep->peer[p].nq) ||
-			    d->skb->len + sizeof(struct omi_slot_hdr) > ep->peer[p].slot_size)
+			    d->skb->len + sizeof(struct omi_slot_hdr) > ep->peer[p].slot_size ||
+			    (d->skb->ip_summed == CHECKSUM_PARTIAL &&
+			     !READ_ONCE(ep->peer[p].csum_ok)))
 				gone |= BIT(p);
 		if (gone) {
 			txd_release(ep, d, gone, q);
