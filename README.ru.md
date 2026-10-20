@@ -42,7 +42,7 @@ Blade 3), которым нужно:
 
 | Что нужно | Репозиторий |
 | --- | --- |
-| Ethernet между блейдами через PCIe-коммутатор (`omi0`, ~5 Гбит/с на поток, ~25 Гбит/с при четырёх отправителях) | [pcie-ep-net](https://github.com/roysbike/pcie-ep-net) (этот репозиторий) |
+| Ethernet между блейдами через PCIe-коммутатор (`omi0`, 7-8 Гбит/с на поток, ~25 Гбит/с при четырёх отправителях) | [pcie-ep-net](https://github.com/roysbike/pcie-ep-net) (этот репозиторий) |
 | Talos Linux (Kubernetes) на Blade 3, в Cluster Box или отдельно | [mixtile-talos](https://github.com/roysbike/mixtile-talos) |
 | Свежий OpenWrt на BMC: питание и консоли блейдов, обновление прошивки, сторона OpenMIOP на BMC | [mixtile-clusterbox-mt7620a-openwrt](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt) |
 
@@ -62,8 +62,8 @@ Blade 3), которым нужно:
 | Где | Как |
 | --- | --- |
 | Cluster Box (BMC) | прошивка [mixtile-clusterbox-mt7620a-openwrt v0.3.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.3.0): `omi-rc` грузится при старте. На другой прошивке — архив `openmiop-<version>-clusterbox-bmc-mipsel.tar.gz`, см. [Install](README.md#install) |
-| Blade 3 с Talos | установщик [mixtile-talos v0.5.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.5.0): модуль уже встроен, собирать ничего не нужно |
-| Blade 3 с Debian/Ubuntu | DKMS-пакет из [релиза](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.5.2) (ядро 6.1+, заголовки ядра), затем адрес в `/etc/openmiop.addr` и перезагрузка, см. [Install](README.md#install) |
+| Blade 3 с Talos | установщик [mixtile-talos v0.6.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.0): модуль уже встроен, собирать ничего не нужно |
+| Blade 3 с Debian/Ubuntu | DKMS-пакет из [релиза](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.0) (ядро 6.1+, заголовки ядра), затем адрес в `/etc/openmiop.addr` и перезагрузка, см. [Install](README.md#install) |
 
 Сначала обновите до v0.3 все блейды, потом BMC: модуль `omi-rc` не
 трогает блейды без push-режима. Адреса: BMC — 10.20.0.1/24, блейды —
@@ -73,7 +73,8 @@ Blade 3), которым нужно:
 
 Команды проверки — в [Verify](README.md#verify), результаты тестов — в
 [Tested configuration](README.md#tested-configuration-and-results).
-Главные ограничения: один поток использует одну очередь (~4,7 Гбит/с),
-нет аппаратного подсчёта контрольных сумм, перезагрузка BMC сбрасывает
+Главные ограничения: один поток использует одну очередь (7-8 Гбит/с
+между блейдами v0.6, ~4,7 раньше), нет TSO/GSO, контрольные суммы TCP/UDP
+не считаются только между блейдами (к BMC считаются), перезагрузка BMC сбрасывает
 линки всех блейдов (блейды переподключаются сами через ~12 с). Полный
 список — в [Known limitations](README.md#known-limitations).

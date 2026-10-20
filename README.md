@@ -13,12 +13,13 @@ It is an independent implementation, not Mixtile's MIOP driver, and
 contains no Mixtile code or firmware. License: GPL-2.0-or-later
 ([LICENSE](LICENSE)).
 
-Current release: **v0.5.2** (v0.5.0 plus `omi-rc` fixes for Linux 6.1+
-and 6.12: build, and the PCIe switch ports enabled; protocol v4 framing between blades; push
-mode: the Cluster Box never reads a blade; gateway pull with zero-copy:
-blades read Cluster Box to blade traffic with their eDMA straight from
-the BMC's buffers, ~3x faster than v0.3).
-See the [release notes](docs/release-notes/v0.5.2.md),
+Current release: **v0.6.0** (blade to blade 7-8 Gbit/s per flow: TX
+threads and eDMA interrupts on the Cortex-A76, TCP/UDP checksum offload
+between blades; protocol v4 framing between blades; push mode: the
+Cluster Box never reads a blade; gateway pull with zero-copy: blades read
+Cluster Box to blade traffic with their eDMA straight from the BMC's
+buffers).
+See the [release notes](docs/release-notes/v0.6.0.md),
 [CHANGELOG.md](CHANGELOG.md) and [Compatible releases](#compatible-releases).
 
 ## Hardware and who this is for
@@ -45,7 +46,7 @@ single Blade 3) and want:
 
 | You want | Repository |
 | --- | --- |
-| Ethernet between the blades over the PCIe switch (`omi0`, ~5 Gbit/s per flow, ~25 Gbit/s with four senders) | [pcie-ep-net](https://github.com/roysbike/pcie-ep-net) (this repository) |
+| Ethernet between the blades over the PCIe switch (`omi0`, 7-8 Gbit/s per flow, ~25 Gbit/s with four senders) | [pcie-ep-net](https://github.com/roysbike/pcie-ep-net) (this repository) |
 | Talos Linux (Kubernetes) on Blade 3, in a Cluster Box or on its own | [mixtile-talos](https://github.com/roysbike/mixtile-talos) |
 | Current OpenWrt on the BMC: blade power and consoles, firmware updates, the BMC side of OpenMIOP | [mixtile-clusterbox-mt7620a-openwrt](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt) |
 
@@ -108,8 +109,15 @@ Details: [docs/architecture.md](docs/architecture.md).
   256 slots × 10 KiB, split into one ring per queue when both ends
   agree) at `0x200000`, eDMA scratch at `0xf00000`, doorbell window at
   `0xff0000`.
-* Optional features per connection (`OMI_FEAT_DOORBELL`, `OMI_FEAT_MQ`),
-  tied to the connect token: v0.1 peers simply do not offer them.
+* Optional features per connection (`OMI_FEAT_DOORBELL`, `OMI_FEAT_MQ`,
+  `OMI_FEAT_CSUM`), tied to the connect token: older peers simply do not
+  offer them.
+* Checksum offload between blades (v0.6): a frame for a single blade that
+  offered `OMI_FEAT_CSUM` keeps its partial TCP/UDP checksum, as
+  virtio-net does; the receiver passes it on as `CHECKSUM_PARTIAL`, and
+  the kernel completes it if the frame leaves the host again. The payload
+  only crosses PCIe links (LCRC, replayed on error) and DRAM. Frames to
+  the BMC, floods and peers without the feature carry a full checksum.
 * Write-only endpoint-to-endpoint control: connect tokens, acks and
   credits are posted writes; per-node epochs reject stale state.
 * L2: unicast by peer table and learned MACs, broadcast/multicast to all
@@ -164,7 +172,7 @@ The BMC gets `omi0` = 10.20.0.1/24, MTU 9000. Log: `/tmp/openmiop-rc.log`.
 
 ### Blade 3 with Talos
 
-Use the [mixtile-talos v0.5.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.5.0)
+Use the [mixtile-talos v0.6.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.0)
 installer image. The module is built into it as a system extension;
 nothing has to be compiled. The release notes there have the machine
 configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
@@ -172,7 +180,7 @@ configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
 ### Blade 3 with Debian or Ubuntu
 
 Install the DKMS package from the
-[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.5.2).
+[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.0).
 DKMS builds the module for the running kernel (6.1 or newer; the
 kernel's headers must be installed). CI installs it on Debian 12,
 Debian 13, Ubuntu 22.04 (HWE kernel) and Ubuntu 24.04 (arm64) and checks
@@ -233,10 +241,31 @@ IPv6 multicast; `scripts/bench.sh` runs iperf3 and SHA-256 transfers.
   The module performs the leave handshake on unload; peers pause for a
   few seconds and reconnect.
 
+### Driver parameters
+
+`openmiop-ep` (`modprobe openmiop-ep name=value`, on Talos
+`machine.kernel.modules[].parameters`); the defaults are what the
+releases are tested with.
+
+| Parameter | Default | What |
+| --- | --- | --- |
+| `queues` | 4 | TX/RX queue pairs (1-4); peers with the same count use one ring per queue |
+| `rx_doorbell` | on | RX interrupt raised by the sender (Linux 6.10+ with the GIC ITS; off: poll) |
+| `tx_irq` | on | wait for eDMA runs on the done interrupt (off: poll) |
+| `tx_cpus` | empty | CPUs for the TX threads and eDMA interrupts, e.g. `4-7`; empty: the biggest cores (Cortex-A76 on RK3588) |
+| `p2p_csum` | on | offer and use checksum offload between blades (`OMI_FEAT_CSUM`) |
+| `gw_pull`, `gw_zc` | on | read BMC gateway frames with eDMA, zero-copy on the BMC (when the BMC offers it) |
+| `autonomy` | on | after a fabric reset reconnect to the last peers without waiting for the BMC |
+| `use_edma` | on | off: everything over the BMC gateway (debugging) |
+
+### Mixing versions
+
 All members must speak the same protocol version (v4 here). The header
 carries the version; a v3 endpoint is not activated by a v4 helper.
-v0.1, v0.2 and v0.3 blades mix: interrupts and queues are negotiated per
-pair. Push mode needs v0.3 on every blade before the BMC loads `omi-rc`.
+v0.1 to v0.6 blades mix: interrupts, queues and checksum offload are
+negotiated per pair, so a rolling upgrade keeps every pair working (a
+v0.6 pair gets the offload once both ends run v0.6). Push mode needs v0.3
+on every blade before the BMC loads `omi-rc`.
 
 ## Troubleshooting
 
@@ -252,6 +281,20 @@ pair. Push mode needs v0.3 on every blade before the BMC loads `omi-rc`.
 More: [docs/operations.md](docs/operations.md).
 
 ## Tested configuration and results
+
+### v0.6.0 (2026-10-20)
+
+Two Blade 3 with this driver and two on v0.5.0 (TX pinned to the A76 by
+hand), Talos v1.14.2, a loaded Cozystack cluster on top, MTU 9000.
+
+| Test | Result |
+| --- | --- |
+| v0.6 <-> v0.6, 1 TCP stream | 7.82-7.98 Gbit/s, 0 retransmits (v0.5.0: 5.0-5.5) |
+| v0.6 <-> v0.6, 4 TCP streams | 11.1-11.3 Gbit/s |
+| v0.6 <-> v0.5, 1 TCP stream | 5.9-7.2 Gbit/s |
+| Pod to pod over Kube-OVN Geneve, 1 / 4 streams | 5.3-5.6 / 8.6 Gbit/s |
+| Integrity (sha256, TCP/UDP, IPv4/IPv6, pods, through the BMC gateway) | all identical, `InCsumErrors` 0 |
+| 1 h soak: load plus 1 GiB integrity loops | 1 232 transfers identical, no driver messages |
 
 ### v0.3.0 (2026-10-12)
 
@@ -303,10 +346,12 @@ in `docs/bench/`.
 
 ## Known limitations
 
-* One flow uses one queue and one eDMA channel: ~4.7 Gbit/s per flow.
+* One flow uses one queue and one eDMA channel: 7-8 Gbit/s per flow
+  between v0.6 blades (TX on the A76 cores, checksum offload), ~4.7 before.
 * Interrupt-driven RX needs Linux 6.10+ and the GIC ITS; older kernels
   (Mixtile Debian 6.1) poll RX. v0.2 is not hardware-tested on Debian.
-* No checksum/GSO offload; fixed 10 KiB slots.
+* No TSO/GSO (the stack segments to the MTU); checksum offload only
+  between blades, not to the BMC; fixed 10 KiB slots.
 * A BMC reboot resets every blade link; blades reconnect P2P by
   themselves after ~12 s (v0.3). On Blade 3 it also resets the M.2 NVMe
   (shared PERST#): mixtile-talos v0.3.0 recovers it.
@@ -324,17 +369,19 @@ in `docs/bench/`.
 
 ## Compatible releases
 
-| OpenMIOP Stack v0.5.0 | |
+| OpenMIOP Stack v0.6.0 | |
 | --- | --- |
-| Protocol | OpenMIOP v4 framing between blades, features `OMI_FEAT_DOORBELL`, `OMI_FEAT_MQ` negotiated per connection; push mode, gateway pull (`OMI_HDR_GW_PULL`) and zero-copy (`OMI_HDR_GW_ZC`) to the BMC |
-| Blade driver, BMC module | [pcie-ep-net v0.5.2](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.5.2) (v0.5.0 plus `omi-rc` fixes for Linux 6.1+/6.12; blade driver unchanged) |
-| Blade OS | [mixtile-talos v0.5.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.5.0) |
-| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.3.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.3.0) |
+| Protocol | OpenMIOP v4 framing between blades, features `OMI_FEAT_DOORBELL`, `OMI_FEAT_MQ`, `OMI_FEAT_CSUM` negotiated per connection; push mode, gateway pull (`OMI_HDR_GW_PULL`) and zero-copy (`OMI_HDR_GW_ZC`) to the BMC |
+| Blade driver, BMC module | [pcie-ep-net v0.6.0](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.0) (`omi-rc` as in v0.5.2) |
+| Blade OS | [mixtile-talos v0.6.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.0) |
+| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.3.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.3.0) (unchanged; the OpenWrt 25.12 firmware in development needs `omi-rc` from v0.5.2 or later) |
 
-Previous: OpenMIOP Stack v0.4.0 = pcie-ep-net v0.4.0, mixtile-talos v0.4.0,
+Previous: OpenMIOP Stack v0.5.0 = pcie-ep-net v0.5.0 (v0.5.2: `omi-rc`
+fixes for Linux 6.1+/6.12), mixtile-talos v0.5.0, ClusterBox firmware
+v0.3.0; v0.4.0 = pcie-ep-net v0.4.0, mixtile-talos v0.4.0,
 ClusterBox firmware v0.2.0; v0.3.1 = pcie-ep-net v0.3.1, mixtile-talos
-v0.3.0, firmware v0.1.1. All of them interoperate (gateway pull and
-zero-copy are negotiated).
+v0.3.0, firmware v0.1.1. All of them interoperate (gateway pull,
+zero-copy and checksum offload are negotiated).
 
 ## Build
 

@@ -251,9 +251,16 @@ struct omi_cons {
  * that stay on a queue stay in order. Used only when both sides
  * announce the same nq; otherwise the pair uses one ring (queue 0) with
  * all ring_slots.
+ *
+ * OMI_FEAT_CSUM, receiver: takes frames whose TCP/UDP checksum the
+ * sender left partial (OMI_SLOT_CSUM, as virtio-net's NEEDS_CSUM): the
+ * payload crossed only PCIe links (LCRC) and DRAM. Sender: it sends such
+ * frames only to a single peer that offered this, never to the RC or in
+ * a flood.
  */
 #define OMI_FEAT_DOORBELL	0x1u
 #define OMI_FEAT_MQ		0x2u
+#define OMI_FEAT_CSUM		0x4u
 
 /* ---- 0x0180: hello lines, one per remote node, written by that node ----
  * Reconnect without the RC. After a fabric reset (Cluster Box reboot,
@@ -296,6 +303,11 @@ struct omi_slot_hdr {
 };
 
 #define OMI_SLOT_HASH		0x1u	/* hash is valid (L4 flow hash) */
+/* OMI_FEAT_CSUM: the checksum is partial; mask = csum_start | csum_offset
+ * << 16, start from the first byte of the frame (P2P slots to a blade
+ * only; the RC reads mask as a node set and never gets these).
+ */
+#define OMI_SLOT_CSUM		0x2u
 
 /* ---- gateway (EP <-> RC), at hdr.gw_off ----
  * ep_prod/rc_cons: frames from the EP to the RC.

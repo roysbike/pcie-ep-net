@@ -168,6 +168,14 @@ static bool autonomy = true;
 module_param(autonomy, bool, 0444);
 MODULE_PARM_DESC(autonomy, "After a fabric reset, reconnect to the peers of the last table without waiting for the Cluster Box helper");
 
+static bool p2p_csum = true;
+module_param(p2p_csum, bool, 0444);
+MODULE_PARM_DESC(p2p_csum, "Leave TCP/UDP checksums of blade-to-blade frames to the receiver (OMI_FEAT_CSUM, negotiated per peer; PCIe LCRC protects the payload)");
+
+static char *tx_cpus = "";
+module_param(tx_cpus, charp, 0444);
+MODULE_PARM_DESC(tx_cpus, "CPUs for the TX threads and eDMA interrupts, e.g. 4-7 (empty: the biggest cores, the Cortex-A76 on RK3588)");
+
 static uint lanes = 2;
 module_param(lanes, uint, 0444);
 MODULE_PARM_DESC(lanes, "Link width. 2 matches Blade 3 (the other two PHY lanes are the M.2 NVMe). 4 aggregates the PHY onto this controller and drops the NVMe");
@@ -346,6 +354,7 @@ struct omi_peer {
 	enum omi_peer_state state;
 	bool stalled;
 	bool db_ok;			/* ring the peer's doorbell */
+	bool csum_ok;			/* peer takes partial checksums (OMI_FEAT_CSUM) */
 	u32 db_off;			/* doorbell word in its BAR */
 	u8 nq;				/* rings it set up for us (1: one ring) */
 	u32 slots;			/* slots per ring */
@@ -1219,6 +1228,13 @@ static void txd_unmap(struct omi_ep *ep, struct omi_txd *d)
 	d->mapped = false;
 }
 
+/* A partial checksum may go only to a single blade that takes it. */
+static bool csum_partial_ok(struct omi_ep *ep, u8 mask)
+{
+	return hweight8(mask) == 1 && !(mask & BIT(OMI_RC_NODE)) &&
+	       READ_ONCE(ep->peer[__ffs(mask)].csum_ok);
+}
+
 static int txd_map(struct omi_ep *ep, struct omi_txd *d)
 {
 	struct sk_buff *skb = d->skb;
@@ -1308,6 +1324,10 @@ static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
 	for (i = 0; i < avail; i++) {
 		struct omi_txd *d = &txq->ring[(first + i) & (OMI_TXQ_SIZE - 1)];
 
+		/* The peer may have reconnected without OMI_FEAT_CSUM. */
+		if (!d->mapped && d->mask && d->skb->ip_summed == CHECKSUM_PARTIAL &&
+		    !csum_partial_ok(ep, d->mask) && skb_checksum_help(d->skb))
+			txd_drop_unmapped(ep, ch, txq, d);
 		if (!d->mapped && d->mask && txd_map(ep, d))
 			txd_drop_unmapped(ep, ch, txq, d);
 	}
@@ -1325,13 +1345,17 @@ static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
 		bool room = true;
 
 		/* Peers that went down or stalled since xmit, that now have
-		 * fewer rings than this queue needs, or whose slots are too
-		 * small for the frame (the RC's gateway ring).
+		 * fewer rings than this queue needs, whose slots are too
+		 * small for the frame (the RC's gateway ring), or that came
+		 * back without OMI_FEAT_CSUM after tx_premap mapped a partial
+		 * checksum (the mapped frame can no longer be completed).
 		 */
 		m = d->mask & up;
 		for_each_set_bit(p, &m, OMI_MAX_NODES)
 			if (q >= READ_ONCE(ep->peer[p].nq) ||
-			    d->skb->len + sizeof(struct omi_slot_hdr) > ep->peer[p].slot_size)
+			    d->skb->len + sizeof(struct omi_slot_hdr) > ep->peer[p].slot_size ||
+			    (d->skb->ip_summed == CHECKSUM_PARTIAL &&
+			     !READ_ONCE(ep->peer[p].csum_ok)))
 				gone |= BIT(p);
 		if (gone) {
 			txd_release(ep, d, gone, q);
@@ -1366,6 +1390,14 @@ static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
 			if (d->skb->l4_hash) {
 				h->flags = OMI_SLOT_HASH;
 				h->hash = d->skb->hash;
+			}
+			/* Only to a single blade with OMI_FEAT_CSUM (omi_xmit,
+			 * tx_premap), so mask is free for the checksum place.
+			 */
+			if (d->skb->ip_summed == CHECKSUM_PARTIAL) {
+				h->flags |= OMI_SLOT_CSUM;
+				h->mask = skb_checksum_start_offset(d->skb) |
+					  (u32)d->skb->csum_offset << 16;
 			}
 			hsrc = ep->scratch_dma + offsetof(struct omi_scratch, txh[q][e]);
 		}
@@ -1867,6 +1899,13 @@ static netdev_tx_t omi_xmit(struct sk_buff *skb, struct net_device *ndev)
 		}
 	}
 
+	/* Complete the checksum unless the frame goes to a single blade that
+	 * takes it partial (the gateway copy, floods, older peers).
+	 */
+	if (skb->ip_summed == CHECKSUM_PARTIAL && (gw || !csum_partial_ok(ep, p2p)) &&
+	    skb_checksum_help(skb))
+		goto drop;
+
 	/* The gateway copy is made now; the P2P path keeps the skb. */
 	if (gw) {
 		int ret = gw_tx(ep, skb, p2p);
@@ -1929,10 +1968,21 @@ static void rx_deliver(struct omi_rxq *rxq, const struct omi_slot_hdr *h,
 		return;
 	}
 	skb_put_data(skb, h + 1, len);
-	/* P2P payloads only crossed PCIe links (LCRC protected) and DRAM. */
+	/* P2P payloads only crossed PCIe links (LCRC protected) and DRAM.
+	 * OMI_SLOT_CSUM: the sender left the checksum to us; CHECKSUM_PARTIAL
+	 * is valid for our stack and completed if the frame goes on.
+	 */
 	if (p2p) {
-		skb->ip_summed = CHECKSUM_UNNECESSARY;
-		if (READ_ONCE(h->flags) & OMI_SLOT_HASH)
+		u32 flags = READ_ONCE(h->flags), m = READ_ONCE(h->mask);
+
+		if (!(flags & OMI_SLOT_CSUM)) {
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+		} else if (!skb_partial_csum_set(skb, m & 0xffff, m >> 16)) {
+			omi_inc(&rxq->rs, dropped);
+			dev_kfree_skb_any(skb);
+			return;
+		}
+		if (flags & OMI_SLOT_HASH)
 			skb_set_hash(skb, READ_ONCE(h->hash), PKT_HASH_TYPE_L4);
 	}
 	skb_record_rx_queue(skb, rxq->idx);
@@ -1988,6 +2038,8 @@ static void rx_credit(struct omi_ep *ep, unsigned int r, unsigned int q)
 			writel(OMI_DB_WIN_OFF + ep->db_word, c + offsetof(struct omi_cons, db_off));
 			writel(ep->db_data, c + offsetof(struct omi_cons, db_data));
 		}
+		if (p2p_csum)
+			feat |= OMI_FEAT_CSUM;
 		if (rq->nq > 1) {
 			feat |= OMI_FEAT_MQ;
 			writel(rq->nq, c + offsetof(struct omi_cons, nq));
@@ -2581,6 +2633,7 @@ static void peer_up(struct omi_ep *ep, unsigned int p, struct omi_cons *c)
 	bool db = (feat & OMI_FEAT_DOORBELL) && !(db_off & 3) &&
 		  db_off <= OPENMIOP_BAR_SIZE - 4;
 	u8 nq = (feat & OMI_FEAT_MQ) && READ_ONCE(c->nq) == ep->nq ? ep->nq : 1;
+	bool csum = p2p_csum && p != OMI_RC_NODE && (feat & OMI_FEAT_CSUM);
 	unsigned int q;
 
 	if (db) {
@@ -2604,12 +2657,13 @@ static void peer_up(struct omi_ep *ep, unsigned int p, struct omi_cons *c)
 	}
 	pr->db_off = db_off;
 	WRITE_ONCE(pr->db_ok, db);
+	WRITE_ONCE(pr->csum_ok, csum);
 	WRITE_ONCE(ep->up_mask, ep->up_mask | BIT(p));
 	txq_unlock_all(ep);
 	spin_unlock_bh(&ep->tx_lock);
 	omi_inc(&ep->cs, peer_up);
-	dev_info(ep->dev, "peer %u up, %u queue%s%s\n", p, nq, nq > 1 ? "s" : "",
-		 db ? ", doorbell" : "");
+	dev_info(ep->dev, "peer %u up, %u queue%s%s%s\n", p, nq, nq > 1 ? "s" : "",
+		 db ? ", doorbell" : "", csum ? ", checksum offload" : "");
 }
 
 static void peers_poll(struct omi_ep *ep)
@@ -3123,17 +3177,54 @@ static int ctl_thread(void *data)
 /* ---------------------------------------------------------------- */
 /* netdev                                                            */
 
+/*
+ * CPUs for the TX threads and the eDMA done interrupts: tx_cpus, else the
+ * online CPUs of the highest capacity. On RK3588 the scheduler otherwise
+ * puts them on the Cortex-A55 as often as not, and one A55 cannot keep a
+ * channel busy: pinning them to the A76 raised one flow from ~5.4 to
+ * ~7 Gbit/s. Empty if nothing fits (then left to the scheduler).
+ */
+static void tx_cpumask(struct cpumask *m)
+{
+	unsigned long cap, max = 0;
+	unsigned int cpu;
+
+	cpumask_clear(m);
+	if (tx_cpus && *tx_cpus) {
+		if (cpulist_parse(tx_cpus, m))
+			cpumask_clear(m);
+		cpumask_and(m, m, cpu_online_mask);
+		return;
+	}
+	for_each_online_cpu(cpu)
+		max = max_t(unsigned long, max, arch_scale_cpu_capacity(cpu));
+	for_each_online_cpu(cpu) {
+		cap = arch_scale_cpu_capacity(cpu);
+		if (cap == max)
+			cpumask_set_cpu(cpu, m);
+	}
+}
+
 static int omi_open(struct net_device *ndev)
 {
 	struct omi_ep *ep = netdev_priv(ndev);
+	cpumask_var_t cpus;
 	unsigned int q, c;
 
+	if (!zalloc_cpumask_var(&cpus, GFP_KERNEL))
+		return -ENOMEM;
+	tx_cpumask(cpus);
 	for (q = 0; q < ep->nq; q++)
 		napi_enable(&ep->rxq[q].napi);
 	for (c = 0; c < ep->nch; c++) {
 		struct omi_chan *ch = &ep->ch[c];
 
-		ch->task = kthread_run(tx_thread, ch, "omi-tx%u", c);
+		ch->task = kthread_create(tx_thread, ch, "omi-tx%u", c);
+		if (!IS_ERR(ch->task)) {
+			if (!cpumask_empty(cpus))
+				set_cpus_allowed_ptr(ch->task, cpus);
+			wake_up_process(ch->task);
+		}
 		if (IS_ERR(ch->task)) {
 			int err = PTR_ERR(ch->task);
 
@@ -3144,9 +3235,11 @@ static int omi_open(struct net_device *ndev)
 			}
 			for (q = 0; q < ep->nq; q++)
 				napi_disable(&ep->rxq[q].napi);
+			free_cpumask_var(cpus);
 			return err;
 		}
 	}
+	free_cpumask_var(cpus);
 	netif_tx_start_all_queues(ndev);
 	return 0;
 }
@@ -3989,6 +4082,10 @@ static int openmiop_probe(struct platform_device *pdev)
 		goto err_dma;
 	edma_init(ep);
 	if (ep->edma && tx_irq) {
+		cpumask_var_t cpus;
+
+		if (zalloc_cpumask_var(&cpus, GFP_KERNEL))
+			tx_cpumask(cpus);
 		/* Write channel c raises line "dma<c>" (seen on RK3588). */
 		for (i = 0; i < ep->nch; i++) {
 			struct omi_chan *ch = &ep->ch[i];
@@ -3998,11 +4095,21 @@ static int openmiop_probe(struct platform_device *pdev)
 			snprintf(name, sizeof(name), "dma%u", i);
 			irq = platform_get_irq_byname_optional(pdev, name);
 			if (irq > 0 && !devm_request_irq(&pdev->dev, irq, omi_edma_isr,
-							 IRQF_SHARED, "openmiop-edma", ch))
+							 IRQF_SHARED, "openmiop-edma", ch)) {
 				ch->irq = irq;
-			else
+				/* Next to the TX thread that waits for it. Not a
+				 * hint: devm frees the IRQ after the driver is gone.
+				 */
+				if (cpumask_available(cpus) && !cpumask_empty(cpus))
+					irq_set_affinity(irq, cpus);
+			} else {
 				dev_warn(ep->dev, "no interrupt for eDMA channel %u, polling it\n", i);
+			}
 		}
+		if (cpumask_available(cpus) && !cpumask_empty(cpus))
+			dev_info(ep->dev, "TX threads and eDMA interrupts on CPUs %*pbl\n",
+				 cpumask_pr_args(cpus));
+		free_cpumask_var(cpus);
 		edma_set_mask(ep);
 	}
 	if (ep->edma) {
@@ -4028,8 +4135,8 @@ static int openmiop_probe(struct platform_device *pdev)
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = OMI_GW_DATA - ETH_HLEN;
 	ndev->mtu = 9000;
-	ndev->features |= NETIF_F_SG | NETIF_F_GRO | NETIF_F_RXCSUM;
-	ndev->hw_features |= NETIF_F_SG | NETIF_F_GRO | NETIF_F_RXCSUM;
+	ndev->features |= NETIF_F_SG | NETIF_F_GRO | NETIF_F_RXCSUM | NETIF_F_HW_CSUM;
+	ndev->hw_features |= NETIF_F_SG | NETIF_F_GRO | NETIF_F_RXCSUM | NETIF_F_HW_CSUM;
 	for (i = 0; i < nq; i++)
 		netif_napi_add(ndev, &ep->rxq[i].napi, omi_napi);
 	netif_carrier_off(ndev);
