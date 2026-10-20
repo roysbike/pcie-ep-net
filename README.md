@@ -13,13 +13,15 @@ It is an independent implementation, not Mixtile's MIOP driver, and
 contains no Mixtile code or firmware. License: GPL-2.0-or-later
 ([LICENSE](LICENSE)).
 
-Current release: **v0.6.0** (blade to blade 7-8 Gbit/s per flow: TX
+Current release: **v0.6.1** (v0.6.0 drivers plus the Blade 3 board
+modules in `drivers/blade3`; blade to blade 7-8 Gbit/s per flow: TX
 threads and eDMA interrupts on the Cortex-A76, TCP/UDP checksum offload
 between blades; protocol v4 framing between blades; push mode: the
 Cluster Box never reads a blade; gateway pull with zero-copy: blades read
 Cluster Box to blade traffic with their eDMA straight from the BMC's
 buffers).
-See the [release notes](docs/release-notes/v0.6.0.md),
+See the release notes of [v0.6.1](docs/release-notes/v0.6.1.md) and
+[v0.6.0](docs/release-notes/v0.6.0.md),
 [CHANGELOG.md](CHANGELOG.md) and [Compatible releases](#compatible-releases).
 
 ## Hardware and who this is for
@@ -180,7 +182,7 @@ configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
 ### Blade 3 with Debian or Ubuntu
 
 Install the DKMS package from the
-[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.0).
+[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.1).
 DKMS builds the module for the running kernel (6.1 or newer; the
 kernel's headers must be installed). CI installs it on Debian 12,
 Debian 13, Ubuntu 22.04 (HWE kernel) and Ubuntu 24.04 (arm64) and checks

@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-20
+
+The Blade 3 board modules move here; the drivers are the same as in
+0.6.0.
+
 ### Added
 
 - `drivers/blade3`: the Blade 3 board modules `blade3-leds` (RTL8125 port
