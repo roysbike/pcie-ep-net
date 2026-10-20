@@ -5,6 +5,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `drivers/blade3`: the Blade 3 board modules `blade3-leds` (RTL8125 port
+  LEDs) and `blade3-nvme-recover` (M.2 NVMe back after a Cluster Box
+  PERST#), moved here unchanged from mixtile-talos (`artifacts/openmiop`),
+  so that one source release has everything the Talos extension builds.
+- CI: openmiop-ep and the board modules compile against Linux 6.18 (the
+  Talos kernel series).
+
 ## [0.6.0] - 2026-10-20
 
 Blade-to-blade throughput: one TCP flow 7.8-8.0 Gbit/s between two v0.6

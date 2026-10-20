@@ -56,6 +56,11 @@ Blade 3), которым нужно:
   вариант, программа `openmiop-rc`. BMC раздаёт блейдам адреса друг друга
   и служит шлюзом в LAN и интернет; его скорость ограничена CPU MT7620A
   (~140–150 Мбит/с к блейду с gateway pull в v0.4, ~90 без него).
+* **Модули платы Blade 3** в `drivers/blade3` (входят в extension
+  mixtile-talos, в пакет DKMS — нет): `blade3-leds` (светодиоды активности
+  портов RTL8125 на 2.5G) и `blade3-nvme-recover` (возвращает M.2 NVMe
+  после PERST# от Cluster Box; нужен полный build tree ядра ради приватного
+  заголовка DesignWare): `make -C drivers/blade3 KDIR=<kernel build tree>`.
 
 ## Установка
 
