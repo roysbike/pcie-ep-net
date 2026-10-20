@@ -102,6 +102,10 @@ jobs:
           make -C "${RUNNER_TEMP}/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
           make -C "${RUNNER_TEMP}/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
       - name: Build openmiop-ep.ko, blade3-leds.ko, blade3-nvme-recover.ko
+        # modules_prepare leaves no Module.symvers: unresolved kernel
+        # symbols are expected, the check is that everything compiles.
+        env:
+          KBUILD_MODPOST_WARN: "1"
         run: |
           for d in drivers/openmiop drivers/blade3; do
             make -C "${d}" KDIR="${RUNNER_TEMP}/linux" \
