@@ -206,6 +206,13 @@ the Blade 3 PCIe endpoint device tree node (`pcie@fe150000` as
 
 Build from source instead: `make -C drivers/openmiop KDIR=<kernel build tree>`.
 
+Two Blade 3 board modules ship next to it in `drivers/blade3` (built into
+the mixtile-talos extension, not into the DKMS package):
+`blade3-leds` (activity LEDs of the RTL8125 ports at 2.5G) and
+`blade3-nvme-recover` (the M.2 NVMe back after a Cluster Box PERST#; it
+needs a full kernel build tree for the private DesignWare header):
+`make -C drivers/blade3 KDIR=<kernel build tree>`.
+
 ## Verify
 
 On a blade:
