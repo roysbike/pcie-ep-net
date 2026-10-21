@@ -134,8 +134,8 @@ Details: [docs/architecture.md](docs/architecture.md).
 | --- | --- |
 | Chassis | Mixtile Cluster Box (ASM2824 switch, MT7620A BMC), 4 slots |
 | Blade | Mixtile Blade 3 (RK3588), PCIe link Gen3 x2 to the switch |
-| Blade OS | Hardware-tested: Talos v1.14.2 (6.18.54-talos) via [mixtile-talos](https://github.com/roysbike/mixtile-talos), Debian 12 with the Mixtile vendor kernel 6.1.99. DKMS package builds in CI for Debian 12/13 and Ubuntu 22.04 (HWE)/24.04 arm64 kernels (not hardware-tested on those) |
-| BMC | OpenWrt 23.05 (kernel 5.15.150) on the Cluster Box; packaged in [mixtile-clusterbox-mt7620a-openwrt](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt) |
+| Blade OS | Hardware-tested: Talos v1.14.4 (6.18.57-talos; earlier v1.14.2 / 6.18.54) via [mixtile-talos](https://github.com/roysbike/mixtile-talos), Debian 12 with the Mixtile vendor kernel 6.1.99. DKMS package builds in CI for Debian 12/13 and Ubuntu 22.04 (HWE)/24.04 arm64 kernels (not hardware-tested on those) |
+| BMC | OpenWrt 25.12.6 (kernel 6.12) and 23.05 (kernel 5.15.150) on the Cluster Box; packaged in [mixtile-clusterbox-mt7620a-openwrt](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt) |
 
 The blade's PCIe3 PHY is split in two x2 halves: lanes 0-1 go to the
 Cluster Box (endpoint), lanes 2-3 to the M.2 NVMe (host). Both train
@@ -146,7 +146,7 @@ Gen3 x2.
 ### Cluster Box (BMC)
 
 Recommended: install the ClusterBox firmware
-[mixtile-clusterbox-mt7620a-openwrt v0.3.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.3.0),
+[mixtile-clusterbox-mt7620a-openwrt v0.4.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.4.0) (or v0.3.0 on OpenWrt 23.05),
 which loads `omi-rc` at boot (`kmod-omi-rc`) and falls back to the helper
 (`openmiop` package). Upgrade all blades to v0.3 first: the module leaves
 blades without push mode alone.
@@ -174,8 +174,8 @@ The BMC gets `omi0` = 10.20.0.1/24, MTU 9000. Log: `/tmp/openmiop-rc.log`.
 
 ### Blade 3 with Talos
 
-Use the [mixtile-talos v0.6.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.0)
-installer image. The module is built into it as a system extension;
+Use the [mixtile-talos v0.6.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.1)
+installer image (Talos v1.14.4). The module is built into it as a system extension;
 nothing has to be compiled. The release notes there have the machine
 configuration (`LinkAliasConfig` for `omi0`) and upgrade commands.
 
@@ -378,14 +378,15 @@ in `docs/bench/`.
 
 ## Compatible releases
 
-| OpenMIOP Stack v0.6.0 | |
+| OpenMIOP Stack v0.6.1 | |
 | --- | --- |
 | Protocol | OpenMIOP v4 framing between blades, features `OMI_FEAT_DOORBELL`, `OMI_FEAT_MQ`, `OMI_FEAT_CSUM` negotiated per connection; push mode, gateway pull (`OMI_HDR_GW_PULL`) and zero-copy (`OMI_HDR_GW_ZC`) to the BMC |
-| Blade driver, BMC module | [pcie-ep-net v0.6.0](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.0) (`omi-rc` as in v0.5.2) |
-| Blade OS | [mixtile-talos v0.6.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.0) |
-| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.3.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.3.0) (unchanged; the OpenWrt 25.12 firmware in development needs `omi-rc` from v0.5.2 or later) |
+| Blade driver, BMC module, board modules | [pcie-ep-net v0.6.1](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.1) (drivers as v0.6.0, `omi-rc` as in v0.5.2, plus `drivers/blade3`) |
+| Blade OS | [mixtile-talos v0.6.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.1) (Talos v1.14.4) |
+| ClusterBox BMC | [mixtile-clusterbox-mt7620a-openwrt v0.4.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.4.0) (OpenWrt 25.12.6; v0.3.0 on OpenWrt 23.05 works the same) |
 
-Previous: OpenMIOP Stack v0.5.0 = pcie-ep-net v0.5.0 (v0.5.2: `omi-rc`
+Previous: OpenMIOP Stack v0.6.0 = pcie-ep-net v0.6.0, mixtile-talos v0.6.0
+(Talos v1.14.2), ClusterBox firmware v0.3.0/v0.4.0; v0.5.0 = pcie-ep-net v0.5.0 (v0.5.2: `omi-rc`
 fixes for Linux 6.1+/6.12), mixtile-talos v0.5.0, ClusterBox firmware
 v0.3.0; v0.4.0 = pcie-ep-net v0.4.0, mixtile-talos v0.4.0,
 ClusterBox firmware v0.2.0; v0.3.1 = pcie-ep-net v0.3.1, mixtile-talos
