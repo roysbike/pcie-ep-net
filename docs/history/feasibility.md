@@ -188,7 +188,7 @@ PHY aggregation (x4) is the reset default of
 `rockchip_p3phy_rk3588_init()` (`RK3588_LANE_AGGREGATION`). Do not
 set a bifurcated `data-lanes` property for Cluster Box.
 
-See [../phase1/dts/rk3588-mixtile-blade3-pcie-ep.dtso](../phase1/dts/rk3588-mixtile-blade3-pcie-ep.dtso).
+See [phase1/dts/rk3588-mixtile-blade3-pcie-ep.dtso](phase1/dts/rk3588-mixtile-blade3-pcie-ep.dtso).
 
 ---
 
@@ -581,7 +581,7 @@ Phase 1 therefore requires one of:
 3. A kernel DTB that **omits** the `pcie@fe150000` node name so the
    lookup fails (fragile; do not do this).
 
-See [../phase1/uboot/README.md](../phase1/uboot/README.md).
+See [phase1/uboot/README.md](phase1/uboot/README.md).
 
 ---
 
