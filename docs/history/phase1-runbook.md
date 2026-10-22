@@ -13,11 +13,11 @@ On the Blade:
 - Linux **6.12 or newer** (6.18 preferred). Stock Mixtile vendor
   6.1 + `pcie-ep-rk35.ko` is the proprietary path and is not this
   work.
-- Kernel built with [../phase1/config/linux-pcie-ep.config](../phase1/config/linux-pcie-ep.config).
+- Kernel built with [phase1/config/linux-pcie-ep.config](phase1/config/linux-pcie-ep.config).
 - DTB that applies
-  [../phase1/dts/rk3588-mixtile-blade3-pcie-ep.dtso](../phase1/dts/rk3588-mixtile-blade3-pcie-ep.dtso).
+  [phase1/dts/rk3588-mixtile-blade3-pcie-ep.dtso](phase1/dts/rk3588-mixtile-blade3-pcie-ep.dtso).
 - U-Boot that does **not** rewrite `/pcie@fe150000` to
-  `mixtile,miop-ep-rk3588`. See [../phase1/uboot/README.md](../phase1/uboot/README.md).
+  `mixtile,miop-ep-rk3588`. See [phase1/uboot/README.md](phase1/uboot/README.md).
 
 On the Cluster Box (already true today):
 
@@ -88,7 +88,7 @@ You want `rockchip,rk3588-pcie-ep` with `status = okay`, and
 As root on the blade:
 
 ```bash
-./phase1/scripts/ep-start-pci-epf-test.sh
+./docs/history/phase1/scripts/ep-start-pci-epf-test.sh
 ```
 
 or the equivalent commands in that script. Then:
@@ -108,7 +108,7 @@ sudo lspci -tvnn
 sudo lspci -nnvv -s 03:00.0   # adjust bus to the slot
 ```
 
-[../phase1/scripts/rc-watch-enum.sh](../phase1/scripts/rc-watch-enum.sh)
+[phase1/scripts/rc-watch-enum.sh](phase1/scripts/rc-watch-enum.sh)
 does the dump.
 
 Success looks like:
