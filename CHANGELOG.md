@@ -14,6 +14,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ring and completed when its eDMA run is retired (sent or dropped);
   stopping the interface resets the counters. No wire or BAR change:
   works with v0.6 peers and the BMC unchanged.
+- openmiop-ep: chained eDMA runs. Each TX thread builds the next run
+  while the current one is on the wire and starts it at the done
+  interrupt, before it retires the finished run; before, the engine
+  idled for the retire and the next list build (~13 us per run). New
+  module parameter `tx_chain` (on, writable at runtime) and ethtool
+  counter `tx_dma_chained`. A run now advances only the heads of the
+  peers it went to. No wire or BAR change.
 
 ## [0.6.1] - 2026-10-20
 
