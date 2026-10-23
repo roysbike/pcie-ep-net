@@ -5,6 +5,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- openmiop-ep: byte queue limits (BQL) on every TX queue. The driver
+  kept up to 256 frames per queue (~2.3 MB at MTU 9000, ~7 ms) below the
+  qdisc, so fq or fq_codel could not reorder them and latency under load
+  had tails of 13-30 ms. Bytes are counted when a frame enters the driver
+  ring and completed when its eDMA run is retired (sent or dropped);
+  stopping the interface resets the counters. No wire or BAR change:
+  works with v0.6 peers and the BMC unchanged.
+
 ## [0.6.1] - 2026-10-20
 
 The Blade 3 board modules move here; the drivers are the same as in

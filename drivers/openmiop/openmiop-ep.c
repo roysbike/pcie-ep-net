@@ -1453,13 +1453,14 @@ static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
 static void tx_complete(struct omi_ep *ep, struct omi_chan *ch,
 			struct omi_txq *txq, struct omi_batch *b, int ret)
 {
-	unsigned int q = txq->idx;
+	unsigned int q = txq->idx, bytes = 0;
 	u32 i;
 
 	spin_lock_bh(&txq->lock);
 	for (i = 0; i < b->n; i++) {
 		struct omi_txd *d = &txq->ring[(b->first + i) & (OMI_TXQ_SIZE - 1)];
 
+		bytes += d->skb->len;
 		txd_release(ep, d, d->mask, q);
 		txd_unmap(ep, d);
 		if (d->mask && !ret) {
@@ -1483,6 +1484,11 @@ static void tx_complete(struct omi_ep *ep, struct omi_chan *ch,
 	if (omi_maybe_wake(ep, txq))
 		omi_inc(&ch->ts, queue_wakes);
 	spin_unlock_bh(&txq->lock);
+	/* BQL: every frame of the run leaves the driver, sent or dropped.
+	 * Only this channel's thread completes queue q.
+	 */
+	if (b->n)
+		netdev_tx_completed_queue(netdev_get_tx_queue(ep->ndev, q), b->n, bytes);
 }
 
 /* Map one queued frame that is not in run b yet. Returns false if
@@ -1924,6 +1930,11 @@ static netdev_tx_t omi_xmit(struct sk_buff *skb, struct net_device *ndev)
 		p2p &= READ_ONCE(ep->up_mask);
 		if (p2p)
 			queued = txq_add(ep, txq, skb, p2p);
+		/* BQL: counted under the lock that tx_build() takes to consume
+		 * the frame, so its completion cannot come first.
+		 */
+		if (queued)
+			netdev_tx_sent_queue(netdev_get_tx_queue(ndev, q), len);
 		/* Stop in the same lock section as the enqueue that fills a
 		 * ring, so the stack never needs NETDEV_TX_BUSY: a requeued
 		 * skb can be overtaken by later ones from another CPU.
@@ -3258,6 +3269,7 @@ static int omi_stop(struct net_device *ndev)
 	}
 	for (q = 0; q < ep->nq; q++) {
 		txq_purge(ep, &ep->txq[q]);
+		netdev_tx_reset_queue(netdev_get_tx_queue(ndev, q));
 		napi_disable(&ep->rxq[q].napi);
 	}
 	return 0;
