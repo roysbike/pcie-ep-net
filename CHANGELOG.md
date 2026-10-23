@@ -14,13 +14,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ring and completed when its eDMA run is retired (sent or dropped);
   stopping the interface resets the counters. No wire or BAR change:
   works with v0.6 peers and the BMC unchanged.
-- openmiop-ep: a sender fills only as many slots of a blade's ring per
-  queue as that blade's credit returns need, sized by the kernel's DQL
-  (the algorithm behind BQL) per peer and queue: sent = heads of retired
-  runs, completed = credit. A full 64-slot ring held ~1.7 ms of frames
-  ahead of every new one under load. Parameter `ring_limit` (default on,
-  writable at runtime); `ethtool -S` shows `slot_limit_peer<N>` (sum over
-  the queues). Gateway ring unchanged.
 
 ## [0.6.1] - 2026-10-20
 

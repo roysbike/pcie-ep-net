@@ -49,7 +49,6 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
-#include <linux/dynamic_queue_limits.h>
 #include <linux/etherdevice.h>
 #include <linux/interrupt.h>
 #include <linux/ethtool.h>
@@ -180,10 +179,6 @@ MODULE_PARM_DESC(tx_cpus, "CPUs for the TX threads and eDMA interrupts, e.g. 4-7
 static uint lanes = 2;
 module_param(lanes, uint, 0444);
 MODULE_PARM_DESC(lanes, "Link width. 2 matches Blade 3 (the other two PHY lanes are the M.2 NVMe). 4 aggregates the PHY onto this controller and drops the NVMe");
-
-static bool ring_limit = true;
-module_param(ring_limit, bool, 0644);
-MODULE_PARM_DESC(ring_limit, "Fill only as many slots of a blade's ring as its credit returns need (DQL per peer queue; off: all slots). Can be changed at runtime");
 
 /* Synopsys DWC eDMA (unrolled) write engine, channel 0. A write
  * channel reads local DRAM (SAR) and emits MemWr TLPs to the PCIe
@@ -334,7 +329,6 @@ struct omi_peer_txq {			/* omi_txq.lock */
 	u32 head;			/* next slot we fill */
 	u32 tail;			/* consumed by the peer (credit) */
 	u32 queued;			/* frames queued, not yet sent */
-	struct dql dql;			/* slots in flight: sent heads vs credit */
 };
 
 struct omi_peer_rxq {			/* the queue's NAPI */
@@ -1200,40 +1194,8 @@ static void peer_refresh_tail(struct omi_ep *ep, unsigned int p, unsigned int q)
 		return;
 	tail = READ_ONCE(*(u32 *)((void *)ep->bar + cons_tail_off(p, q)));
 	/* Ignore credit that would claim more than we sent. */
-	if (pr->tq[q].head - tail <= pr->slots) {
-		struct dql *dql = &pr->tq[q].dql;
-		u32 done = tail - pr->tq[q].tail;
-
+	if (pr->tq[q].head - tail <= pr->slots)
 		pr->tq[q].tail = tail;
-		/* A tail from before the last reset counts nothing. */
-		done = min(done, dql->num_queued - dql->num_completed);
-		if (done)
-			dql_completed(dql, done);
-	}
-}
-
-/* txq lock held. Slots of peer p's ring for queue q we may fill now:
- * the DQL limit plus one, as BQL lets a queue go one object over its
- * limit (that is how DQL sees that the limit was too small).
- */
-static u32 peer_ring_cap(struct omi_peer *pr, unsigned int p, unsigned int q)
-{
-	u32 slots = READ_ONCE(pr->slots);
-
-	if (!READ_ONCE(ring_limit) || p == OMI_RC_NODE)
-		return slots;
-	return min(slots, pr->tq[q].dql.limit + 1);
-}
-
-/* txq lock held, peer (re)connected with slots per ring: new counters. */
-static void peer_ring_reset(struct omi_peer *pr, unsigned int q, u32 slots)
-{
-	struct dql *dql = &pr->tq[q].dql;
-
-	dql_init(dql, HZ);
-	dql->min_limit = min_t(u32, 8, slots - 1);
-	dql->max_limit = slots - 1;
-	dql->limit = dql->min_limit;
 }
 
 /* txq lock held. Wake queue q if every live peer has room on it. */
@@ -1407,13 +1369,12 @@ static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
 		for_each_set_bit(p, &m, OMI_MAX_NODES) {
 			struct omi_peer *pr = &ep->peer[p];
 			u32 used = b->base[p] + b->cnt[p] - pr->tq[q].tail;
-			u32 cap = peer_ring_cap(pr, p, q);
 
-			if (used >= cap) {
+			if (used >= pr->slots) {
 				peer_refresh_tail(ep, p, q);
 				used = b->base[p] + b->cnt[p] - pr->tq[q].tail;
 			}
-			if (used >= cap)
+			if (used >= pr->slots)
 				room = false;
 		}
 		if (!room)
@@ -1516,11 +1477,8 @@ static void tx_complete(struct omi_ep *ep, struct omi_chan *ch,
 	 * free again.
 	 */
 	if (!ret)
-		for (i = 0; i < OMI_MAX_NODES; i++) {
+		for (i = 0; i < OMI_MAX_NODES; i++)
 			ep->peer[i].tq[q].head = b->base[i] + b->cnt[i];
-			if (b->cnt[i])
-				dql_queued(&ep->peer[i].tq[q].dql, b->cnt[i]);
-		}
 	if (b->n)
 		txq->done_gen = b->gen;
 	if (omi_maybe_wake(ep, txq))
@@ -2707,7 +2665,6 @@ static void peer_up(struct omi_ep *ep, unsigned int p, struct omi_cons *c)
 		pr->tq[q].head = 0;
 		pr->tq[q].tail = q < nq ? READ_ONCE(*(u32 *)((void *)ep->bar +
 						    cons_tail_off(p, q))) : 0;
-		peer_ring_reset(pr, q, OMI_RING_SLOTS / nq);
 	}
 	pr->db_off = db_off;
 	WRITE_ONCE(pr->db_ok, db);
@@ -2873,10 +2830,8 @@ static void rc_gw2_poll(struct omi_ep *ep, bool up)
 	 * if the peer only went down. A head of 0 against an old tail
 	 * would look like a full ring forever.
 	 */
-	for (q = 0; q < OMI_MAX_QUEUES; q++) {
+	for (q = 0; q < OMI_MAX_QUEUES; q++)
 		pr->tq[q].head = pr->tq[q].tail = q ? 0 : READ_ONCE(c->tail);
-		peer_ring_reset(pr, q, slots);
-	}
 	WRITE_ONCE(pr->db_ok, false);
 	pr->state = OMI_PEER_UP;
 	WRITE_ONCE(ep->up_mask, ep->up_mask | BIT(OMI_RC_NODE));
@@ -3417,7 +3372,6 @@ static const struct {
 
 /* Per-queue RX packets, so ethtool -S shows the RSS spread. */
 #define OMI_QSTATS	OMI_MAX_QUEUES
-#define OMI_LSTATS	OMI_MAX_NODES	/* slot_limit_peer<N> */
 
 static void omi_get_drvinfo(struct net_device *ndev, struct ethtool_drvinfo *info)
 {
@@ -3431,8 +3385,7 @@ static void omi_get_drvinfo(struct net_device *ndev, struct ethtool_drvinfo *inf
 
 static int omi_get_sset_count(struct net_device *ndev, int sset)
 {
-	return sset == ETH_SS_STATS ? ARRAY_SIZE(omi_stats) + OMI_QSTATS + OMI_LSTATS :
-				      -EOPNOTSUPP;
+	return sset == ETH_SS_STATS ? ARRAY_SIZE(omi_stats) + OMI_QSTATS : -EOPNOTSUPP;
 }
 
 static void omi_get_strings(struct net_device *ndev, u32 sset, u8 *buf)
@@ -3446,9 +3399,6 @@ static void omi_get_strings(struct net_device *ndev, u32 sset, u8 *buf)
 	for (i = 0; i < OMI_QSTATS; i++)
 		snprintf(buf + (ARRAY_SIZE(omi_stats) + i) * ETH_GSTRING_LEN,
 			 ETH_GSTRING_LEN, "rx_q%d_packets", i);
-	for (i = 0; i < OMI_LSTATS; i++)
-		snprintf(buf + (ARRAY_SIZE(omi_stats) + OMI_QSTATS + i) * ETH_GSTRING_LEN,
-			 ETH_GSTRING_LEN, "slot_limit_peer%d", i);
 }
 
 static u64 omi_stat_one(void *grp, size_t off, size_t sync)
@@ -3495,15 +3445,6 @@ static void omi_get_ethtool_stats(struct net_device *ndev,
 	}
 	for (k = 0; k < OMI_QSTATS; k++)
 		data[i + k] = k < ep->nq ? omi_read(&ep->rxq[k].rs, packets) : 0;
-	/* Sum over the peer's queues of the slots we may fill (gauge). */
-	for (k = 0; k < OMI_LSTATS; k++) {
-		struct omi_peer *pr = &ep->peer[k];
-		unsigned int q;
-
-		data[i + OMI_QSTATS + k] = 0;
-		for (q = 0; q < READ_ONCE(pr->nq); q++)
-			data[i + OMI_QSTATS + k] += peer_ring_cap(pr, k, q);
-	}
 }
 
 static void omi_get_channels(struct net_device *ndev, struct ethtool_channels *ch)
