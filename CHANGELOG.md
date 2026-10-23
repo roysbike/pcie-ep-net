@@ -21,8 +21,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   module parameter `tx_chain` (on, writable at runtime) and ethtool
   counter `tx_dma_chained`. A run now advances only the heads of the
   peers it went to. No wire or BAR change.
-- openmiop-ep: module parameter `tx_batch` (1-32, default 32, writable
-  at runtime): the most frames per eDMA run.
+- openmiop-ep: at most 16 frames per eDMA run (was 32), module parameter
+  `tx_batch` (1-32, writable at runtime). With chained runs this halves
+  the BQL limit (~288 KB per queue): on two blades one TCP stream 8.5
+  instead of 8.0 Gbit/s, eight streams 11.8 Gbit/s, ping under that load
+  ~1.2 instead of ~1.4 ms on average.
 
 ## [0.6.1] - 2026-10-20
 

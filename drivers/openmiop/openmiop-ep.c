@@ -251,7 +251,7 @@ struct edma_lli {
 #define OMI_MAX_CH		2	/* eDMA write channels we drive */
 #define OMI_GW_PULL_BATCH	16	/* gateway slots per read run */
 
-static unsigned int tx_batch = OMI_TX_BATCH;
+static unsigned int tx_batch = 16;
 module_param(tx_batch, uint, 0644);
 MODULE_PARM_DESC(tx_batch, "Frames per eDMA run at most (1-32); shorter runs keep less queued below the qdisc");
 

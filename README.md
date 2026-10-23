@@ -250,7 +250,7 @@ the releases are tested with.
 | `rx_doorbell` | on | RX interrupt raised by the sender (Linux 6.10+ with the GIC ITS; off: poll) |
 | `tx_irq` | on | wait for eDMA runs on the done interrupt (off: poll) |
 | `tx_chain` | on | build the next eDMA run while one is on the wire and start it at its done; writable at runtime |
-| `tx_batch` | 32 | frames per eDMA run at most (1-32); writable at runtime |
+| `tx_batch` | 16 | frames per eDMA run at most (1-32); writable at runtime |
 | `tx_cpus` | empty | CPUs for the TX threads and eDMA interrupts, e.g. `4-7`; empty: the biggest cores (Cortex-A76 on RK3588) |
 | `p2p_csum` | on | offer and use checksum offload between blades |
 | `gw_pull`, `gw_zc` | on | read BMC gateway frames with eDMA; zero-copy on the BMC when it offers it |
