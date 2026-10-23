@@ -21,6 +21,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   module parameter `tx_chain` (on, writable at runtime) and ethtool
   counter `tx_dma_chained`. A run now advances only the heads of the
   peers it went to. No wire or BAR change.
+- openmiop-ep: module parameter `tx_batch` (1-32, default 32, writable
+  at runtime): the most frames per eDMA run.
 
 ## [0.6.1] - 2026-10-20
 

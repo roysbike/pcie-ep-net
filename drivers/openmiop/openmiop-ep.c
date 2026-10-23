@@ -251,6 +251,10 @@ struct edma_lli {
 #define OMI_MAX_CH		2	/* eDMA write channels we drive */
 #define OMI_GW_PULL_BATCH	16	/* gateway slots per read run */
 
+static unsigned int tx_batch = OMI_TX_BATCH;
+module_param(tx_batch, uint, 0644);
+MODULE_PARM_DESC(tx_batch, "Frames per eDMA run at most (1-32); shorter runs keep less queued below the qdisc");
+
 /* Local scratch at OMI_SCRATCH_OFF: per channel its two linked lists
  * and the head values they copy into peers, per queue the slot headers,
  * and the doorbell values. Peers and the RC never write here.
@@ -1323,7 +1327,8 @@ static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
 
 	spin_lock_bh(&txq->lock);
 	first = prev ? prev->first + prev->n : txq->cons;
-	avail = min_t(u32, txq->prod - first, OMI_TX_BATCH);
+	avail = min_t(u32, txq->prod - first,
+		      clamp_t(u32, READ_ONCE(tx_batch), 1, OMI_TX_BATCH));
 	spin_unlock_bh(&txq->lock);
 	b->first = first;
 	if (!avail)
