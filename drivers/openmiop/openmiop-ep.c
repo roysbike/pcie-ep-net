@@ -148,6 +148,10 @@ static bool tx_irq = true;
 module_param(tx_irq, bool, 0444);
 MODULE_PARM_DESC(tx_irq, "Wait for eDMA runs on the done interrupt (off: poll the done bit)");
 
+static bool tx_chain = true;
+module_param(tx_chain, bool, 0644);
+MODULE_PARM_DESC(tx_chain, "Build the next eDMA run while one is on the wire and start it at its done (off: build after the done)");
+
 static bool rx_doorbell = true;
 module_param(rx_doorbell, bool, 0444);
 MODULE_PARM_DESC(rx_doorbell, "Offer peers a doorbell that raises an RX interrupt (needs the GIC ITS and Linux 6.10+; off: poll)");
@@ -247,6 +251,10 @@ struct edma_lli {
 #define OMI_MAX_CH		2	/* eDMA write channels we drive */
 #define OMI_GW_PULL_BATCH	16	/* gateway slots per read run */
 
+static unsigned int tx_batch = 16;
+module_param(tx_batch, uint, 0644);
+MODULE_PARM_DESC(tx_batch, "Frames per eDMA run at most (1-32); shorter runs keep less queued below the qdisc");
+
 /* Local scratch at OMI_SCRATCH_OFF: per channel its two linked lists
  * and the head values they copy into peers, per queue the slot headers,
  * and the doorbell values. Peers and the RC never write here.
@@ -266,8 +274,8 @@ struct omi_scratch {
 
 /* One eDMA run: a contiguous range of one queue's entries and the slots
  * it takes in each peer's ring for that queue. Two of them alternate per
- * channel, so the next run is built while the previous one is on the
- * wire.
+ * channel: with tx_chain the next run is built while the previous one is
+ * on the wire and starts at its done, before the previous one is retired.
  */
 struct omi_batch {
 	u8 q;				/* queue it was built from */
@@ -280,6 +288,7 @@ struct omi_batch {
 	u8 db_mask;			/* peers rung at the end of the run */
 	int nel;			/* list elements, 0: nothing to send */
 	int list;			/* which scratch list */
+	u64 t0;				/* when it was started */
 };
 
 /* Without an RX interrupt the ctl thread polls. It polls every
@@ -388,7 +397,7 @@ struct omi_xmit_stats {			/* per TX queue: xmit */
 struct omi_tx_stats {			/* per channel: its TX thread */
 	u64_stats_t p2p_frames, dma_runs, dma_elems, dma_errors, dropped,
 		    peer_full_drops, queue_wakes, dma_wait_ns, dma_bytes,
-		    irq_lost, doorbells;
+		    irq_lost, doorbells, dma_chained;
 	struct u64_stats_sync syncp;
 };
 
@@ -1294,10 +1303,12 @@ static void txd_drop_unmapped(struct omi_ep *ep, struct omi_chan *ch,
  * in order while every target peer has a free slot in its ring for this
  * queue. Per target: the 16-byte slot header from scratch, then the skb
  * segments. At the end one head write per touched peer, then their
- * doorbells.
+ * doorbells. prev is the channel's run on the wire, if any: on the same
+ * queue the new run goes on after its frames and its slots.
  */
 static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
-		     struct omi_txq *txq, struct omi_batch *b, int list)
+		     struct omi_txq *txq, struct omi_batch *b, int list,
+		     const struct omi_batch *prev)
 {
 	struct omi_chan_scratch *cs = &ep->scratch->ch[ch->idx];
 	struct omi_scratch *sc = ep->scratch;
@@ -1308,13 +1319,16 @@ static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
 	u8 touched = 0, up;
 	int nel = 0;
 
+	if (prev && prev->q != q)
+		prev = NULL;
 	memset(b, 0, sizeof(*b));
 	b->list = list;
 	b->q = q;
 
 	spin_lock_bh(&txq->lock);
-	first = txq->cons;
-	avail = min_t(u32, txq->prod - first, OMI_TX_BATCH);
+	first = prev ? prev->first + prev->n : txq->cons;
+	avail = min_t(u32, txq->prod - first,
+		      clamp_t(u32, READ_ONCE(tx_batch), 1, OMI_TX_BATCH));
 	spin_unlock_bh(&txq->lock);
 	b->first = first;
 	if (!avail)
@@ -1334,8 +1348,12 @@ static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
 
 	spin_lock_bh(&txq->lock);
 	up = READ_ONCE(ep->up_mask);
+	/* A peer prev sends to cannot be reset before prev is retired
+	 * (peer_wait_runs); for the others the head is current.
+	 */
 	for (i = 0; i < OMI_MAX_NODES; i++)
-		b->base[i] = ep->peer[i].tq[q].head;
+		b->base[i] = prev && prev->cnt[i] ? prev->base[i] + prev->cnt[i] :
+						    ep->peer[i].tq[q].head;
 	for (b->n = 0; b->n < avail; b->n++) {
 		u32 e = (first + b->n) & (OMI_TXQ_SIZE - 1);
 		struct omi_txd *d = &txq->ring[e];
@@ -1453,13 +1471,14 @@ static void tx_build(struct omi_ep *ep, struct omi_chan *ch,
 static void tx_complete(struct omi_ep *ep, struct omi_chan *ch,
 			struct omi_txq *txq, struct omi_batch *b, int ret)
 {
-	unsigned int q = txq->idx;
+	unsigned int q = txq->idx, bytes = 0;
 	u32 i;
 
 	spin_lock_bh(&txq->lock);
 	for (i = 0; i < b->n; i++) {
 		struct omi_txd *d = &txq->ring[(b->first + i) & (OMI_TXQ_SIZE - 1)];
 
+		bytes += d->skb->len;
 		txd_release(ep, d, d->mask, q);
 		txd_unmap(ep, d);
 		if (d->mask && !ret) {
@@ -1473,15 +1492,33 @@ static void tx_complete(struct omi_ep *ep, struct omi_chan *ch,
 	}
 	txq->cons += b->n;
 	/* On failure the peers never saw the new heads; the slots are
-	 * free again.
+	 * free again. Only the peers the run went to: another one may have
+	 * come up (peer_up() resets its head) since the run was built.
 	 */
 	if (!ret)
 		for (i = 0; i < OMI_MAX_NODES; i++)
-			ep->peer[i].tq[q].head = b->base[i] + b->cnt[i];
+			if (b->cnt[i])
+				ep->peer[i].tq[q].head = b->base[i] + b->cnt[i];
 	if (b->n)
 		txq->done_gen = b->gen;
 	if (omi_maybe_wake(ep, txq))
 		omi_inc(&ch->ts, queue_wakes);
+	spin_unlock_bh(&txq->lock);
+	/* BQL: every frame of the run leaves the driver, sent or dropped.
+	 * Only this channel's thread completes queue q.
+	 */
+	if (b->n)
+		netdev_tx_completed_queue(netdev_get_tx_queue(ep->ndev, q), b->n, bytes);
+}
+
+/* A run built ahead that is not started (the run before it failed):
+ * its frames stay queued and are built again. Count it as retired for
+ * peer_wait_runs().
+ */
+static void tx_discard(struct omi_txq *txq, const struct omi_batch *b)
+{
+	spin_lock_bh(&txq->lock);
+	txq->done_gen = b->gen;
 	spin_unlock_bh(&txq->lock);
 }
 
@@ -1582,13 +1619,14 @@ static int tx_wait_irq(struct omi_ep *ep, struct omi_chan *ch,
 	return st & EDMA_CH_ABORT(ch->idx) ? -EIO : 0;
 }
 
-static int tx_wait_run(struct omi_ep *ep, struct omi_chan *ch,
-		       struct omi_txq *txq, struct omi_batch *b, u64 t0)
+/* Wait for run b; meanwhile map what is queued on txq behind run pb. */
+static int tx_wait_run(struct omi_ep *ep, struct omi_chan *ch, struct omi_batch *b,
+		       struct omi_txq *txq, struct omi_batch *pb)
 {
-	int ret = ch->irq ? tx_wait_irq(ep, ch, txq, b) :
-			    tx_wait_premap(ep, ch, txq, b);
+	int ret = ch->irq ? tx_wait_irq(ep, ch, txq, pb) :
+			    tx_wait_premap(ep, ch, txq, pb);
 
-	omi_add(&ch->ts, dma_wait_ns, ktime_get_ns() - t0);
+	omi_add(&ch->ts, dma_wait_ns, ktime_get_ns() - b->t0);
 	if (ret) {
 		edma_reset(ep, ch);
 		dev_err_ratelimited(ep->dev, "eDMA channel %u: run of %d elements failed (%d)\n",
@@ -1630,6 +1668,42 @@ static bool ch_credit_wake(struct omi_ep *ep, struct omi_chan *ch)
 	return stopped;
 }
 
+static void tx_kick(struct omi_ep *ep, struct omi_chan *ch, struct omi_batch *b)
+{
+	b->t0 = ktime_get_ns();
+	atomic_set(&ch->irq_st, 0);
+	edma_kick(ep, ch, b);
+}
+
+/*
+ * Build a run into list for channel ch from the next of its queues that
+ * has frames (round robin). prev: the run on the wire, if any. Returns
+ * the queue, NULL if no queue gave a frame; *waiting is set if one has
+ * frames that wait for credit.
+ */
+static struct omi_txq *tx_pick(struct omi_ep *ep, struct omi_chan *ch,
+			       struct omi_batch *b, int list,
+			       const struct omi_batch *prev, bool *waiting)
+{
+	unsigned int served = DIV_ROUND_UP(ep->nq - ch->idx, ep->nch);
+	unsigned int k;
+
+	b->n = 0;
+	for (k = 0; k < served; k++) {
+		unsigned int q = ch->idx + ((ch->rr + k) % served) * ep->nch;
+		struct omi_txq *txq = &ep->txq[q];
+
+		tx_build(ep, ch, txq, b, list, prev);
+		if (b->n) {
+			ch->rr = (ch->rr + k + 1) % served;
+			return txq;
+		}
+		if (READ_ONCE(txq->prod) != READ_ONCE(txq->cons))
+			*waiting = true;
+	}
+	return NULL;
+}
+
 /* The queues a channel serves: q with q % nch == channel. */
 static bool ch_has_frames(struct omi_ep *ep, struct omi_chan *ch)
 {
@@ -1642,27 +1716,25 @@ static bool ch_has_frames(struct omi_ep *ep, struct omi_chan *ch)
 }
 
 /*
- * One thread per eDMA channel. While a run is on the wire, the frames
- * queuing behind it are mapped (tx_wait_*). When it is done, the next
- * run is built from the next of the channel's queues that has frames
- * and started at once: the engine idles only for the list build, and
- * runs grow with the load, which amortises the fixed cost of a run
- * (~13 us measured). The channels run in parallel.
+ * One thread per eDMA channel. While a run is on the wire, the next one
+ * is built from the next of the channel's queues that has frames
+ * (tx_chain) and the frames queuing behind it are mapped (tx_wait_*).
+ * At the done the next run is started first and the finished one
+ * retired after, so the engine idles only for the done interrupt and
+ * the kick. Runs grow with the load, which amortises the fixed cost of
+ * a run (~13 us measured). The channels run in parallel.
  */
 static int tx_thread(void *data)
 {
 	struct omi_chan *ch = data;
 	struct omi_ep *ep = ch->ep;
-	unsigned int served = DIV_ROUND_UP(ep->nq - ch->idx, ep->nch);
 	int list = 0;
 
 	set_user_nice(current, -20);
 	while (!kthread_should_stop()) {
 		struct omi_batch *b = &ch->batch[list];
-		struct omi_txq *txq = NULL;
+		struct omi_txq *txq;
 		bool waiting = false;
-		unsigned int k;
-		u64 t0;
 		int ret;
 
 		/* Under sustained load there is always work. Talos runs
@@ -1671,20 +1743,8 @@ static int tx_thread(void *data)
 		 * RCU for 21 s in a 10 minute bidirectional run.
 		 */
 		cond_resched();
-		b->n = 0;
-		for (k = 0; k < served; k++) {
-			unsigned int q = ch->idx + ((ch->rr + k) % served) * ep->nch;
-
-			txq = &ep->txq[q];
-			tx_build(ep, ch, txq, b, list);
-			if (b->n) {
-				ch->rr = (ch->rr + k + 1) % served;
-				break;
-			}
-			if (READ_ONCE(txq->prod) != READ_ONCE(txq->cons))
-				waiting = true;
-		}
-		if (!b->n) {
+		txq = tx_pick(ep, ch, b, list, NULL, &waiting);
+		if (!txq) {
 			if (waiting || ch_credit_wake(ep, ch)) {
 				/* The first frame, or a stopped queue, waits for
 				 * credit.
@@ -1701,12 +1761,41 @@ static int tx_thread(void *data)
 			tx_complete(ep, ch, txq, b, 0);
 			continue;
 		}
-		t0 = ktime_get_ns();
-		atomic_set(&ch->irq_st, 0);
-		edma_kick(ep, ch, b);
-		ret = tx_wait_run(ep, ch, txq, b, t0);
-		tx_complete(ep, ch, txq, b, ret);
-		list ^= 1;
+		tx_kick(ep, ch, b);
+		/* b is on the wire. */
+		for (;;) {
+			struct omi_batch *next = NULL;
+			struct omi_txq *ntxq = NULL;
+
+			list ^= 1;
+			if (READ_ONCE(tx_chain) && !kthread_should_stop()) {
+				next = &ch->batch[list];
+				ntxq = tx_pick(ep, ch, next, list, b, &waiting);
+				if (!ntxq)
+					next = NULL;
+			}
+			ret = next ? tx_wait_run(ep, ch, b, ntxq, next) :
+				     tx_wait_run(ep, ch, b, txq, b);
+			if (next && next->nel && !ret) {
+				tx_kick(ep, ch, next);
+				omi_inc(&ch->ts, dma_chained);
+			}
+			tx_complete(ep, ch, txq, b, ret);
+			if (!next)
+				break;
+			if (ret) {
+				/* Built on b's heads, which did not go out. */
+				tx_discard(ntxq, next);
+				break;
+			}
+			if (!next->nel) {
+				tx_complete(ep, ch, ntxq, next, 0);
+				break;
+			}
+			b = next;
+			txq = ntxq;
+			cond_resched();
+		}
 	}
 	return 0;
 }
@@ -1924,6 +2013,11 @@ static netdev_tx_t omi_xmit(struct sk_buff *skb, struct net_device *ndev)
 		p2p &= READ_ONCE(ep->up_mask);
 		if (p2p)
 			queued = txq_add(ep, txq, skb, p2p);
+		/* BQL: counted under the lock that tx_build() takes to consume
+		 * the frame, so its completion cannot come first.
+		 */
+		if (queued)
+			netdev_tx_sent_queue(netdev_get_tx_queue(ndev, q), len);
 		/* Stop in the same lock section as the enqueue that fills a
 		 * ring, so the stack never needs NETDEV_TX_BUSY: a requeued
 		 * skb can be overtaken by later ones from another CPU.
@@ -3258,6 +3352,7 @@ static int omi_stop(struct net_device *ndev)
 	}
 	for (q = 0; q < ep->nq; q++) {
 		txq_purge(ep, &ep->txq[q]);
+		netdev_tx_reset_queue(netdev_get_tx_queue(ndev, q));
 		napi_disable(&ep->rxq[q].napi);
 	}
 	return 0;
@@ -3333,6 +3428,7 @@ static const struct {
 	OMI_STAT("tx_dma_bytes", OMI_TS, struct omi_tx_stats, dma_bytes),
 	OMI_STAT("tx_dma_irq_lost", OMI_TS, struct omi_tx_stats, irq_lost),
 	OMI_STAT("tx_doorbells", OMI_TS, struct omi_tx_stats, doorbells),
+	OMI_STAT("tx_dma_chained", OMI_TS, struct omi_tx_stats, dma_chained),
 	OMI_STAT("rx_p2p_packets", OMI_RS, struct omi_rx_stats, p2p_packets),
 	OMI_STAT("rx_gw_packets", OMI_RS, struct omi_rx_stats, gw_packets),
 	OMI_STAT("rx_bad_len", OMI_RS, struct omi_rx_stats, errors),

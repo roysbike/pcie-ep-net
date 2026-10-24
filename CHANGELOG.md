@@ -5,6 +5,40 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-24
+
+Faster TX with less latency under load, sender side only: v0.7 blades
+work with v0.6 blades and the BMC unchanged.
+
+### Changed
+
+- openmiop-ep: byte queue limits (BQL) on every TX queue. The driver
+  kept up to 256 frames per queue (~2.3 MB at MTU 9000, ~7 ms) below the
+  qdisc, so fq or fq_codel could not reorder them and latency under load
+  had tails of 13-30 ms. Bytes are counted when a frame enters the driver
+  ring and completed when its eDMA run is retired (sent or dropped);
+  stopping the interface resets the counters. No wire or BAR change:
+  works with v0.6 peers and the BMC unchanged.
+- openmiop-ep: chained eDMA runs. Each TX thread builds the next run
+  while the current one is on the wire and starts it at the done
+  interrupt, before it retires the finished run; before, the engine
+  idled for the retire and the next list build (~13 us per run). New
+  module parameter `tx_chain` (on, writable at runtime) and ethtool
+  counter `tx_dma_chained`. A run now advances only the heads of the
+  peers it went to. No wire or BAR change.
+- openmiop-ep: at most 16 frames per eDMA run (was 32), module parameter
+  `tx_batch` (1-32, writable at runtime). With chained runs this halves
+  the BQL limit (~288 KB per queue): on two blades one TCP stream 8.5
+  instead of 8.0 Gbit/s, eight streams 11.8 Gbit/s, ping under that load
+  ~1.2 instead of ~1.4 ms on average.
+
+### Fixed
+
+- openmiop-ep: a run retired after a peer came up again could overwrite
+  that peer's freshly reset ring head with the head from before the
+  reconnect (the run advanced every peer's head, not only those it went
+  to). Part of the chained-runs change above.
+
 ## [0.6.1] - 2026-10-20
 
 The Blade 3 board modules move here; the drivers are the same as in

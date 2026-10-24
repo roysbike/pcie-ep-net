@@ -13,10 +13,10 @@
 Mixtile; кода и прошивок Mixtile в ней нет. Лицензия: GPL-2.0-or-later
 ([LICENSE](LICENSE)).
 
-**Текущий релиз: [v0.6.1](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.1)**
-(2026-10-21), входит в OpenMIOP Stack v0.6.1.
-Release notes: [v0.6.1](docs/release-notes/v0.6.1.md) ·
-[v0.6.0](docs/release-notes/v0.6.0.md) · [CHANGELOG.md](CHANGELOG.md).
+**Текущий релиз: [v0.7.0](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.7.0)**
+(2026-10-24), входит в OpenMIOP Stack v0.7.0.
+Release notes: [v0.7.0](docs/release-notes/v0.7.0.md) ·
+[v0.6.1](docs/release-notes/v0.6.1.md) · [CHANGELOG.md](CHANGELOG.md).
 
 ## Содержание
 
@@ -41,13 +41,13 @@ Mixtile поставляет Cluster Box со своей прошивкой BMC 
 драйвером для блейдов (MIOP). **OpenMIOP Stack** — независимая открытая
 замена из трёх репозиториев, которые выпускаются вместе:
 
-| Репозиторий | Что даёт | Stack v0.6.1 |
+| Репозиторий | Что даёт | Stack v0.7.0 |
 | --- | --- | --- |
-| **pcie-ep-net** (этот) | драйвер блейда `openmiop-ep` (`omi0`), модуль BMC `omi-rc`, модули платы Blade 3 | [v0.6.1](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.1) |
-| [mixtile-talos](https://github.com/roysbike/mixtile-talos) | Talos Linux (Kubernetes) для Blade 3 со встроенным openmiop | [v0.6.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.1) (Talos v1.14.4) |
-| [mixtile-clusterbox-mt7620a-openwrt](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt) | OpenWrt для BMC: питание и консоли блейдов, сторона BMC в openmiop, сетевой край кластера, веб-интерфейс, обновления | [v0.4.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.4.0) (OpenWrt 25.12.6) |
+| **pcie-ep-net** (этот) | драйвер блейда `openmiop-ep` (`omi0`), модуль BMC `omi-rc`, модули платы Blade 3 | [v0.7.0](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.7.0) |
+| [mixtile-talos](https://github.com/roysbike/mixtile-talos) | Talos Linux (Kubernetes) для Blade 3 со встроенным openmiop | [v0.7.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.7.0) (Talos v1.14.4) |
+| [mixtile-clusterbox-mt7620a-openwrt](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt) | OpenWrt для BMC: питание и консоли блейдов, сторона BMC в openmiop, сетевой край кластера, веб-интерфейс, обновления | [v0.4.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.4.1) (OpenWrt 25.12.6) |
 
-Протокол Stack v0.6.1: кадры OpenMIOP v4 между блейдами с возможностями,
+Протокол Stack v0.7.0: кадры OpenMIOP v4 между блейдами с возможностями,
 которые согласуются для каждого соединения (RX doorbell, несколько
 очередей, checksum offload); push-режим, gateway pull и zero-copy в
 сторону BMC.
@@ -147,14 +147,14 @@ Mixtile поставляет Cluster Box со своей прошивкой BMC 
 | ОС блейда, проверено на железе | Talos v1.14.4 (ядро 6.18.57-talos) через [mixtile-talos](https://github.com/roysbike/mixtile-talos), основная платформа; Debian 12 с ядром Mixtile 6.1.99 (проверено с v0.1) |
 | ОС блейда, сборка в CI | DKMS-пакет на ядрах Debian 12/13 и Ubuntu 22.04 (HWE)/24.04 arm64; любое ядро 6.1+ с заголовками. Прерываниям RX нужен Linux 6.10+ (на старых ядрах опрос) |
 | Device tree | `pcie@fe150000` в режиме PCIe endpoint: `openmiop,rk3588-pcie-ep` (mixtile-talos) или `mixtile,miop-ep-rk3588` (U-Boot Mixtile) |
-| BMC | прошивка ClusterBox v0.4.0 (OpenWrt 25.12.6, Linux 6.12) или v0.3.0 (OpenWrt 23.05, Linux 5.15) со встроенным `omi-rc` |
+| BMC | прошивка ClusterBox v0.4.1 (OpenWrt 25.12.6, Linux 6.12) или v0.3.0 (OpenWrt 23.05, Linux 5.15) со встроенным `omi-rc` |
 
 ## Установка
 
 ### 1. BMC
 
 Установите прошивку ClusterBox
-[v0.4.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.4.0).
+[v0.4.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.4.1).
 Она загружает `omi-rc` при старте (`kmod-omi-rc`), а если не вышло —
 запускает помощник (пакет `openmiop`). Больше на BMC ничего не нужно.
 
@@ -168,8 +168,8 @@ BMC получает `omi0` = 10.20.0.1/24, MTU 9000.
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-tar xzf openmiop-0.6.1-clusterbox-bmc-mipsel.tar.gz
-cd openmiop-0.6.1-clusterbox-bmc-mipsel
+tar xzf openmiop-0.7.0-clusterbox-bmc-mipsel.tar.gz
+cd openmiop-0.7.0-clusterbox-bmc-mipsel
 scp -O openmiop-rc openmiop.init root@<bmc>:/tmp/
 ssh root@<bmc> 'cp /tmp/openmiop-rc /usr/bin/openmiop-rc && chmod 755 /usr/bin/openmiop-rc &&
   cp /tmp/openmiop.init /etc/init.d/openmiop && chmod 755 /etc/init.d/openmiop &&
@@ -184,7 +184,7 @@ ssh root@<bmc> 'cp /tmp/openmiop-rc /usr/bin/openmiop-rc && chmod 755 /usr/bin/o
 ### 2. Блейды: Talos
 
 Используйте образ или установщик
-[mixtile-talos v0.6.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.1).
+[mixtile-talos v0.7.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.7.0).
 Драйвер и модули платы встроены как system extension; ничего собирать не
 нужно. В README mixtile-talos есть конфигурация машины
 (`LinkAliasConfig` для `omi0`, адрес) и порядок обновления.
@@ -192,13 +192,13 @@ ssh root@<bmc> 'cp /tmp/openmiop-rc /usr/bin/openmiop-rc && chmod 755 /usr/bin/o
 ### 2. Блейды: Debian или Ubuntu
 
 Установите DKMS-пакет из
-[релиза](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.1).
+[релиза](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.7.0).
 DKMS собирает модуль под работающее ядро (нужны его заголовки; на образе
 Mixtile Debian 12 пакет сам находит `/usr/src/linux-headers-6.1-rockchip`).
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-sudo apt install ./openmiop-dkms_0.6.1_all.deb
+sudo apt install ./openmiop-dkms_0.7.0_all.deb
 echo 10.20.0.<N>/24 | sudo tee /etc/openmiop.addr    # свой адрес на каждый блейд; .1 — это BMC
 sudo reboot
 ```
@@ -251,6 +251,8 @@ MTU 9000 у всех участников.
 | `queues` | 4 | пары очередей TX/RX (1-4); пиры с одинаковым числом используют отдельное кольцо на очередь |
 | `rx_doorbell` | on | прерывание RX от отправителя (Linux 6.10+ с GIC ITS; off: опрос) |
 | `tx_irq` | on | ждать завершения eDMA по прерыванию (off: опрос) |
+| `tx_chain` | on | собирать следующий запуск eDMA, пока идёт текущий, и стартовать его сразу по завершении; меняется на ходу |
+| `tx_batch` | 16 | не больше стольких кадров в одном запуске eDMA (1-32); меняется на ходу |
 | `tx_cpus` | пусто | CPU для потоков отправки и прерываний eDMA, например `4-7`; пусто: самые мощные ядра (Cortex-A76 на RK3588) |
 | `p2p_csum` | on | предлагать и использовать checksum offload между блейдами |
 | `gw_pull`, `gw_zc` | on | забирать кадры шлюза BMC своим eDMA; zero-copy, если BMC его предлагает |
