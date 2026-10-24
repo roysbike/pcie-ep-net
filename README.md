@@ -13,10 +13,10 @@ The implementation is called **openmiop** (interface `omi0`, on-wire magic
 and contains no Mixtile code or firmware. License: GPL-2.0-or-later
 ([LICENSE](LICENSE)).
 
-**Current release: [v0.6.1](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.1)**
-(2026-10-21), part of OpenMIOP Stack v0.6.1.
-Release notes: [v0.6.1](docs/release-notes/v0.6.1.md) ·
-[v0.6.0](docs/release-notes/v0.6.0.md) · [CHANGELOG.md](CHANGELOG.md).
+**Current release: [v0.7.0](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.7.0)**
+(2026-10-24), part of OpenMIOP Stack v0.7.0.
+Release notes: [v0.7.0](docs/release-notes/v0.7.0.md) ·
+[v0.6.1](docs/release-notes/v0.6.1.md) · [CHANGELOG.md](CHANGELOG.md).
 
 ## Contents
 
@@ -41,20 +41,20 @@ Mixtile ships the Cluster Box with its own BMC firmware and its own blade
 network driver (MIOP). The **OpenMIOP Stack** is an independent, open
 replacement made of three repositories that are released together:
 
-| Repository | What it gives you | Stack v0.6.1 |
+| Repository | What it gives you | Stack v0.7.0 |
 | --- | --- | --- |
-| **pcie-ep-net** (this one) | the blade driver `openmiop-ep` (`omi0`), the BMC module `omi-rc`, the Blade 3 board modules | [v0.6.1](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.1) |
-| [mixtile-talos](https://github.com/roysbike/mixtile-talos) | Talos Linux (Kubernetes) for Blade 3 with openmiop built in | [v0.6.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.1) (Talos v1.14.4) |
-| [mixtile-clusterbox-mt7620a-openwrt](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt) | OpenWrt for the BMC: blade power and consoles, the BMC side of openmiop, the cluster's network edge, web UI, updates | [v0.4.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.4.0) (OpenWrt 25.12.6) |
+| **pcie-ep-net** (this one) | the blade driver `openmiop-ep` (`omi0`), the BMC module `omi-rc`, the Blade 3 board modules | [v0.7.0](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.7.0) |
+| [mixtile-talos](https://github.com/roysbike/mixtile-talos) | Talos Linux (Kubernetes) for Blade 3 with openmiop built in | [v0.7.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.7.0) (Talos v1.14.4) |
+| [mixtile-clusterbox-mt7620a-openwrt](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt) | OpenWrt for the BMC: blade power and consoles, the BMC side of openmiop, the cluster's network edge, web UI, updates | [v0.4.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.4.1) (OpenWrt 25.12.6) |
 
-Protocol of Stack v0.6.1: OpenMIOP v4 framing between blades with the
+Protocol of Stack v0.7.0: OpenMIOP v4 framing between blades with the
 per-connection features RX doorbell, multiqueue and checksum offload;
 push mode, gateway pull and zero-copy towards the BMC.
 
 ## Features
 
-* **Fast blade-to-blade network.** 7.8-8.0 Gbit/s for one TCP flow,
-  ~11 Gbit/s with four flows between two blades, ~25 Gbit/s total with
+* **Fast blade-to-blade network.** ~8.5 Gbit/s for one TCP flow,
+  ~11.8 Gbit/s with four flows between two blades, ~25 Gbit/s total with
   all four blades sending. MTU 9000 (up to 9246).
 * **Plain Ethernet for the OS.** `omi0` is a normal Linux netdev: ARP,
   IPv4, IPv6 with neighbour discovery, broadcast and multicast, MAC
@@ -145,14 +145,14 @@ Full description (BAR layout, control plane, memory ordering, L2):
 | Blade OS, tested on hardware | Talos v1.14.4 (kernel 6.18.57-talos) via [mixtile-talos](https://github.com/roysbike/mixtile-talos), the reference platform; Debian 12 with the Mixtile vendor kernel 6.1.99 (tested with v0.1) |
 | Blade OS, built in CI | DKMS package on Debian 12/13 and Ubuntu 22.04 (HWE)/24.04 arm64 kernels; any kernel 6.1 or newer with its headers. RX interrupts need Linux 6.10+ (older kernels poll) |
 | Device tree | `pcie@fe150000` as PCIe endpoint: `openmiop,rk3588-pcie-ep` (mixtile-talos) or `mixtile,miop-ep-rk3588` (Mixtile U-Boot) |
-| BMC | ClusterBox firmware v0.4.0 (OpenWrt 25.12.6, Linux 6.12) or v0.3.0 (OpenWrt 23.05, Linux 5.15) with `omi-rc` built in |
+| BMC | ClusterBox firmware v0.4.1 (OpenWrt 25.12.6, Linux 6.12) or v0.3.0 (OpenWrt 23.05, Linux 5.15) with `omi-rc` built in |
 
 ## Install
 
 ### 1. The BMC
 
 Install the ClusterBox firmware
-[v0.4.0](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.4.0).
+[v0.4.1](https://github.com/roysbike/mixtile-clusterbox-mt7620a-openwrt/releases/tag/v0.4.1).
 It loads `omi-rc` at boot (`kmod-omi-rc`) and falls back to the helper
 (`openmiop` package). Nothing else is needed on the BMC.
 
@@ -166,8 +166,8 @@ Use the release asset `openmiop-<version>-clusterbox-bmc-mipsel.tar.gz`
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-tar xzf openmiop-0.6.1-clusterbox-bmc-mipsel.tar.gz
-cd openmiop-0.6.1-clusterbox-bmc-mipsel
+tar xzf openmiop-0.7.0-clusterbox-bmc-mipsel.tar.gz
+cd openmiop-0.7.0-clusterbox-bmc-mipsel
 scp -O openmiop-rc openmiop.init root@<bmc>:/tmp/
 ssh root@<bmc> 'cp /tmp/openmiop-rc /usr/bin/openmiop-rc && chmod 755 /usr/bin/openmiop-rc &&
   cp /tmp/openmiop.init /etc/init.d/openmiop && chmod 755 /etc/init.d/openmiop &&
@@ -180,7 +180,7 @@ overlay can drop the execute bit. Log: `/tmp/openmiop-rc.log`.
 
 ### 2. The blades: Talos
 
-Use the [mixtile-talos v0.6.1](https://github.com/roysbike/mixtile-talos/releases/tag/v0.6.1)
+Use the [mixtile-talos v0.7.0](https://github.com/roysbike/mixtile-talos/releases/tag/v0.7.0)
 image or installer. The module and the board modules are built in as a
 system extension; nothing has to be compiled. The mixtile-talos README
 has the machine configuration (`LinkAliasConfig` for `omi0`, address)
@@ -189,14 +189,14 @@ and the upgrade procedure.
 ### 2. The blades: Debian or Ubuntu
 
 Install the DKMS package from the
-[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.6.1).
+[release](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.7.0).
 DKMS builds the module for the running kernel (its headers must be
 installed; on the Mixtile Debian 12 image the package finds
 `/usr/src/linux-headers-6.1-rockchip` by itself).
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-sudo apt install ./openmiop-dkms_0.6.1_all.deb
+sudo apt install ./openmiop-dkms_0.7.0_all.deb
 echo 10.20.0.<N>/24 | sudo tee /etc/openmiop.addr    # one address per blade; .1 is the BMC
 sudo reboot
 ```
@@ -281,8 +281,9 @@ Lab Cluster Box, four Blade 3 on Talos, MTU 9000, under cluster load:
 
 | Path | Throughput |
 | --- | --- |
-| Blade -> blade, 1 TCP flow | 7.8-8.0 Gbit/s, 0 retransmits |
-| Blade -> blade, 4 TCP flows | 11.1-11.3 Gbit/s |
+| Blade -> blade, 1 TCP flow | 8.5 Gbit/s (v0.6: 7.8-8.0) |
+| Blade -> blade, 4 / 8 TCP flows | 11.8-11.9 / 11.5-11.9 Gbit/s (v0.6: 10.6-11.3) |
+| Ping under 8-flow load | ~1.4 ms average, < 5 ms max (v0.6: 1.6-1.9 / 6.6-7.6 ms) |
 | All four blades sending at once | ~25 Gbit/s total (measured with v0.3) |
 | Pod -> pod over Kube-OVN Geneve, 1 / 4 flows | 5.3-5.6 / 8.6 Gbit/s |
 | Blade <-> LAN through the BMC | ~220-280 Mbit/s (BMC CPU) |
@@ -294,7 +295,7 @@ results, older releases and the gateway history:
 ## Known limitations
 
 * **One flow = one queue.** A single TCP flow uses one queue and one eDMA
-  channel (7.8-8.0 Gbit/s); more flows spread over the four queues.
+  channel (~8.5 Gbit/s); more flows spread over the four queues.
 * **No TSO/GSO.** The stack segments to the MTU. Checksum offload works
   only between blades, not towards the BMC. Slots are a fixed 10 KiB, so
   small frames waste ring space.

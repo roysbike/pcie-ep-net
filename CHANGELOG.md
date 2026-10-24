@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-24
+
+Faster TX with less latency under load, sender side only: v0.7 blades
+work with v0.6 blades and the BMC unchanged.
+
 ### Changed
 
 - openmiop-ep: byte queue limits (BQL) on every TX queue. The driver
@@ -26,6 +31,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the BQL limit (~288 KB per queue): on two blades one TCP stream 8.5
   instead of 8.0 Gbit/s, eight streams 11.8 Gbit/s, ping under that load
   ~1.2 instead of ~1.4 ms on average.
+
+### Fixed
+
+- openmiop-ep: a run retired after a peer came up again could overwrite
+  that peer's freshly reset ring head with the head from before the
+  reconnect (the run advanced every peer's head, not only those it went
+  to). Part of the chained-runs change above.
 
 ## [0.6.1] - 2026-10-20
 
