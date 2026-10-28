@@ -70,6 +70,30 @@ static uint link_stable_ms = 1500;
 module_param(link_stable_ms, uint, 0644);
 MODULE_PARM_DESC(link_stable_ms, "A blade's link must be up this long before we touch it");
 
+/*
+ * Fan-in (three blades saturating the switch port of a fourth) delays our
+ * posted writes into that blade, and a config read queued behind them
+ * outlives the root port's completion timeout (50 ms at most). The
+ * MT7620A root port does not recover from that timeout: every switch
+ * port reads as down until the Cluster Box reboots. With the timeout
+ * disabled the read waits for the congestion instead. Our reads only
+ * go to the switch (its ports' config space) or to a blade whose link
+ * has been stable for link_stable_ms, never into a BAR.
+ */
+static bool ct_off = true;
+module_param(ct_off, bool, 0444);
+MODULE_PARM_DESC(ct_off, "Disable the root port's completion timeout (fan-in wedge)");
+
+/*
+ * A late Link Status read can still come back as garbage (seen with the
+ * timeout disabled: a port read as down for one pass under fan-in, the
+ * blade itself never lost its link). Drop a blade only once its port
+ * has read as down for this long.
+ */
+static uint link_down_ms = 100;
+module_param(link_down_ms, uint, 0644);
+MODULE_PARM_DESC(link_down_ms, "A port must read as down this long before its blade is dropped");
+
 #define LINK_POLL_MS	5
 #define LEAVE_DOWN_MS	30000	/* after a leave or release: wait for the drop */
 #define STATUS_MS	20	/* look at pushed state */
@@ -99,6 +123,8 @@ struct rc_ep {
 	struct pci_dev *pdev;		/* the blade, NULL until enumerated */
 	bool link;
 	unsigned long link_since, link_next;
+	unsigned long down_since;	/* first down read while link, 0: none */
+	u16 down_sta;			/* what that read returned */
 	u32 link_downs;
 	unsigned long quiet_until, next, offer_at, leave_start, seen_at;
 	unsigned long need_down;	/* 0, or probe only after a drop until then */
@@ -146,6 +172,8 @@ struct rc {
 	struct mutex ctl_lock;
 	bool tables_dirty;
 	int nports;
+	struct pci_dev *root;		/* root port, completion timeout off */
+	u16 root_devctl2;		/* its DEVCTL2 before */
 	struct rc_ep ep[OMI_MAX_NODES];
 };
 
@@ -189,7 +217,8 @@ static void ep_state_done(struct rc_ep *e)
 
 /*
  * Sample the port's link (at most every LINK_POLL_MS unless force).
- * True when it is up and has been for link_stable_ms.
+ * A link that was up counts as down only after link_down_ms of down
+ * reads. True when it is up and has been for link_stable_ms.
  */
 static bool link_ok(struct rc_ep *e, bool force)
 {
@@ -203,12 +232,27 @@ static bool link_ok(struct rc_ep *e, bool force)
 		up = sta != 0xffff && (sta & PCI_EXP_LNKSTA_DLLLA);
 		if (up && !e->link)
 			e->link_since = jiffies;
+		if (up && e->down_since) {
+			netdev_info(rc->ndev, "node %u %s: link read as down (%#06x) for %u ms, up again\n",
+				    e->node, pci_name(e->port), e->down_sta,
+				    jiffies_to_msecs(jiffies - e->down_since));
+			e->down_since = 0;
+		}
 		if (!up && e->link) {
+			if (!e->down_since) {
+				e->down_since = jiffies ? : 1;
+				e->down_sta = sta;
+			}
+			if (time_before(jiffies, e->down_since + msecs_to_jiffies(link_down_ms)))
+				goto out;
+			e->down_since = 0;
 			e->link_downs++;
-			log_ep(e, "link down at the switch port");
+			netdev_info(rc->ndev, "node %u %s: link down at the switch port (%#06x)\n",
+				    e->node, pci_name(e->port), sta);
 		}
 		e->link = up;
 	}
+out:
 	return e->link && time_after_eq(jiffies, e->link_since + msecs_to_jiffies(link_stable_ms));
 }
 
@@ -1154,6 +1198,34 @@ static void ep_release_all(void)
 	}
 }
 
+/* Completion timeout off on the root port above the switch (ct_off). */
+static void root_ct_off(void)
+{
+	struct pci_dev *root = pcie_find_root_port(rc->ep[0].port);
+	u32 cap2;
+
+	if (!ct_off || !root)
+		return;
+	if (pcie_capability_read_dword(root, PCI_EXP_DEVCAP2, &cap2) ||
+	    !(cap2 & PCI_EXP_DEVCAP2_COMP_TMOUT_DIS) ||
+	    pcie_capability_read_word(root, PCI_EXP_DEVCTL2, &rc->root_devctl2)) {
+		pci_info(root, DRV_NAME ": completion timeout cannot be disabled\n");
+		return;
+	}
+	pcie_capability_set_word(root, PCI_EXP_DEVCTL2, PCI_EXP_DEVCTL2_COMP_TMOUT_DIS);
+	rc->root = pci_dev_get(root);
+	pci_info(root, DRV_NAME ": completion timeout disabled\n");
+}
+
+static void root_ct_restore(void)
+{
+	if (!rc->root)
+		return;
+	pcie_capability_write_word(rc->root, PCI_EXP_DEVCTL2, rc->root_devctl2);
+	pci_dev_put(rc->root);
+	rc->root = NULL;
+}
+
 static int __init omi_rc_init(void)
 {
 	struct net_device *ndev;
@@ -1185,6 +1257,7 @@ static int __init omi_rc_init(void)
 		rc->ep[i].link_next = jiffies;
 		rc->ep[i].rescan_at = jiffies;
 	}
+	root_ct_off();
 	hrtimer_init(&rc->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	rc->timer.function = rc_timer;
 	strscpy(ndev->name, "omi0", IFNAMSIZ);
@@ -1214,6 +1287,7 @@ static int __init omi_rc_init(void)
 
 err_netdev:
 	netif_napi_del(&rc->napi);
+	root_ct_restore();
 	for (i = 0; i < rc->nports; i++)
 		pci_dev_put(rc->ep[i].port);
 	free_netdev(ndev);
@@ -1229,6 +1303,7 @@ static void __exit omi_rc_exit(void)
 	unregister_netdev(ndev);
 	ep_release_all();
 	netif_napi_del(&rc->napi);
+	root_ct_restore();
 	rc = NULL;
 	free_netdev(ndev);
 }
