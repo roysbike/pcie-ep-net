@@ -5,6 +5,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- omi-rc: fan-in load no longer wedges the BMC side of the fabric. When
+  several blades saturate one blade's switch port, BMC writes into that
+  blade (gateway frames) queue behind the load, the next BMC config read
+  (`LNKSTA` of the switch port) completes late, and the MT7620A root port
+  did not recover from the completion timeout: the cluster was unreachable
+  from outside until a BMC reboot (blade-to-blade traffic kept working).
+  omi-rc now sets Completion Timeout Disable on the root port above the
+  switch at load and restores the old value on unload (module parameter
+  `ct_off`, default on; dmesg `omi-rc: completion timeout disabled`).
+- omi-rc: a blade is dropped only after its switch port reads as down for
+  `link_down_ms` (default 100, writable at runtime). Late `LNKSTA` reads
+  under fan-in return 0 for up to 20 ms; omi-rc took them for a link loss
+  and dropped and re-attached the blade. Short reads are logged as
+  `link read as down (...) for N ms, up again`.
+
+Tested on the Cluster Box: 3 blades into one (13.3 Gbit/s) for 30 and 60 s
+with gateway pings and `nodectl` polling: no wedge, no blade dropped.
+
 ## [0.7.0] - 2026-10-24
 
 Faster TX with less latency under load, sender side only: v0.7 blades
