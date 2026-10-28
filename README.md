@@ -301,6 +301,8 @@ results, older releases and the gateway history:
   small frames waste ring space.
 * **The gateway is slow.** Traffic to the LAN goes through the MT7620A
   CPU: ~220-280 Mbit/s. Blade-to-blade traffic is not affected.
+  When several blades send into one blade at full speed, gateway traffic
+  to that blade queues behind them (pings up to ~200 ms, some loss).
 * **A BMC reboot resets the fabric.** Every blade link drops until
   `omi-rc` is loaded again (~150 s on OpenWrt 25.12); blades reconnect to
   each other after ~12 s by themselves. On Blade 3 the same reset hits the
