@@ -299,6 +299,15 @@ results, older releases and the gateway history:
 * **No TSO/GSO.** The stack segments to the MTU. Checksum offload works
   only between blades, not towards the BMC. Slots are a fixed 10 KiB, so
   small frames waste ring space.
+* **Latency under bidirectional load.** With full traffic in both
+  directions between two blades, a ping between them takes 1-2 ms
+  (median), with tails of tens of ms and up to ~130 ms on a node whose
+  CPU is busy (measured 2026-10-28 with iperf3 `-P 4 --bidir` on a
+  loaded cluster; idle 0.2-0.3 ms). Small frames (ping, ACKs, etcd) wait
+  behind the bulk frames in the same queues and for the CPU of the
+  receiving node. Pinning iperf3 to other cores did not help; a smaller
+  `tx_batch` lowers the median but costs throughput, so the default stays
+  16.
 * **The gateway is slow.** Traffic to the LAN goes through the MT7620A
   CPU: ~220-280 Mbit/s. Blade-to-blade traffic is not affected.
   When several blades send into one blade at full speed, gateway traffic
