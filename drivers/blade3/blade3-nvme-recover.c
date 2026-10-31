@@ -26,6 +26,13 @@
  * finds. So the config space of both, saved at load time, goes back
  * first.
  *
+ * A link down shorter than the poll interval goes unseen (seen on a
+ * blade: the NVMe dropped its link by itself and it was back, at
+ * 2.5 GT/s, before the next poll). It still leaves the Root Port without
+ * its bus numbers and Memory/Bus Master enable, and the NVMe without its
+ * BARs, so nvme gives the controller up. A link that is up with a Root
+ * Port in that state is therefore taken for a link down as well.
+ *
  * It does not bind to the device; nvme stays its driver.
  */
 #include <linux/delay.h>
@@ -54,6 +61,10 @@ MODULE_PARM_DESC(stable_ms, "The link must stay up this long before the NVMe res
 static unsigned int recoveries;
 module_param(recoveries, uint, 0444);
 MODULE_PARM_DESC(recoveries, "NVMe resets done after a link down (read only)");
+
+static unsigned int unseen;
+module_param(unseen, uint, 0444);
+MODULE_PARM_DESC(unseen, "Link downs found only by the Root Port reset, shorter than poll_ms (read only)");
 
 struct port {
 	struct pci_dev *nvme;
@@ -99,17 +110,36 @@ static void retrain(struct port *p)
 	p->retrained = jiffies;
 }
 
+/* The Root Port lost its non-sticky registers: the link went down. Its
+ * config space is local (DBI), reading it sends nothing on the link.
+ */
+static bool rp_reset(struct port *p)
+{
+	u16 cmd;
+	u8 bus;
+
+	pci_read_config_byte(p->rp, PCI_SECONDARY_BUS, &bus);
+	pci_read_config_word(p->rp, PCI_COMMAND, &cmd);
+	return !bus || !(cmd & PCI_COMMAND_MEMORY);
+}
+
 static void port_poll(struct port *p)
 {
 	bool up = dw_pcie_link_up(p->pci);
 	int ret;
 
 	if (p->up) {
-		if (up)
+		if (up && !rp_reset(p))
 			return;
 		p->up = false;
 		p->down_since = jiffies;
 		p->up_since = 0;
+		if (up) {
+			unseen++;
+			dev_warn(&p->nvme->dev,
+				 "link went down unseen (Root Port reset), recovering\n");
+			return;
+		}
 		dev_warn(&p->nvme->dev, "link down, restarting it\n");
 		retrain(p);
 		return;
