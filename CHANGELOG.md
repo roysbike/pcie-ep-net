@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-31
+
+Fixes only: the Blade 3 NVMe recovery and the BMC module `omi-rc`. The
+blade driver `openmiop-ep` and protocol v4 are unchanged; v0.7.1 blades
+work with v0.7.0 and v0.6 blades.
+
 ### Fixed
 
 - blade3-nvme-recover: a link drop of the M.2 NVMe shorter than `poll_ms`
