@@ -7,6 +7,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- blade3-nvme-recover: a link drop of the M.2 NVMe shorter than `poll_ms`
+  (20 ms) went unseen. Seen on a blade on 2026-10-31: the NVMe dropped its
+  link by itself (no Cluster Box reset), the link was back at 2.5 GT/s
+  before the next poll, but the Root Port had lost its bus numbers and
+  Memory/Bus Master enable and the NVMe its BARs: nvme marked the
+  controller dead, the ZFS pool on it was suspended and the node needed a
+  hard reset. The module now also treats a Root Port without its bus
+  number or Memory enable as a link down and runs the usual recovery
+  (restore the Root Port and NVMe config, raise the speed, reset the
+  NVMe). New read-only parameter `unseen` counts these cases; dmesg
+  `link went down unseen (Root Port reset), recovering`.
+
 - omi-rc: fan-in load no longer wedges the BMC side of the fabric. When
   several blades saturate one blade's switch port, BMC writes into that
   blade (gateway frames) queue behind the load, the next BMC config read

@@ -78,8 +78,8 @@ push mode, gateway pull and zero-copy towards the BMC.
 * **Rolling upgrades.** Features are negotiated per pair, so blades on
   different releases (v0.1 to v0.6) keep talking.
 * **Blade 3 board modules** (`drivers/blade3`): `blade3-nvme-recover`
-  brings the M.2 NVMe back after a Cluster Box PCIe reset, `blade3-leds`
-  drives the 2.5G port LEDs.
+  brings the M.2 NVMe back after a Cluster Box PCIe reset or a short link
+  drop of the NVMe itself, `blade3-leds` drives the 2.5G port LEDs.
 
 ## Hardware
 
