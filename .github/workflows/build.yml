@@ -121,6 +121,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y device-tree-compiler
       - run: scripts/build-dkms-deb.sh "${{ needs.version.outputs.version }}" dist
       - run: dpkg-deb -I dist/*.deb && dpkg-deb -c dist/*.deb
       - uses: actions/upload-artifact@v7
@@ -149,6 +150,9 @@ jobs:
             headers: linux-headers-generic-hwe-22.04
           - os: Ubuntu 24.04
             image: ubuntu:24.04
+            headers: linux-headers-generic
+          - os: Ubuntu 26.04
+            image: ubuntu:26.04
             headers: linux-headers-generic
     steps:
       - uses: actions/download-artifact@v8
@@ -184,10 +188,108 @@ jobs:
           apt-get remove -y openmiop-dkms
           ! find /lib/modules -name 'openmiop-ep.ko*' | grep -q .
 
+  mixtile-os:
+    # Mixtile OS (github.com/mixtile-rockchip/mixtile-os): the kernel
+    # headers, DTB and u-boot-menu config come from the released Blade 3
+    # image. Its headers carry x86-64 fixdep/modpost (fix-host-tools.sh)
+    # and its U-Boot no longer rewrites pcie@fe150000 (overlay).
+    name: DKMS install on Mixtile OS ${{ matrix.os }}
+    needs: dkms-deb
+    runs-on: ubuntu-24.04-arm
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Ubuntu 26.04 (v2026.11.09)
+            image: ubuntu:26.04
+            release: v2026.11.09
+            file: ubuntu-26.04-server-arm64-mixtile-blade3.img.xz
+            sha256: 2075f4d807d605af72e4ecb2a9cc145a968a26e74db0cede8331befe65e7f98a
+            kver: 6.1.172-rockchip-vendor
+    env:
+      KVER: ${{ matrix.kver }}
+    steps:
+      - name: Tools, dkms and u-boot-menu
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl xz-utils e2fsprogs \
+            fdisk device-tree-compiler dkms build-essential u-boot-menu iproute2 kmod
+          gcc --version | head -n1
+      - uses: actions/cache@v6
+        id: cache
+        with:
+          path: mixtile-os
+          key: mixtile-os-${{ matrix.release }}-${{ matrix.sha256 }}
+      - name: Take headers, DTB and boot config from the image
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          mkdir -p mixtile-os/root
+          curl -fsSL -o img.xz \
+            "https://github.com/mixtile-rockchip/mixtile-os/releases/download/${{ matrix.release }}/${{ matrix.file }}"
+          echo "${{ matrix.sha256 }}  img.xz" | sha256sum -c
+          xz -d img.xz
+          off=$(sfdisk -d img | sed -n 's/.*start= *\([0-9]*\),.*name="writable".*/\1/p')
+          test -n "$off"
+          r="img?offset=$((off * 512))"
+          d() { debugfs -R "$1" "$r"; }
+          mkdir -p mixtile-os/root/usr/src "mixtile-os/root/usr/lib/linux-image-${KVER}/rockchip" \
+            mixtile-os/root/usr/share/u-boot-menu/conf.d mixtile-os/root/etc/kernel
+          d "rdump /usr/src/linux-headers-${KVER} mixtile-os/root/usr/src"
+          d "dump /usr/lib/linux-image-${KVER}/rockchip/rk3588-mixtile-blade3.dtb mixtile-os/root/usr/lib/linux-image-${KVER}/rockchip/rk3588-mixtile-blade3.dtb"
+          d "dump /usr/share/u-boot-menu/conf.d/mixtile.conf mixtile-os/root/usr/share/u-boot-menu/conf.d/mixtile.conf"
+          d "dump /etc/kernel/cmdline mixtile-os/root/etc/kernel/cmdline"
+          rm -f img
+      - name: Install the image files
+        run: |
+          set -e
+          cp -a mixtile-os/root/. /
+          mkdir -p "/lib/modules/${KVER}" /boot
+          ln -sfn "/usr/src/linux-headers-${KVER}" "/lib/modules/${KVER}/build"
+          : > "/boot/vmlinuz-${KVER}"
+          : > "/boot/initrd.img-${KVER}"
+          # The image ships the cross-built host tools; this is what DKMS meets.
+          file_m() { od -An -tx1 -j18 -N2 "$1" | tr -d ' '; }
+          echo "fixdep e_machine $(file_m "/usr/src/linux-headers-${KVER}/scripts/basic/fixdep"), /bin/sh $(file_m /bin/sh)"
+      - uses: actions/download-artifact@v8
+        with:
+          name: deb
+          path: dist
+      - name: Install the package (DKMS builds the module)
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y ./dist/openmiop-dkms_*_all.deb
+          dkms status
+      - name: Check the module
+        run: |
+          set -e
+          ko=$(find "/lib/modules/${KVER}/updates" -name 'openmiop-ep.ko*' | head -n1)
+          test -n "$ko"
+          modinfo "$ko" | grep -E '^(vermagic|alias|license)'
+          modinfo -F vermagic "$ko" | grep -q "^${KVER} "
+          modinfo -F alias "$ko" | grep -q 'mixtile,miop-ep-rk3588'
+      - name: Check the overlay
+        run: |
+          set -e
+          test -f /boot/dtbo/openmiop-cluster-box.dtbo
+          grep -E '^\s*fdtoverlays .*/boot/dtbo/openmiop-cluster-box.dtbo' /boot/extlinux/extlinux.conf
+          fdtoverlay -i "/usr/lib/linux-image-${KVER}/rockchip/rk3588-mixtile-blade3.dtb" \
+            -o /tmp/out.dtb /boot/dtbo/openmiop-cluster-box.dtbo
+          test "$(fdtget -t s /tmp/out.dtb /pcie@fe150000 compatible)" = mixtile,miop-ep-rk3588
+          test "$(fdtget -t s /tmp/out.dtb /pcie@fe150000 status)" = okay
+      - name: Remove the package
+        run: |
+          apt-get remove -y openmiop-dkms
+          ! find /lib/modules -name 'openmiop-ep.ko*' | grep -q .
+          test ! -e /boot/dtbo/openmiop-cluster-box.dtbo
+          ! grep -q openmiop-cluster-box /boot/extlinux/extlinux.conf
+
   release:
     name: GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [version, root-complex, endpoint, talos-kernel, dkms-deb, dkms-install]
+    needs: [version, root-complex, endpoint, talos-kernel, dkms-deb, dkms-install, mixtile-os]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

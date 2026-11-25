@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Mixtile OS on a Blade 3 in the Cluster Box: PCIe3 controller
+ * fe150000 as the openmiop endpoint.
+ *
+ * Mixtile OS (vendor kernel 6.1, Rockchip U-Boot 2017.09) boots the
+ * vendor device tree, where /pcie@fe150000 is a root complex, so the
+ * in-kernel host driver would take the controller. The older Mixtile
+ * U-Boot rewrote this node to "mixtile,miop-ep-rk3588" when it saw
+ * the Cluster Box; this overlay does the same, the openmiop driver
+ * binds that compatible. The PHY already is in aggregation mode and
+ * the SMMU at fc900000 is off in the vendor tree.
+ *
+ * Installed in /boot/dtbo by openmiop-dkms on Mixtile OS only
+ * (u-boot-menu adds it as "fdtoverlays" to extlinux.conf).
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/pcie@fe150000";
+		__overlay__ {
+			compatible = "mixtile,miop-ep-rk3588";
+		};
+	};
+};

@@ -144,8 +144,8 @@ Full description (BAR layout, control plane, memory ordering, L2):
 | Chassis | Mixtile Cluster Box (ASM2824 switch, MT7620A BMC), 4 slots |
 | Blade | Mixtile Blade 3 (RK3588), link Gen3 x2 to the switch |
 | Blade OS, tested on hardware | Talos v1.14.4 (kernel 6.18.57-talos) via [mixtile-talos](https://github.com/roysbike/mixtile-talos), the reference platform; Debian 12 with the Mixtile vendor kernel 6.1.99 (tested with v0.1) |
-| Blade OS, built in CI | DKMS package on Debian 12/13 and Ubuntu 22.04 (HWE)/24.04 arm64 kernels; any kernel 6.1 or newer with its headers. RX interrupts need Linux 6.10+ (older kernels poll) |
-| Device tree | `pcie@fe150000` as PCIe endpoint: `openmiop,rk3588-pcie-ep` (mixtile-talos) or `mixtile,miop-ep-rk3588` (Mixtile U-Boot) |
+| Blade OS, built in CI | DKMS package on Debian 12/13 and Ubuntu 22.04 (HWE)/24.04/26.04 arm64 kernels, and on [Mixtile OS](https://docs.mixtile.com/blade-3/download/) Ubuntu 26.04 (vendor kernel 6.1.172, headers and device tree from the released image; not run on hardware yet); any kernel 6.1 or newer with its headers. RX interrupts need Linux 6.10+ (older kernels poll) |
+| Device tree | `pcie@fe150000` as PCIe endpoint: `openmiop,rk3588-pcie-ep` (mixtile-talos) or `mixtile,miop-ep-rk3588` (older Mixtile U-Boot; on Mixtile OS the overlay of the DKMS package) |
 | BMC | ClusterBox firmware v0.4.3 (OpenWrt 25.12.6, Linux 6.12) or v0.3.0 (OpenWrt 23.05, Linux 5.15) with `omi-rc` built in |
 
 ## Install
@@ -194,6 +194,28 @@ Install the DKMS package from the
 DKMS builds the module for the running kernel (its headers must be
 installed; on the Mixtile Debian 12 image the package finds
 `/usr/src/linux-headers-6.1-rockchip` by itself).
+
+On [Mixtile OS](https://docs.mixtile.com/blade-3/download/) (the current
+Mixtile images: Ubuntu 24.04/26.04, Debian 12/13, vendor kernel 6.1) the
+package does two more things:
+
+* Mixtile OS's kernel headers carry `fixdep` and `modpost` built for
+  x86-64 (the kernel is cross-built). The DKMS `PRE_BUILD` step rebuilds
+  them for the blade from the sources in the headers package.
+* Mixtile OS's U-Boot no longer turns `pcie@fe150000` into the Cluster
+  Box endpoint node, so the in-kernel PCIe host driver would take the
+  controller. The package installs the overlay
+  `/boot/dtbo/openmiop-cluster-box.dtbo` (`compatible =
+  "mixtile,miop-ep-rk3588"`, what the older U-Boot set) and runs
+  `u-boot-update`, which adds it to `/boot/extlinux/extlinux.conf`. After
+  that reboot, the blade's PCIe3 controller is the fabric endpoint, not a
+  root complex. Removing the package removes the overlay.
+
+Both are checked in CI on the released Mixtile OS Ubuntu 26.04 image
+(headers, device tree, boot menu), not yet on a blade. Check the boot
+log after the first reboot: `fdtoverlays` must be applied (`cat
+/proc/device-tree/pcie@fe150000/compatible` shows
+`mixtile,miop-ep-rk3588`).
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
@@ -355,7 +377,8 @@ against the Talos kernel.
 
 GitHub Actions on every push: the endpoint module against `linux-6.1.y`
 and `linux-6.18.y`, the board modules, the BMC binaries, and the DKMS
-package installed on Debian 12/13 and Ubuntu 22.04/24.04. A `v*` tag
+package installed on Debian 12/13, Ubuntu 22.04/24.04/26.04 and on the
+kernel headers and device tree of the Mixtile OS Ubuntu 26.04 image. A `v*` tag
 publishes the release (DKMS `.deb`, BMC tarball, `SHA256SUMS`,
 `BUILD-INFO.txt`).
 

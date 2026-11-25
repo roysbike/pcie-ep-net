@@ -14,6 +14,20 @@ if [ "$1" = configure ]; then
 		echo "openmiop: using the Mixtile kernel headers in $VENDOR"
 	fi
 
+	# Mixtile OS (Ubuntu 24.04/26.04, Debian 12/13 from mixtile-os):
+	# its U-Boot no longer turns pcie@fe150000 into the Cluster Box
+	# endpoint node, so the host driver would take the controller. The
+	# overlay sets the compatible the old U-Boot set; u-boot-menu adds
+	# every /boot/dtbo/*.dtbo to extlinux.conf.
+	if [ -e /usr/share/u-boot-menu/conf.d/mixtile.conf ]; then
+		mkdir -p /boot/dtbo
+		cp /usr/lib/openmiop/openmiop-cluster-box.dtbo /boot/dtbo/
+		if command -v u-boot-update >/dev/null 2>&1; then
+			u-boot-update || echo "openmiop: u-boot-update failed, the overlay is not in extlinux.conf yet" >&2
+		fi
+		echo "openmiop: device tree overlay /boot/dtbo/openmiop-cluster-box.dtbo (pcie@fe150000 as the Cluster Box endpoint)"
+	fi
+
 	dkms add -m "$NAME" -v "$VERSION" >/dev/null 2>&1 || true
 	built=0
 	for build in /lib/modules/*/build; do
