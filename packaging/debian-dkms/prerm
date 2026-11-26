@@ -4,6 +4,12 @@ if [ "$1" = remove ] || [ "$1" = upgrade ]; then
 	if [ -d /run/systemd/system ] && [ "$1" = remove ]; then
 		systemctl disable openmiop.service >/dev/null 2>&1 || true
 	fi
+	if [ "$1" = remove ] && [ -e /boot/dtbo/openmiop-cluster-box.dtbo ]; then
+		rm -f /boot/dtbo/openmiop-cluster-box.dtbo
+		if command -v u-boot-update >/dev/null 2>&1; then
+			u-boot-update || true
+		fi
+	fi
 	dkms remove -m openmiop -v @VERSION@ --all >/dev/null 2>&1 || true
 fi
 exit 0

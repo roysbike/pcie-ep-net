@@ -17,18 +17,21 @@ sub() { sed -e "s/@VERSION@/$VERSION/g" -e "s/@DEBVERSION@/$DEBVERSION/g" "$1"; 
 
 src=$W/root/usr/src/openmiop-$VERSION
 mkdir -p "$src" "$W/root/usr/sbin" "$W/root/lib/systemd/system" \
-	"$W/root/usr/share/doc/openmiop-dkms" "$W/root/DEBIAN"
+	"$W/root/usr/share/doc/openmiop-dkms" "$W/root/usr/lib/openmiop" "$W/root/DEBIAN"
 cp "$TOP/drivers/openmiop/openmiop-ep.c" "$TOP/drivers/openmiop/openmiop.h" "$src/"
 cp "$P/Kbuild" "$src/Kbuild"
+install -m 0755 "$P/fix-host-tools.sh" "$src/fix-host-tools.sh"
 sub "$P/dkms.conf" > "$src/dkms.conf"
 install -m 0755 "$P/openmiop-ep-start" "$W/root/usr/sbin/openmiop-ep-start"
+dtc -q -I dts -O dtb -o "$W/root/usr/lib/openmiop/openmiop-cluster-box.dtbo" "$P/openmiop-cluster-box.dts"
 install -m 0644 "$P/openmiop.service" "$W/root/lib/systemd/system/openmiop.service"
 cp "$TOP/LICENSE" "$W/root/usr/share/doc/openmiop-dkms/copyright"
 sub "$P/control" > "$W/root/DEBIAN/control"
 sub "$P/postinst" > "$W/root/DEBIAN/postinst"
 sub "$P/prerm" > "$W/root/DEBIAN/prerm"
 chmod -R u=rwX,go=rX "$W/root"
-chmod 0755 "$W/root/DEBIAN/postinst" "$W/root/DEBIAN/prerm" "$W/root/usr/sbin/openmiop-ep-start"
+chmod 0755 "$W/root/DEBIAN/postinst" "$W/root/DEBIAN/prerm" "$W/root/usr/sbin/openmiop-ep-start" \
+	"$src/fix-host-tools.sh"
 echo "Installed-Size: $(du -sk "$W/root" | cut -f1)" >> "$W/root/DEBIAN/control"
 
 mkdir -p "$OUT"

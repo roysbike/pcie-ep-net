@@ -5,6 +5,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- openmiop-dkms on Mixtile OS (github.com/mixtile-rockchip/mixtile-os,
+  the images on docs.mixtile.com: Ubuntu 24.04/26.04, Debian 12/13,
+  vendor kernel 6.1.172-rockchip-vendor, Rockchip U-Boot 2017.09), #34:
+  - DKMS `PRE_BUILD` step `fix-host-tools.sh`: the image's kernel headers
+    carry x86-64 `fixdep`/`modpost` (cross `make bindeb-pkg`), it rebuilds
+    them for the blade from the sources in the headers package; a no-op
+    on headers with native tools.
+  - Device tree overlay `openmiop-cluster-box.dtbo`: `/pcie@fe150000`
+    `compatible = "mixtile,miop-ep-rk3588"`, what the older Mixtile
+    U-Boot set in a Cluster Box and Mixtile OS's U-Boot no longer does.
+    Installed in `/boot/dtbo` (u-boot-menu `fdtoverlays`) only when
+    `/usr/share/u-boot-menu/conf.d/mixtile.conf` exists; removed with
+    the package.
+- CI: DKMS install on Ubuntu 26.04, and on the kernel headers, DTB and
+  boot menu config of the released Mixtile OS Ubuntu 26.04 image
+  (v2026.11.09): module built, overlay in `extlinux.conf` and applied to
+  the image's DTB with `fdtoverlay`. Not run on a blade yet.
+
 ## [0.7.1] - 2026-10-31
 
 Fixes only: the Blade 3 NVMe recovery and the BMC module `omi-rc`. The

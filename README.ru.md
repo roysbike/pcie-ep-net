@@ -147,7 +147,7 @@ Mixtile поставляет Cluster Box со своей прошивкой BMC 
 | Шасси | Mixtile Cluster Box (коммутатор ASM2824, BMC MT7620A), 4 слота |
 | Блейд | Mixtile Blade 3 (RK3588), линк Gen3 x2 до коммутатора |
 | ОС блейда, проверено на железе | Talos v1.14.4 (ядро 6.18.57-talos) через [mixtile-talos](https://github.com/roysbike/mixtile-talos), основная платформа; Debian 12 с ядром Mixtile 6.1.99 (проверено с v0.1) |
-| ОС блейда, сборка в CI | DKMS-пакет на ядрах Debian 12/13 и Ubuntu 22.04 (HWE)/24.04 arm64; любое ядро 6.1+ с заголовками. Прерываниям RX нужен Linux 6.10+ (на старых ядрах опрос) |
+| ОС блейда, сборка в CI | DKMS-пакет на ядрах Debian 12/13 и Ubuntu 22.04 (HWE)/24.04/26.04 arm64, а также на [Mixtile OS](https://docs.mixtile.com/blade-3/download/) Ubuntu 26.04 (vendor-ядро 6.1.172, заголовки и device tree из выпущенного образа; на железе ещё не запускался); любое ядро 6.1+ с заголовками. Прерываниям RX нужен Linux 6.10+ (на старых ядрах опрос) |
 | Device tree | `pcie@fe150000` в режиме PCIe endpoint: `openmiop,rk3588-pcie-ep` (mixtile-talos) или `mixtile,miop-ep-rk3588` (U-Boot Mixtile) |
 | BMC | прошивка ClusterBox v0.4.3 (OpenWrt 25.12.6, Linux 6.12) или v0.3.0 (OpenWrt 23.05, Linux 5.15) со встроенным `omi-rc` |
 
@@ -197,6 +197,28 @@ ssh root@<bmc> 'cp /tmp/openmiop-rc /usr/bin/openmiop-rc && chmod 755 /usr/bin/o
 [релиза](https://github.com/roysbike/pcie-ep-net/releases/tag/v0.7.1).
 DKMS собирает модуль под работающее ядро (нужны его заголовки; на образе
 Mixtile Debian 12 пакет сам находит `/usr/src/linux-headers-6.1-rockchip`).
+
+На [Mixtile OS](https://docs.mixtile.com/blade-3/download/) (текущие
+образы Mixtile: Ubuntu 24.04/26.04, Debian 12/13, vendor-ядро 6.1) пакет
+делает ещё две вещи:
+
+* В заголовках ядра Mixtile OS `fixdep` и `modpost` собраны под x86-64
+  (ядро собирается кросс-компилятором). Шаг DKMS `PRE_BUILD`
+  пересобирает их под блейд из исходников в пакете заголовков.
+* U-Boot Mixtile OS больше не превращает `pcie@fe150000` в узел
+  endpoint для Cluster Box, и контроллер забрал бы штатный драйвер PCIe
+  host. Пакет ставит оверлей `/boot/dtbo/openmiop-cluster-box.dtbo`
+  (`compatible = "mixtile,miop-ep-rk3588"`, как ставил старый U-Boot) и
+  запускает `u-boot-update`, который добавляет его в
+  `/boot/extlinux/extlinux.conf`. После перезагрузки контроллер PCIe3
+  блейда работает как endpoint фабрики, а не как root complex. При
+  удалении пакета оверлей удаляется.
+
+Оба шага проверяются в CI на выпущенном образе Mixtile OS Ubuntu 26.04
+(заголовки, device tree, меню загрузки), на блейде пока нет. После
+первой перезагрузки проверьте, что оверлей применился: `cat
+/proc/device-tree/pcie@fe150000/compatible` показывает
+`mixtile,miop-ep-rk3588`.
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
@@ -361,7 +383,8 @@ make -C <openwrt kernel tree> M=$PWD/drivers/omi-rc ARCH=mips CROSS_COMPILE=mips
 
 GitHub Actions на каждый push: модуль endpoint под `linux-6.1.y` и
 `linux-6.18.y`, модули платы, бинарники BMC и установка DKMS-пакета на
-Debian 12/13 и Ubuntu 22.04/24.04. Тег `v*` публикует релиз (DKMS `.deb`,
+Debian 12/13, Ubuntu 22.04/24.04/26.04 и на заголовках ядра и device tree
+образа Mixtile OS Ubuntu 26.04. Тег `v*` публикует релиз (DKMS `.deb`,
 архив для BMC, `SHA256SUMS`, `BUILD-INFO.txt`).
 
 ## Структура репозитория
